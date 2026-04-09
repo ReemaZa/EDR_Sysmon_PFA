@@ -1,0 +1,45 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.vscode
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Database
+*.db
+*.sqlite3
+
+# Data
+data/*.db
+logs/
+data/graph_snapshots/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Config (if secrets present)
+config/config.local.yaml
+.env
+.env.local
