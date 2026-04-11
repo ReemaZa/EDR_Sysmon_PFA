@@ -115,20 +115,21 @@ class SigmaEngine:
         Check event against preloaded Sigma rules and return DetectionResult.
         """
         try:
+            event = {**event, **event["data"]}
+            #print(event)
             matched_rules = []
             metadata = {
                 'rules': [],
                 'techniques': [],
                 'tactics': [],
-                'event_processing_delay': None,
+                #'event_processing_delay': None,
                 'total_checks': 0,
                 'rules_matched': 0
             }
 
             # Compute event delay if timestamp exists
             event_ts = event.get('timestamp')
-            dt = datetime.fromisoformat(event_ts.replace('Z', '+00:00'))
-            event_ts = dt.timestamp()
+         
             # Iterate over preloaded rules for this event ID
             for matcher in self.preloaded_rules.get(int(event['event_id']), []):
                 self.stats['total_checks'] += 1
@@ -137,17 +138,21 @@ class SigmaEngine:
                         rule = matcher.rule
                         matched_rules.append(rule.title)
                         metadata['rules'].append(rule.title)
-                        if hasattr(rule, 'technique'):
-                            metadata['techniques'].append(rule.technique)
-                        if hasattr(rule, 'tactic'):
-                            metadata['tactics'].append(rule.tactic)
+                        for tag in getattr(rule, 'tags', []):
+                            tag=str(tag)
+                            if tag.startswith("attack.t"):
+                                metadata['techniques'].append(tag)   # e.g. attack.t1059
+                            elif tag.startswith("attack."):
+                                metadata['tactics'].append(tag.replace("attack.", ""))
                 except Exception as e:
                     print(f"[ERROR] Rule matching failed: {e}")
 
             metadata['total_checks'] = self.stats['total_checks']
             metadata['rules_matched'] = len(matched_rules)
-            metadata['event_processing_delay'] = time.time() - event_ts
-
+            #metadata['event_processing_delay'] = time.time() - event_ts
+            print(len(matched_rules))
+            if len(matched_rules)==0:
+                return None
             return DetectionResult(
                 layer_name="L2-Sigma",
                 threat_level=ThreatLevel.LOW,
