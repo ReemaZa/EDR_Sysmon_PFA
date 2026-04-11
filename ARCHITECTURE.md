@@ -312,6 +312,7 @@ result = engine.check_event(event)
 if result:
     print(f"✅ Detection: {result.threat_level.name}")
     print(f"   Matches: {result.matches}")
+    print(f"   MetaData {result.metadata}")
 else:
     print("✅ Clean - no threat")
 ```

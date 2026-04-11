@@ -1,4 +1,5 @@
 """Parsing and normalization for Sysmon events."""
+from datetime import datetime
 from typing import Optional, Dict, Any
 import xml.etree.ElementTree as ET
 from dateutil import parser as dateparser
@@ -114,215 +115,44 @@ def normalize_path(path: str) -> str:
     return path.replace("\\", "/").lower()
 
 
-def parse_sysmon_event(event_xml: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse a Sysmon event XML string into a normalized, structured dict.
-    
-    This parser intelligently extracts fields and structures them for:
-    - Hash scanning (MD5, SHA256, IMPHASH)
-    - Sigma rules matching
-    - YARA rule conditions
-    
-    Args:
-        event_xml: Raw XML string from win32evtlog.EvtRender()
-
-    Returns:
-        Dict with normalized Sysmon event data, or None if parsing fails
-    """
+def parse_sysmon_event(xml_string):
+    """Parse Sysmon event XML and extract key information."""
     try:
-        root = ET.fromstring(event_xml)
-    except ET.ParseError:
-        return None
+        root = ET.fromstring(xml_string)
+        ns = {'ns': 'http://schemas.microsoft.com/win/2004/08/events/event'}
 
-    # XML namespace for Windows Event Log
-    ns = '{http://schemas.microsoft.com/win/2004/08/events/event}'
+        system = root.find('.//ns:System', ns)
+        event_data = root.find('.//ns:EventData', ns)
 
-    # Extract System section
-    system = root.find(f'.//{ns}System')
-    if system is None:
-        return None
+        if system is None or event_data is None:
+            return None
 
-    # === SYSTEM FIELDS ===
-    
-    # EventID
-    event_id_node = system.find(f'{ns}EventID')
-    event_id = int(event_id_node.text) if event_id_node is not None and event_id_node.text else -1
-    
-    # Event type name for convenience
-    event_type = SYSMON_EVENTS.get(event_id, f"Unknown Event {event_id}")
-
-    # Timestamp - normalize to ISO format
-    time_node = system.find(f'{ns}TimeCreated')
-    timestamp = time_node.get('SystemTime') if time_node is not None else None
-    if timestamp:
+        time_created = system.find('.//ns:TimeCreated', ns)
+        timestamp = time_created.get('SystemTime') if time_created is not None else 'Unknown'
         try:
-            dt = dateparser.parse(timestamp)
-            timestamp = dt.isoformat()
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
         except Exception:
-            pass  # Keep original format if parsing fails
+            pass
 
-    # Computer name
-    computer_node = system.find(f'{ns}Computer')
-    computer = computer_node.text if computer_node is not None else ""
+        event_id_elem = system.find('.//ns:EventID', ns)
+        event_id = event_id_elem.text if event_id_elem is not None else 'Unknown'
 
-    # Provider/Channel name
-    provider_node = system.find(f'{ns}Provider')
-    provider = provider_node.get('Name') if provider_node is not None else "Unknown"
+        computer_elem = system.find('.//ns:Computer', ns)
+        computer = computer_elem.text if computer_elem is not None else 'Unknown'
 
-    # Event Record ID
-    event_record_id_node = system.find(f'{ns}EventRecordID')
-    event_record_id = int(event_record_id_node.text) if event_record_id_node is not None else 0
-
-    # Execution info (ProcessID, ThreadID)
-    execution_node = system.find(f'{ns}Execution')
-    execution_process_id = execution_node.get('ProcessID') if execution_node is not None else ""
-    execution_thread_id = execution_node.get('ThreadID') if execution_node is not None else ""
-
-    # User
-    security_node = system.find(f'{ns}Security')
-    user_id = security_node.get('UserID') if security_node is not None else ""
-
-    # === EVENT DATA FIELDS ===
-    
-    # Extract EventData section and build a structured dict
-    event_data_node = root.find(f'.//{ns}EventData')
-    event_data_raw = {}
-    
-    if event_data_node is not None:
-        for d in event_data_node.findall(f'{ns}Data'):
-            name = d.get('Name')
-            text = d.text or ''
-            if name:
-                event_data_raw[name] = text
-
-    # === PARSED EVENT DATA (Intelligently structured) ===
-    
-    parsed_data = {}
-    
-    # Process Information (Event ID 1, 3, 10, etc.)
-    if 'Image' in event_data_raw:
-        parsed_data['process'] = {
-            'image': normalize_path(event_data_raw.get('Image', '')),
-            'command_line': event_data_raw.get('CommandLine', ''),
-            'current_directory': normalize_path(event_data_raw.get('CurrentDirectory', '')),
-            'pid': event_data_raw.get('ProcessId', ''),
-            'guid': event_data_raw.get('ProcessGuid', ''),
-            'user': event_data_raw.get('User', ''),
-            'logon_id': event_data_raw.get('LogonId', ''),
-            'logon_guid': event_data_raw.get('LogonGuid', ''),
-            'terminal_session_id': event_data_raw.get('TerminalSessionId', ''),
-            'integrity_level': event_data_raw.get('IntegrityLevel', ''),
-        }
-    
-    # Parent Process Information
-    if 'ParentImage' in event_data_raw:
-        parsed_data['parent_process'] = {
-            'image': normalize_path(event_data_raw.get('ParentImage', '')),
-            'command_line': event_data_raw.get('ParentCommandLine', ''),
-            'pid': event_data_raw.get('ParentProcessId', ''),
-            'guid': event_data_raw.get('ParentProcessGuid', ''),
-            'user': event_data_raw.get('ParentUser', ''),
-        }
-    
-    # File Information (Event ID 11, 23, etc.)
-    if 'TargetFilename' in event_data_raw:
-        parsed_data['file'] = {
-            'path': normalize_path(event_data_raw.get('TargetFilename', '')),
-            'creation_time': event_data_raw.get('CreationUtcTime', ''),
-            'previous_creation_time': event_data_raw.get('PreviousCreationUtcTime', ''),
-        }
-    
-    # Hash Information (Critical for hash scanning)
-    if 'Hashes' in event_data_raw:
-        parsed_data['hashes'] = parse_hashes(event_data_raw.get('Hashes', ''))
-    
-    # File Version Information (for file scanning)
-    if 'FileVersion' in event_data_raw or 'Product' in event_data_raw:
-        parsed_data['file_version'] = {
-            'file_version': event_data_raw.get('FileVersion', ''),
-            'product': event_data_raw.get('Product', ''),
-            'company': event_data_raw.get('Company', ''),
-            'description': event_data_raw.get('Description', ''),
-            'original_file_name': event_data_raw.get('OriginalFileName', ''),
-        }
-    
-    # Network Information (Event ID 3)
-    if 'DestinationIp' in event_data_raw:
-        parsed_data['network'] = {
-            'source_ip': event_data_raw.get('SourceIp', ''),
-            'source_port': event_data_raw.get('SourcePort', ''),
-            'destination_ip': event_data_raw.get('DestinationIp', ''),
-            'destination_port': event_data_raw.get('DestinationPort', ''),
-            'protocol': event_data_raw.get('Protocol', ''),
-            'initiated': event_data_raw.get('Initiated', ''),
-            'source_is_ipv6': event_data_raw.get('SourceIsIpv6', ''),
-            'destination_is_ipv6': event_data_raw.get('DestinationIsIpv6', ''),
-        }
-    
-    # DNS Query Information (Event ID 22)
-    if 'QueryName' in event_data_raw:
-        parsed_data['dns'] = {
-            'query_name': event_data_raw.get('QueryName', '').lower(),
-            'query_status': event_data_raw.get('QueryStatus', ''),
-            'query_results': event_data_raw.get('QueryResults', ''),
-        }
-    
-    # Registry Information (Event ID 12, 13, 14)
-    if 'TargetObject' in event_data_raw:
-        parsed_data['registry'] = {
-            'target_object': event_data_raw.get('TargetObject', ''),
-            'event_type': event_data_raw.get('EventType', ''),
-            'details': event_data_raw.get('Details', ''),
-        }
-    
-    # Pipe Information (Event ID 17, 18)
-    if 'PipeName' in event_data_raw:
-        parsed_data['pipe'] = {
-            'name': event_data_raw.get('PipeName', ''),
-        }
-    
-    # Image Load Information (Event ID 7)
-    if 'ImageLoaded' in event_data_raw:
-        parsed_data['image_load'] = {
-            'image_loaded': normalize_path(event_data_raw.get('ImageLoaded', '')),
-            'signed': event_data_raw.get('Signed', ''),
-            'signature': event_data_raw.get('Signature', ''),
-            'signature_status': event_data_raw.get('SignatureStatus', ''),
-        }
-    
-    # Driver Load Information (Event ID 6)
-    if 'ImageLoaded' in event_data_raw and event_id == 6:
-        parsed_data['driver'] = {
-            'image_loaded': normalize_path(event_data_raw.get('ImageLoaded', '')),
-            'hashes': parse_hashes(event_data_raw.get('Hashes', '')),
-            'signed': event_data_raw.get('Signed', ''),
-        }
-    
-    # Rule Name (present in most events for better organization)
-    rule_name = event_data_raw.get('RuleName', '-')
-    
-    # === BUILD FINAL NORMALIZED EVENT ===
-    
-    return {
-        # System fields
-        "event_id": event_id,
-        "event_type": event_type,
-        "timestamp": timestamp or "",
-        "computer": computer,
-        "provider": provider,
-        "event_record_id": event_record_id,
-        "user_id": user_id,
-        "execution": {
-            "process_id": execution_process_id,
-            "thread_id": execution_thread_id,
-        },
+        data_fields = {}
+        for data in event_data.findall('.//ns:Data', ns):
+            name = data.get('Name')
+            text = data.text if data.text else ''
+            data_fields[name] = text
         
-        # Rule and metadata
-        "rule_name": rule_name,
-        
-        # Parsed structured data (for Sigma, YARA, hash scanning)
-        "data": parsed_data,
-        
-        # Raw event data (fallback for fields not explicitly parsed)
-        "raw_data": event_data_raw,
-    }
+        return {
+            'timestamp': timestamp,
+            'event_id': int(event_id),
+            'computer': computer,
+            'data': data_fields
+        }
+    except Exception as e:
+        print(f"[!] Parse error: {e}")
+        return None

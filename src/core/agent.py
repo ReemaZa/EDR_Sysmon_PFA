@@ -5,6 +5,7 @@ Responsibility: Manage the lifecycle, route events to pipeline, and handle alert
 
 Flow: event_watcher → ingestion → pipeline → response/storage
 """
+import json
 import os
 import signal
 import sys
@@ -54,12 +55,25 @@ def process_event(evt):
         threat_name = "Clean"
     
     print(f"{alert_icon} [{event_id:2d}] {timestamp} | {event_type:30s} | Threat: {threat_name}")
-    
+    output = []
     # Log detection details if threats found
     if verdict.layer_results:
         for result in verdict.layer_results:
             matches = ', '.join(result.matches[:2])  # Show first 2 matches
             print(f"       └─ {result.layer_name}: {result.threat_level.name} - {matches}")
+            print(f"   MetaData {result.metadata}")
+            output.append({
+            "event":evt,
+            
+            "layer_name": result.layer_name,
+            "threat_level": result.threat_level.name,
+            "matches": result.matches[:2],
+            "metadata": result.metadata
+        })
+
+    # 👉 Save to file AFTER the loop
+    with open("results.json", "a") as f:
+        json.dump(output, f, indent=4)
     
     # TODO: Handle response actions for CRITICAL/HIGH threats
     # if verdict.is_malicious():
