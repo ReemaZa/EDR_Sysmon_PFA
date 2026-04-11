@@ -5,12 +5,15 @@ Uses bookmarks to persist progress and resume from where it stopped.
 
 Parsing and normalization is handled by ingestion module.
 """
+import traceback
+import sys
 import threading
 import time
 import win32evtlog
 import pywintypes
 from typing import Callable
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.core.ingestion import parse_sysmon_event
 
@@ -64,6 +67,7 @@ def update_bookmark(bookmark_handle, event_handle) -> None:
     """Reposition the bookmark to point to a specific event."""
     try:
         win32evtlog.EvtUpdateBookmark(bookmark_handle, event_handle)
+        save_bookmark_xml(bookmark_handle) 
     except pywintypes.error as e:
         print(f"[ERROR] Error updating bookmark: {e}")
 
@@ -78,10 +82,10 @@ class SysmonEventWatcher(threading.Thread):
     where event is a normalized dict from ingestion.parse_sysmon_event()
     """
 
-    def __init__(self, callback: Callable):
+    def __init__(self, callback: Callable, stop_event=None):
         super().__init__(daemon=True)
         self.callback = callback
-        self._stop_event = threading.Event()
+        self._stop_event = stop_event if stop_event is not None else threading.Event()
         self.h_subscription = None
         self.bookmark_handle = None
 
@@ -117,7 +121,7 @@ class SysmonEventWatcher(threading.Thread):
             try:
                 self.callback(evt)
             except Exception as e:
-                print(f"[ERROR] Callback failed: {e}")
+                print(traceback.print_exception(e))
         
         except Exception as e:
             print(f"[ERROR] Failed to process event: {e}")
@@ -157,30 +161,26 @@ class SysmonEventWatcher(threading.Thread):
                 Callback=self._event_callback,
                 Bookmark=self.bookmark_handle if flags == win32evtlog.EvtSubscribeStartAfterBookmark else None
             )
-            
+            self._stop_event.wait()
             print("[INFO] Sysmon event watcher initialized with EvtSubscribe")
-            
-            # Keep the subscription alive until stopped
-            # Periodically save bookmark to persist progress
-            while not self._stop_event.is_set():
-                time.sleep(1)
-                # Save bookmark periodically to avoid losing progress
-                if self.bookmark_handle is not None:
-                    save_bookmark_xml(self.bookmark_handle)
+           # while not self._stop_event.is_set():
+             #   time.sleep(1)
+           
                     
         except pywintypes.error as e:
             print(f"[ERROR] Failed to initialize event subscription: {e}")
-        finally:
-            # Always save bookmark on exit
-            try:
-                if self.bookmark_handle is not None:
-                    save_bookmark_xml(self.bookmark_handle)
-                    print("[INFO] Bookmark saved. Will resume from here on next start.")
-            except Exception as e:
-                print(f"[ERROR] Failed to save bookmark on exit: {e}")
+        # finally:
+        #     # Always save bookmark on exit
+        #     try:
+        #         if self.bookmark_handle is not None:
+        #             save_bookmark_xml(self.bookmark_handle)
+        #             print("[INFO] Bookmark saved. Will resume from here on next start.")
+        #     except Exception as e:
+        #         print(f"[ERROR] Failed to save bookmark on exit: {e}")
             
-            try:
-                if self.h_subscription is not None:
-                    win32evtlog.CloseEventLog(self.h_subscription)
-            except Exception:
-                pass
+        #     try:
+        #         if self.h_subscription is not None:
+        #             print('hhhh')
+        #             win32evtlog.CloseEventLog(self.h_subscription)
+        #     except Exception:
+        #         pass

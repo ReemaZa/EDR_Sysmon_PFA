@@ -37,7 +37,7 @@ from typing import Dict, Any, Optional, Set, List
 from pathlib import Path
 
 # Import classes from pipeline
-from src.core.pipeline import DetectionResult, ThreatLevel
+from src.core.utils import DetectionResult, ThreatLevel
 
 
 class HashReputationEngine:

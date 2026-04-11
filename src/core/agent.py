@@ -5,8 +5,10 @@ Responsibility: Manage the lifecycle, route events to pipeline, and handle alert
 
 Flow: event_watcher → ingestion → pipeline → response/storage
 """
+import os
 import signal
 import sys
+import threading
 import time
 
 from src.core.event_watcher import SysmonEventWatcher
@@ -68,54 +70,51 @@ def process_event(evt):
 
 
 def main():
-    """Start the agent and begin collecting Sysmon events."""
     global detection_pipeline
-    
+
     print("=" * 70)
     print("EDR SYSTEM - Sysmon Event Monitor")
     print("=" * 70)
     print("Starting event watcher...")
     print("Detection layers: L1 (Hash), L2 (Sigma), L3 (YARA), L4 (AI)")
     print("Press Ctrl+C to stop.\n")
-    
-    # Initialize detection pipeline
-    detection_pipeline = DetectionPipeline(
-        enable_l1=True,   # Hash reputation
-        enable_l2=True,   # Sigma rules
-        enable_l3=False,   # YARA scanner
-        enable_l4=False   # AI/ML (disabled until models are ready)
-    )
-    
-    # Create and start the event watcher with our processing callback
-    watcher = SysmonEventWatcher(callback=process_event)
-    watcher.start()
 
+    stop_event = threading.Event()
+
+    detection_pipeline = DetectionPipeline(
+        enable_l1=True,
+        enable_l2=True,
+        enable_l3=False,
+        enable_l4=False,
+    )
+
+    watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
+
+    # Define AFTER watcher and stop_event exist
     def _stop(signum, frame):
-        """Gracefully stop the watcher on interrupt."""
         print("\n" + "=" * 70)
         print("Stopping watcher...")
-        watcher.stop()
-        watcher.join(timeout=2)
-        
-        # Print final statistics
+        stop_event.set()       # unblocks watcher's _stop_event.wait()
+        watcher.stop()         # redundant but explicit
+        watcher.join(timeout=5)
         if detection_pipeline:
             detection_pipeline.print_stats()
-        
         print("=" * 70)
-        sys.exit(0)
-        sys.exit(0)
+        sys.exit(0)            # ← important: actually exits
 
-    # Handle Ctrl+C and termination signals
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    # Keep the main thread alive
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        _stop(None, None)
+    watcher.start()
 
+    # Loop instead of a long blocking wait — allows signals to be processed
+     #stop_event.wait()
+    while not stop_event.is_set():
+        time.sleep(0.2)
+    if detection_pipeline:
+        detection_pipeline.print_stats()
+        
+   
 
 if __name__ == "__main__":
     main()
