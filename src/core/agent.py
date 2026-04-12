@@ -97,7 +97,7 @@ def main():
 
     detection_pipeline = DetectionPipeline(
         enable_l1=True,
-        enable_l2=True,
+        enable_l2=False,
         enable_l3=False,
         enable_l4=False,
     )
