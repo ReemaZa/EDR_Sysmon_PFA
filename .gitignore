@@ -43,3 +43,11 @@ htmlcov/
 config/config.local.yaml
 .env
 .env.local
+
+
+# Données de détection (Trop lourd pour Git)
+src/detection/l1_hash_check/*.csv
+
+# Résultats de tests et logs
+results.json
+*.log

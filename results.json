@@ -163653,4 +163653,889 @@
             "source": "redis-cache"
         }
     }
-][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][]
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:18",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:18.823",
+                "ProcessGuid": "{feade960-05c6-69dc-e623-000000003c00}",
+                "ProcessId": "20156",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 32,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:34",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:34.002",
+                "ProcessGuid": "{feade960-05d6-69dc-fe23-000000003c00}",
+                "ProcessId": "23428",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 33,
+            "source": "redis-cache"
+        }
+    }
+][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:36",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:36.195",
+                "ProcessGuid": "{feade960-05d8-69dc-0324-000000003c00}",
+                "ProcessId": "16336",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 34,
+            "source": "redis-cache"
+        }
+    }
+][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:37",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:37.468",
+                "ProcessGuid": "{feade960-05d9-69dc-0524-000000003c00}",
+                "ProcessId": "2732",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 35,
+            "source": "redis-cache"
+        }
+    }
+][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:40",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:40.242",
+                "ProcessGuid": "{feade960-05dc-69dc-0724-000000003c00}",
+                "ProcessId": "25976",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 36,
+            "source": "redis-cache"
+        }
+    }
+][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:41",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:41.460",
+                "ProcessGuid": "{feade960-05dd-69dc-0924-000000003c00}",
+                "ProcessId": "18260",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 37,
+            "source": "redis-cache"
+        }
+    }
+][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:51:43",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:51:43.332",
+                "ProcessGuid": "{feade960-05df-69dc-0e24-000000003c00}",
+                "ProcessId": "18208",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 38,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:52:03",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:52:03.251",
+                "ProcessGuid": "{feade960-05f3-69dc-2924-000000003c00}",
+                "ProcessId": "26972",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-05e5-69dc-2124-000000003c00}",
+                "ParentProcessId": "14340",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "C:\\WINDOWS\\System32\\cmd.exe",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 1,
+            "source": "fresh-detection"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:52:58",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:52:58.007",
+                "ProcessGuid": "{feade960-062a-69dc-aa24-000000003c00}",
+                "ProcessId": "24680",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-05e5-69dc-2124-000000003c00}",
+                "ParentProcessId": "14340",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "C:\\WINDOWS\\System32\\cmd.exe",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 2,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:54:12",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:54:12.201",
+                "ProcessGuid": "{feade960-0674-69dc-7a25-000000003c00}",
+                "ProcessId": "25504",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-05e5-69dc-2124-000000003c00}",
+                "ParentProcessId": "14340",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "C:\\WINDOWS\\System32\\cmd.exe",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 3,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 20:57:49",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 20:57:49.426",
+                "ProcessGuid": "{feade960-074d-69dc-4727-000000003c00}",
+                "ProcessId": "26308",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-05e5-69dc-2124-000000003c00}",
+                "ParentProcessId": "14340",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "C:\\WINDOWS\\System32\\cmd.exe",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 4,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 21:01:54",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 21:01:54.839",
+                "ProcessGuid": "{feade960-0842-69dc-3c28-000000003c00}",
+                "ProcessId": "25408",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-05e5-69dc-2124-000000003c00}",
+                "ParentProcessId": "14340",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "C:\\WINDOWS\\System32\\cmd.exe",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 5,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 21:06:41",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 21:06:41.091",
+                "ProcessGuid": "{feade960-0961-69dc-572a-000000003c00}",
+                "ProcessId": "15060",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 39,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 21:07:18",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 21:07:18.544",
+                "ProcessGuid": "{feade960-0986-69dc-ca2a-000000003c00}",
+                "ProcessId": "3412",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 40,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][][
+    {
+        "event": {
+            "timestamp": "2026-04-12 21:14:15",
+            "event_id": 1,
+            "computer": "LAPTOP-JU3BUMUD",
+            "event_type": "Process Create",
+            "data": {
+                "RuleName": "-",
+                "UtcTime": "2026-04-12 21:14:15.835",
+                "ProcessGuid": "{feade960-0b27-69dc-652c-000000003c00}",
+                "ProcessId": "6796",
+                "Image": "C:\\Windows\\System32\\bash.exe",
+                "FileVersion": "10.0.26100.7309 (WinBuild.160101.0800)",
+                "Description": "Microsoft Bash Launcher",
+                "Product": "Microsoft\u00ae Windows\u00ae Operating System",
+                "Company": "Microsoft Corporation",
+                "OriginalFileName": "Bash.exe",
+                "CommandLine": "bash.exe  -c \"echo fafa\"",
+                "CurrentDirectory": "C:\\Users\\farah\\",
+                "User": "LAPTOP-JU3BUMUD\\farah",
+                "LogonGuid": "{feade960-e9c1-69db-de22-460000000000}",
+                "LogonId": "0x4622de",
+                "TerminalSessionId": "1",
+                "IntegrityLevel": "Medium",
+                "Hashes": "MD5=60BBCC746B709A52FFF20D4DC6AAFA92,SHA256=4BB9D3546809B9129078135286C4E044F781357A3E0AF5659CCE6A5E448537AF,IMPHASH=45A1D18F094FF1E476CBA5BDED0A231E",
+                "ParentProcessGuid": "{feade960-fc22-69db-4418-000000003c00}",
+                "ParentProcessId": "17996",
+                "ParentImage": "C:\\Windows\\System32\\cmd.exe",
+                "ParentCommandLine": "\"C:\\WINDOWS\\system32\\cmd.exe\" ",
+                "ParentUser": "LAPTOP-JU3BUMUD\\farah"
+            },
+            "hashes": {
+                "md5": "60bbcc746b709a52fff20d4dc6aafa92",
+                "sha256": "4bb9d3546809b9129078135286c4e044f781357a3e0af5659cce6a5e448537af",
+                "imphash": "45a1d18f094ff1e476cba5bded0a231e"
+            }
+        },
+        "layer_name": "L2-Sigma",
+        "threat_level": "MEDIUM",
+        "matches": [
+            "Indirect Inline Command Execution Via Bash.EXE",
+            "Indirect Command Execution From Script File Via Bash.EXE"
+        ],
+        "metadata": {
+            "rules": [
+                "Indirect Inline Command Execution Via Bash.EXE",
+                "Indirect Command Execution From Script File Via Bash.EXE"
+            ],
+            "techniques": [
+                "attack.t1202"
+            ],
+            "tactics": [
+                "defense-evasion"
+            ],
+            "count": 41,
+            "source": "redis-cache"
+        }
+    }
+][][][][][][][][][][][][][]

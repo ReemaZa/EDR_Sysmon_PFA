@@ -3,5 +3,6 @@ pywin32>=305
 # HTTP requests for VirusTotal API
 requests>=2.31.0
 pysigma
-pysigma-pipeline-sysmon  
+python-dotenv
+pysigma-pipeline-sysmon
 redis 

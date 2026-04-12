@@ -108,7 +108,12 @@ class SysmonEventWatcher(threading.Thread):
             
             # Parse and normalize using ingestion module
             evt = parse_sysmon_event(xml_content)
-            
+            #print('**********************************')
+            #from pprint import pprint
+
+            #pprint(evt)
+            #print('**********************************')
+
             if evt is None:
                 print(f"[WARNING] Failed to parse event")
                 return
