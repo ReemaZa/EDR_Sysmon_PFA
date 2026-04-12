@@ -80,9 +80,10 @@ class DetectionPipeline:
         
         # Load L1 engine if enabled
         if enable_l1:
-            from src.detection.l1_hash_reputation import HashReputationEngine
-            self.l1_engine = HashReputationEngine()
         
+            from src.detection.l1_hash_check.l1_hash_reputation import HashReputationEngine
+            self.l1_engine = HashReputationEngine()
+
         # L2-L4 will be loaded when implemented
         if enable_l2:
         #     from src.detection.l2_sigma_engine import SigmaEngine
@@ -148,7 +149,14 @@ class DetectionPipeline:
         self.stats['total_events'] += 1
         
         # ===== LAYER 1: Hash Reputation =====
-        if self.enable_l1 and self.l1_engine:
+        # Check only logs that have hash fields (e.g., ProcessCreate, FileCreate, etc.)
+        # Quick pre-check: Does this event have ANY hash field?
+        event_hashes = event.get('hashes', {})
+        
+        #print("event_hashes:", event_hashes)
+        
+        target_hash = event_hashes.get('sha256') or event_hashes.get('md5') or event_hashes.get('sha1')
+        if self.enable_l1 and self.l1_engine and target_hash: 
             l1_result = self.l1_engine.check_event(event)
             if l1_result:
                 verdict.add_result(l1_result)
@@ -160,6 +168,7 @@ class DetectionPipeline:
                     self.stats['critical'] += 1
                     self.stats['alerts'] += 1
                     return verdict
+            print(f"DEBUG: L1 Hash Reputation check for {target_hash[:10]}: {l1_result}") # ADD THIS
         
         # ===== LAYER 2: Sigma Rules =====
         if self.enable_l2 and self.l2_engine:
@@ -297,9 +306,19 @@ class DetectionPipeline:
         # Print L1 detailed stats if available
         if 'l1_stats' in stats:
             l1 = stats['l1_stats']
-            print(f"\nL1 Hash Reputation Details:")
-            print(f"  Total Checks:     {l1['total_checks']}")
-            print(f"  Blacklist Hits:   {l1['blacklist_hits']}")
-            print(f"  Blacklist Size:   {l1['blacklist_size']}")
+            print(f"\n[+] L1 Hash Reputation (Simplified) Details:")
+            
+            # Local Database Stats
+            print(f"  Total Checks:        {l1.get('total_checks', 0)}")
+            print(f"  Whitelist Hits:      {l1.get('whitelist_hits', 0)} (Size: {l1.get('whitelist_size', 0)})")
+            print(f"  Local Malware Hits:  {l1.get('malware_table_hits', 0)} (Size: {l1.get('malware_db_size', 0)})")
+            
+            # API Stats
+            print(f"  API Queries:         {l1.get('api_queries', 0)}")
+            print(f"  API Errors/Limits:   {l1.get('api_errors', 0)}")
+            
+            # Summary
+            print(f"  Total Malicious:     {l1.get('malicious_found', 0)}")
+            print(f"  Detection Rate:      {l1.get('detection_rate', '0.00%')}")
         
         print("="*60 + "\n")
