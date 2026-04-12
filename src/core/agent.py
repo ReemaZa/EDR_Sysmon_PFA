@@ -43,7 +43,7 @@ def process_event(evt):
     
     # Print brief event info
     event_type = evt.get('event_type', 'Unknown')
-    event_id = evt.get('event_id', '?')
+    event_id = evt.get('event_id', 0)
     timestamp = evt.get('timestamp', '')
     
     # Format based on threat level

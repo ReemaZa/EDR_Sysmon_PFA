@@ -1,0 +1,250 @@
+{
+    "1": {
+        "fields": [
+            "Hashes",
+            "Image",
+            "CurrentDirectory",
+            "ParentImage",
+            "LogonId",
+            "OriginalFileName",
+            "EventID",
+            "ParentUser",
+            "ParentCommandLine",
+            "FileVersion",
+            "Description",
+            "Product",
+            "Company",
+            "Provider_Name",
+            "User",
+            "IntegrityLevel",
+            "CommandLine"
+        ]
+    },
+    "2": {
+        "fields": [
+            "Image",
+            "TargetFilename",
+            "EventID"
+        ]
+    },
+    "3": {
+        "fields": [
+            "SourcePort",
+            "Image",
+            "DestinationIp",
+            "ParentImage",
+            "DestinationHostname",
+            "SourceIsIpv6",
+            "DestinationPort",
+            "SourceHostname",
+            "SourceIp",
+            "EventID",
+            "Initiated",
+            "User",
+            "CommandLine",
+            "Protocol"
+        ]
+    },
+    "4": {
+        "fields": [
+            "Description",
+            "State",
+            "EventID"
+        ]
+    },
+    "5": {
+        "fields": []
+    },
+    "6": {
+        "fields": [
+            "Hashes",
+            "EventID",
+            "ImageLoaded"
+        ]
+    },
+    "7": {
+        "fields": [
+            "Hashes",
+            "Image",
+            "CommandLine",
+            "OriginalFileName",
+            "Signature",
+            "EventID",
+            "Description",
+            "Product",
+            "Company",
+            "Signed",
+            "SignatureStatus",
+            "ImageLoaded"
+        ]
+    },
+    "8": {
+        "fields": [
+            "TargetParentProcessId",
+            "StartAddress",
+            "StartFunction",
+            "TargetImage",
+            "SourceParentImage",
+            "EventID",
+            "SourceCommandLine",
+            "StartModule",
+            "SourceImage"
+        ]
+    },
+    "9": {
+        "fields": []
+    },
+    "10": {
+        "fields": [
+            "TargetImage",
+            "EventID",
+            "GrantedAccess",
+            "SourceUser",
+            "Provider_Name",
+            "CallTrace",
+            "SourceImage"
+        ]
+    },
+    "11": {
+        "fields": []
+    },
+    "12": {
+        "fields": [
+            "TargetObject",
+            "Image",
+            "EventType",
+            "EventID",
+            "Details",
+            "NewName"
+        ]
+    },
+    "13": {
+        "fields": [
+            "TargetObject",
+            "Image",
+            "EventType",
+            "EventID",
+            "Details",
+            "User",
+            "NewName"
+        ]
+    },
+    "14": {
+        "fields": [
+            "TargetObject",
+            "Image",
+            "EventType",
+            "EventID",
+            "Details",
+            "NewName"
+        ]
+    },
+    "15": {
+        "fields": [
+            "Hash",
+            "Contents",
+            "Image",
+            "TargetFilename",
+            "EventID"
+        ]
+    },
+    "16": {
+        "fields": [
+            "Description",
+            "State",
+            "EventID"
+        ]
+    },
+    "17": {
+        "fields": [
+            "EventID",
+            "Image",
+            "PipeName"
+        ]
+    },
+    "18": {
+        "fields": [
+            "EventID",
+            "Image",
+            "PipeName"
+        ]
+    },
+    "19": {
+        "fields": [
+            "EventID",
+            "Destination"
+        ]
+    },
+    "20": {
+        "fields": [
+            "EventID",
+            "Destination"
+        ]
+    },
+    "21": {
+        "fields": [
+            "EventID",
+            "Destination"
+        ]
+    },
+    "22": {
+        "fields": [
+            "QueryName",
+            "EventID",
+            "Image"
+        ]
+    },
+    "23": {
+        "fields": [
+            "User",
+            "Image",
+            "TargetFilename",
+            "EventID"
+        ]
+    },
+    "24": {
+        "fields": []
+    },
+    "25": {
+        "fields": [
+            "Image",
+            "Type",
+            "EventID"
+        ]
+    },
+    "26": {
+        "fields": [
+            "FileName",
+            "Image",
+            "ParentImage"
+        ]
+    },
+    "27": {
+        "fields": [
+            "FileName",
+            "Image",
+            "ParentImage"
+        ]
+    },
+    "28": {
+        "fields": [
+            "FileName",
+            "Image",
+            "ParentImage"
+        ]
+    },
+    "29": {
+        "fields": [
+            "FileName",
+            "Image",
+            "ParentImage"
+        ]
+    },
+    "255": {
+        "fields": [
+            "Description",
+            "State",
+            "EventID"
+        ]
+    }
+}
