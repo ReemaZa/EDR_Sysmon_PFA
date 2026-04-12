@@ -57,7 +57,7 @@ class DetectionPipeline:
             print("THREAT DETECTED!")
     """
     
-    def __init__(self, enable_l1=False, enable_l2=True, enable_l3=True, enable_l4=False):
+    def __init__(self, enable_l1=True, enable_l2=True, enable_l3=True, enable_l4=False):
         """
         Initialize the pipeline.
         

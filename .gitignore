@@ -33,7 +33,7 @@ Thumbs.db
 data/*.db
 logs/
 data/graph_snapshots/
-
+*.json
 # Testing
 .pytest_cache/
 .coverage

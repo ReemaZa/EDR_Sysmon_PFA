@@ -163,6 +163,7 @@ def parse_sysmon_event(xml_string):
             'timestamp': timestamp,
             'event_id': int(event_id),
             'computer': computer,
+            'event_type': SYSMON_EVENTS[int(event_id)],
             'data': data_fields
         }
 
