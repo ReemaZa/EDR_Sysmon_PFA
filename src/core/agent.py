@@ -14,6 +14,7 @@ import time
 
 from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
+from src.graph.Graph_Builder import GraphBuilder
 
 
 # Global pipeline instance
@@ -25,7 +26,7 @@ _self_guid = None          # Sysmon GUID of this EDR process, discovered at runt
 _self_guid_lock = threading.Lock()
 EDR_IMAGE_MARKER = "EDR_Sysmon_PFA"  # Substring that identifies our image path
 
-
+graph_builder=GraphBuilder()
 
 def _is_edr_image(image_path: str) -> bool:
     """
@@ -164,19 +165,20 @@ def process_event(evt):
     print(f"{alert_icon} [{event_id:2d}] {timestamp} | {event_type:30s} | Threat: {threat_name}")
 
     output = []
-    if verdict.layer_results:
-        for result in verdict.layer_results:
-            matches = ', '.join(result.matches[:2])
-            print(f"       └─ {result.layer_name}: {result.threat_level.name} - {matches}")
-            print(f"   MetaData {result.metadata}")
-            output.append({
-            "threat_level": result.threat_level.name,
-                "event":      evt,
-                "layer_name": result.layer_name,
-                "threat_level": result.threat_level.name,
-                "matches":    result.matches[:2],
-                "metadata":   result.metadata,
-            })
+    # ================= GRAPH BUILDER =================
+    try:
+        graph_detection = None
+        
+        if verdict and verdict.layer_results:
+            for result in verdict.layer_results:
+                if result.layer_name == "L2-Sigma":
+                    graph_detection = result.metadata.get("graph_detection")
+                    break
+          
+        graph_builder.process_event(evt, graph_detection)
+    
+    except Exception as e:
+        print("[GRAPH ERROR]", str(e))
 
     # 👉 Save to file AFTER the loop
     with open("results.json", "a") as f:
