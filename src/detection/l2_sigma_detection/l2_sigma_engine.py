@@ -10,7 +10,7 @@ from sigma.collection import SigmaCollection
 from sigma.pipelines.sysmon import sysmon_pipeline
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
-
+from Enums.severity import SCORE_TO_THREAT, SEVERITY_MAP
 from sigma_rule_matcher_local.matcher import RuleMatcher
 from src.core.utils import DetectionResult, ThreatLevel
 
@@ -19,7 +19,7 @@ from src.core.utils import DetectionResult, ThreatLevel
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 REDIS_DB = 0
-
+SYSTEM_FINDINGS_INIT_KEY = "system:findings:initialized"
 
 event_id_to_folders = {
     1: {'process_creation': ['process_creation']},
@@ -50,15 +50,13 @@ class SigmaEngine:
         self.preloaded_rules = {}
         self.fields_by_event = {}
 
-        # ✅ Redis connection
         self.redis = redis.Redis(
             host=REDIS_HOST,
             port=REDIS_PORT,
             db=REDIS_DB,
             decode_responses=True,
-         
-        socket_connect_timeout=5,
-        retry_on_timeout=True,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
         )
         print(self.redis.ping())
 
@@ -68,7 +66,6 @@ class SigmaEngine:
 
         print("[INIT] Extracting fields...")
         self.fields_by_event = self._load_fields_from_json("fields.json")
-        
 
     # ================= LOAD RULES =================
     def _load_rules_from_path(self, folder_path, categories=None):
@@ -91,6 +88,16 @@ class SigmaEngine:
         return rules
 
     def _load_all_rules(self):
+        redis_initialized = False
+
+        if self.redis.exists(SYSTEM_FINDINGS_INIT_KEY):
+            redis_initialized = True
+            print("[INIT] Redis findings already initialized")
+
+        print("[INIT] Preloading findings ...")
+
+        total_rules = 0
+
         for event_id, folders in event_id_to_folders.items():
             self.preloaded_rules[event_id] = []
 
@@ -98,18 +105,57 @@ class SigmaEngine:
                 path = os.path.join(self.rules_dir, folder)
                 rules = self._load_rules_from_path(path, categories)
 
-                # ✅ THIS WAS YOUR BUG BEFORE
-                self.preloaded_rules[event_id].extend(rules)
+                for matcher in rules:
+                    rule = matcher.rule
+                    self.preloaded_rules[event_id].append(matcher)
+
+                    if not redis_initialized:
+                        rule_id = str(getattr(rule, "id", None))
+                        if not rule_id:
+                            continue
+
+                        level = str(getattr(rule, "level", "low")).lower()
+                        score = SEVERITY_MAP.get(level, 0)
+
+                        techniques = []
+                        tactics = []
+
+                        for tag in getattr(rule, "tags", []):
+                            tag = str(tag)
+                            if tag.startswith("attack.t"):
+                                techniques.append(tag)
+                            elif tag.startswith("attack."):
+                                tactic = tag.replace("attack.", "")
+                                if not tactic.startswith("t"):
+                                    tactics.append(tactic)
+
+                        finding_template = {
+                            "rule_id": rule_id,
+                            "title": rule.title,
+                            "score": score,
+                            "techniques": list(set(techniques)),
+                            "tactics": list(set(tactics))
+                        }
+
+                        self.redis.set(
+                            f"finding:{rule_id}",
+                            json.dumps(finding_template)
+                        )
+
+                        total_rules += 1
+
+        self.redis.set(SYSTEM_FINDINGS_INIT_KEY, "1")
+        print(f"[INIT] Findings cached in Redis: {total_rules} rules")
 
     # ================= FIELD EXTRACTION =================
     def _extract_fields_recursive(self, detection, fields_set):
         for item in detection.detection_items:
-
             if hasattr(item, "detection_items"):
                 self._extract_fields_recursive(item, fields_set)
             else:
                 if getattr(item, "field", None):
                     fields_set.add(item.field)
+
     def _load_fields_from_json(self, path: str) -> Dict[int, Dict[str, Any]]:
         if not os.path.exists(path):
             raise FileNotFoundError(f"[ERROR] fields.json not found at {path}")
@@ -128,6 +174,7 @@ class SigmaEngine:
                 print(f"[WARNING] Invalid event_id in fields.json: {event_id}")
 
         return normalized
+
     def export_event_fields(self):
         result = {}
 
@@ -137,11 +184,9 @@ class SigmaEngine:
             for matcher in matchers:
                 rule = matcher.rule
 
-                # explicit fields
                 for f in getattr(rule, "fields", []) or []:
                     fields_set.add(f)
 
-                # detection fields
                 try:
                     for det in rule.detection.detections.values():
                         self._extract_fields_recursive(det, fields_set)
@@ -168,126 +213,156 @@ class SigmaEngine:
                 extracted[f] = str(v).lower()
 
         canonical = json.dumps(extracted, sort_keys=True)
-
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     # ================= REDIS =================
     def is_duplicate(self, event_hash: str) -> bool:
-        return self.redis.exists(event_hash)
+        return self.redis.exists(f"event:{event_hash}")
 
     def store_event(self, event_hash: str, data: dict):
-        self.redis.set(event_hash, json.dumps(data))
+        # Single unified key: event:{hash}
+        self.redis.set(f"event:{event_hash}", json.dumps(data))
 
     def get_event(self, event_hash: str):
-        data = self.redis.get(event_hash)
+        data = self.redis.get(f"event:{event_hash}")
         return json.loads(data) if data else None
 
+    def _build_aggregation_from_matched_rules(
+        self,
+        matched_rule_ids: list,
+        matched_rule_titles: list,
+        techniques: list,
+        tactics: list,
+        total_score: int,
+        count: int,
+        event: dict,
+    ) -> dict:
+        return {
+            "event": event,
+            "matches": matched_rule_titles,
+            "finding_ids": matched_rule_ids,
+            "total_score": total_score,
+            "techniques": list(set(techniques)),
+            "tactics": list(set(tactics)),
+            "count": count,
+        }
+    def _build_graph_detection(self, data: dict) -> dict:
+        """
+        Convert internal aggregation → GraphBuilder format
+        """
+        return {
+            "finding_ids": data.get("finding_ids", []),
+            "techniques": data.get("techniques", []),
+            "tactics": data.get("tactics", []),
+            "total_score": data.get("total_score", 0),
+        }
     # ================= MAIN =================
     def check_event(self, event: Dict[str, Any]) -> Optional[DetectionResult]:
-       try:
-           event = {**event, **event["data"]}
+        try:
+            event = {**event, **event["data"]}
 
-           event_hash = self.build_event_hash(event)
-           if not event_hash:
-               return None
+            event_hash = self.build_event_hash(event)
+            if not event_hash:
+                return None
 
-           # ================= DUPLICATE =================
-           if self.is_duplicate(event_hash):
-               data = self.get_event(event_hash)
+            # ================= DUPLICATE =================
+            if self.is_duplicate(event_hash):
+                data = self.get_event(event_hash)
 
-               if not data:
-                   return None  # safety
+                if not data:
+                    return None
 
-               # 🔁 increment counter
-               data["count"] = data.get("count", 1) + 1
-               self.store_event(event_hash, data)
+                # Increment counter and persist
+                data["count"] = data.get("count", 1) + 1
+                self.store_event(event_hash, data)
 
-               print(f"[DUPLICATE x{data['count']}] {event_hash}")
+                print(f"[DUPLICATE x{data['count']}] {event_hash}")
 
-               # 🔁 rebuild DetectionResult from Redis
-               if len(data.get("matches", []))>0:
+                # Only emit a result if the original event actually matched rules
+                if data.get("matches"):
                     return DetectionResult(
                         layer_name="L2-Sigma",
-                        threat_level=ThreatLevel[data.get("threat_level", "").upper()],
-                        matches=data.get("matches", []),
+                        threat_level=SCORE_TO_THREAT.get(
+                            data.get("total_score", 0), ThreatLevel.LOW
+                        ),
+                        matches=data["matches"],
                         metadata={
-                            **data.get("metadata", {}),
+                            "rules": data["matches"],
+                            #"techniques": data.get("techniques", []),
+                            #"tactics": data.get("tactics", []),
+                            #"finding_ids": data.get("finding_ids", []),
+                            #"total_score": data.get("total_score", 0),
                             "count": data["count"],
-                            "source": "redis-cache"
-                        }
+                            "source": "redis-cache",
+                            "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                        },
                     )
-               
-               return None
-            
 
-           # ================= FIRST TIME =================
-           matched_rules = []
-           metadata = {
-               "rules": [],
-               "techniques": set(),
-               "tactics": set()
-           }
+                return None
 
-           max_severity = ThreatLevel.LOW  # track highest severity
+            # ================= FIRST TIME — run ALL matchers first =================
+            matched_rule_ids = []
+            matched_rule_titles = []
+            techniques = set()
+            tactics = set()
+            total_score = 0
 
-           for matcher in self.preloaded_rules.get(int(event['event_id']), []):
-               if matcher.match(event):
-                   rule = matcher.rule
+            for matcher in self.preloaded_rules.get(int(event["event_id"]), []):
+                if matcher.match(event):
+                    rule = matcher.rule
+                    rule_id = str(getattr(rule, "id", "unknown"))
+                    print(f"========================id================== {rule_id}")
 
-                   matched_rules.append(rule.title)
-                   metadata["rules"].append(rule.title)
+                    matched_rule_ids.append(rule_id)
+                    matched_rule_titles.append(rule.title)
 
-                   # 🎯 extract MITRE tags
-                   for tag in getattr(rule, "tags", []):
-                       tag = str(tag)
-                       if tag.startswith("attack.t"):
-                           metadata["techniques"].add(tag)
-                       elif tag.startswith("attack."):
-                           metadata["tactics"].add(tag.replace("attack.", ""))
+                    # Score
+                    level = str(getattr(rule, "level", "low")).lower()
+                    total_score += SEVERITY_MAP.get(level, 0)
 
-                   # 🔥 extract Sigma level
-                   level = getattr(rule, "level", None)
+                    # MITRE tags
+                    for tag in getattr(rule, "tags", []):
+                        tag = str(tag)
+                        if tag.startswith("attack.t"):
+                            techniques.add(tag)
+                        elif tag.startswith("attack."):
+                            tactics.add(tag.replace("attack.", ""))
 
-                   if level:
-                       level_str = str(level).lower()
+            # ================= STORE — single unified record =================
+            data = self._build_aggregation_from_matched_rules(
+                matched_rule_ids=matched_rule_ids,
+                matched_rule_titles=matched_rule_titles,
+                techniques=list(techniques),
+                tactics=list(tactics),
+                total_score=total_score,
+                count=1,
+                event=event,
+            )
 
-                       if level_str == "critical":
-                           max_severity = ThreatLevel.CRITICAL
-                       elif level_str == "high" and max_severity != ThreatLevel.CRITICAL:
-                           max_severity = ThreatLevel.HIGH
-                       elif level_str == "medium" and max_severity not in [ThreatLevel.CRITICAL, ThreatLevel.HIGH]:
-                           max_severity = ThreatLevel.MEDIUM
-                       elif level_str == "low" and max_severity == ThreatLevel.LOW:
-                           max_severity = ThreatLevel.LOW
-           metadata["techniques"] = list(set(metadata["techniques"]))
-           metadata["tactics"] = list(set(metadata["tactics"]))
+            self.store_event(event_hash, data)
+            print(f"[NEW] {event_hash}")
 
-           
-           # ================= STORE =================
-           data = {
-               "event": event,
-               "matches": matched_rules,
-               "metadata": metadata,
-               "threat_level": max_severity.name,
-               "count": 1
-           }
+            if not matched_rule_titles:
+                return None
 
-           self.store_event(event_hash, data)
+            threat_level = SCORE_TO_THREAT.get(data["total_score"], ThreatLevel.LOW)
 
-           print(f"[NEW] {event_hash}")
-           if not matched_rules:
-               return None
-           return DetectionResult(
-               layer_name="L2-Sigma",
-               threat_level=max_severity,
-               matches=matched_rules,
-               metadata={
-                   **metadata,
-                   "count": 1,
-                   "source": "fresh-detection"
-               }
-           )
+            return DetectionResult(
+                layer_name="L2-Sigma",
+                threat_level=threat_level,
+                matches=matched_rule_titles,
+                metadata={
+                    "rules": matched_rule_titles,
+                    #"techniques": data["techniques"],
+                    #"tactics": data["tactics"],
+                    #"finding_ids": matched_rule_ids,
+                    #"total_score": data["total_score"],
+                    "count": 1,
+                    "source": "fresh-detection",
+                    "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                },
+            )
 
-       except Exception:
-           traceback.print_exc()
-           return None
+        except Exception:
+            traceback.print_exc()
+            return None
