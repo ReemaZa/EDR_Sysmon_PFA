@@ -48,11 +48,14 @@ event_id_to_folders = {
 
 
 class SigmaEngine:
-    """
-    Sigma rule matching engine with exception handling.
-    """
+    """Sigma rule matching engine with exception handling."""
 
-    def __init__(self, rules_dir: str = r"src\detection\l2_sigma_detection\rules\windows"):
+    def __init__(self, rules_dir: str = None):
+        # Resolve default rules directory relative to this file so loading
+        # works regardless of current working directory when the app runs.
+        if rules_dir is None:
+            base_dir = os.path.dirname(__file__)
+            rules_dir = os.path.join(base_dir, 'rules', 'windows')
         self.rules_dir = rules_dir
         self.preloaded_rules = {}
         self.stats = {'total_checks': 0, 'rule_matches': 0}
@@ -150,9 +153,18 @@ class SigmaEngine:
             metadata['total_checks'] = self.stats['total_checks']
             metadata['rules_matched'] = len(matched_rules)
             #metadata['event_processing_delay'] = time.time() - event_ts
-            print(len(matched_rules))
-            if len(matched_rules)==0:
+            # If no matches, return None
+            if len(matched_rules) == 0:
                 return None
+
+            # Print matches to console for visibility
+            try:
+                event_summary = f"event_id={event.get('event_id')} timestamp={event.get('timestamp')} computer={event.get('computer') }"
+            except Exception:
+                event_summary = "event=<unknown>"
+            for title in matched_rules:
+                print(f"[L2-SIGMA] Match - {event_summary} -> {title}")
+            self.stats['rule_matches'] += len(matched_rules)
             return DetectionResult(
                 layer_name="L2-Sigma",
                 threat_level=ThreatLevel.LOW,
