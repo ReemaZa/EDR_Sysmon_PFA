@@ -2,13 +2,12 @@
 Layer 1: Simplified Hash Reputation Engine
 
 PURPOSE:
-    Simple 3-step hash checking:
-    1. Check whitelist table → SKIP (trusted)
-    2. Check MalwareBazaar table → CRITICAL (malicious)
-    3. Check MalwareBazaar API → CRITICAL (malicious) + add to table
+    Simple 2-step hash checking:
+    1. Check MalwareBazaar table → CRITICAL (malicious)
+    2. Check MalwareBazaar API → CRITICAL (malicious) + add to table
     
 FEATURES:
-    - Separate tables for whitelist and malware
+    - MalwareBazaar table for cached malware hashes
     - Early exit on first match (no need to check all 3 hashes)
     - No complex caching (for now)
     - Simple and fast
@@ -40,15 +39,14 @@ class HashReputationEngine:
     WORKFLOW:
     1. Extract hashes from event
     2. For EACH hash (early exit on first match):
-       a. Check whitelist → Skip if trusted
-       b. Check MalwareBazaar table → CRITICAL if found
-       c. Check MalwareBazaar API → CRITICAL if found + add to table
+       a. Check MalwareBazaar table → CRITICAL if found
+       b. Check MalwareBazaar API → CRITICAL if found + add to table
     3. Return CRITICAL if any hash is malicious, None otherwise
     """
     
     def __init__(self,
                  db_path: str = "data/malware_intelligence.db",
-                 enable_api: bool = True,
+                 enable_api: bool = False,
                  api_rate_limit: int = 100):
         """
         Initialize hash reputation engine.
@@ -83,7 +81,6 @@ class HashReputationEngine:
             'total_checks': 0,
             'malicious_found': 0,
             'clean_found': 0,
-            'whitelist_hits': 0,
             'malware_table_hits': 0,
             'api_queries': 0,
             'api_malicious': 0,
@@ -95,7 +92,6 @@ class HashReputationEngine:
         db_stats = self.db.get_stats()
         
         print(f"[L1-HASH] Hash reputation engine initialized")
-        print(f"[L1-HASH] Whitelist: {db_stats['whitelist_count']:,} hashes")
         print(f"[L1-HASH] MalwareBazaar: {db_stats['malware_count']:,} hashes")
         print(f"[L1-HASH] API: {'Enabled' if enable_api else 'Disabled'}")
     
@@ -242,15 +238,7 @@ class HashReputationEngine:
         # Check each hash (EARLY EXIT on first match!)
         for file_hash in hashes:
             
-            # === STEP 1: Check whitelist ===
-            whitelist_result = self.db.is_whitelisted(file_hash)
-            print(f"DEBUG: Whitelist check for {file_hash[:10]}: {'Found' if whitelist_result else 'Not found'}") # ADD THIS
-            if whitelist_result:
-                print(f"DEBUG: Found {file_hash[:10]} in Whitelist! Skipping...") # ADD THIS
-                self.stats['whitelist_hits'] += 1
-                continue  # Skip this hash (trusted)
-            
-            # === STEP 2: Check MalwareBazaar table ===
+            # === STEP 1: Check MalwareBazaar table ===
             malware_result = self.db.is_malware(file_hash)
             print(f"DEBUG: MalwareBazaar table check for {file_hash[:10]}: {'Found' if malware_result else 'Not found'}") # ADD THIS
             if malware_result:
@@ -262,15 +250,15 @@ class HashReputationEngine:
                     event, file_hash, malware_result, source="MalwareBazaar DB"
                 )
             
-            # === STEP 3: Check MalwareBazaar API ===
-            api_result = self._check_api(file_hash)
+            # === STEP 2: Check MalwareBazaar API ===
+            '''api_result = self._check_api(file_hash)
             if api_result:
                 self.stats['malicious_found'] += 1
                 
                 # EARLY EXIT - Found malicious hash!
                 return self._create_detection_result(
                     event, file_hash, api_result, source="MalwareBazaar API"
-                )
+                )'''
         
         # All hashes are clean or unknown
         self.stats['clean_found'] += 1
@@ -345,7 +333,6 @@ class HashReputationEngine:
             'detection_rate': f"{(self.stats['malicious_found'] / max(self.stats['total_checks'], 1) * 100):.2f}%",
             
             # Detection sources
-            'whitelist_hits': self.stats['whitelist_hits'],
             'malware_table_hits': self.stats['malware_table_hits'],
             'api_queries': self.stats['api_queries'],
             'api_malicious': self.stats['api_malicious'],
@@ -353,6 +340,5 @@ class HashReputationEngine:
             'api_rate_limited': self.stats['api_rate_limited'],
             
             # Database stats
-            'whitelist_size': db_stats['whitelist_count'],
             'malware_db_size': db_stats['malware_count'],
         }
