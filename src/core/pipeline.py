@@ -89,17 +89,16 @@ class DetectionPipeline:
         #     from src.detection.l2_sigma_engine import SigmaEngine
              self.l2_engine = SigmaEngine()
         
-        # Statistics
+        # NOUVEAU : Historique détaillé des alertes
+        self.alert_history = [] 
+        self.max_history = 100 # Pour éviter de saturer la RAM
+
         self.stats = {
-            'total_events': 0,       # How many events processed
-            'alerts': 0,             # How many threats found
-            'critical': 0,           # How many CRITICAL threats
-            'layer_hits': {          # Detections per layer
-                'l1': 0,
-                'l2': 0,
-                'l3': 0,
-                'l4': 0
-            }
+            'total_events': 0,
+            'alerts': 0,
+            'critical': 0,
+            'layer_hits': {'l1': 0, 'l2': 0, 'l3': 0, 'l4': 0},
+            'alert_logs': [] # On peut aussi les mettre ici
         }
     
     def process_event(self, event: Dict[str, Any]) -> FinalVerdict:
@@ -140,7 +139,7 @@ class DetectionPipeline:
         
         
         # Get event ID for tracking
-        event_id = str(event.get('event_record_id', 'unknown'))
+        event_id = str(event.get('event_id', 'unknown'))
         
         # Create empty verdict
         verdict = FinalVerdict(event_id, ThreatLevel.UNKNOWN)
@@ -272,6 +271,7 @@ class DetectionPipeline:
                 'alert_rate': '2.50%',
                 'layer_hits': {'l1': 20, 'l2': 5, 'l3': 0, 'l4': 0},
                 'l1_stats': {...}  # If L1 engine exists
+                'l2_stats': {...}  # If L2 engine exists
             }
         """
         stats_dict = {**self.stats}
@@ -279,6 +279,10 @@ class DetectionPipeline:
         # Add L1 engine stats if available
         if self.l1_engine:
             stats_dict['l1_stats'] = self.l1_engine.get_stats()
+        
+        # Add L2 engine stats if available
+        if self.l2_engine:
+            stats_dict['l2_stats'] = self.l2_engine.get_stats()
         
         # Calculate alert rate
         total = max(self.stats['total_events'], 1)
@@ -291,34 +295,36 @@ class DetectionPipeline:
         """Print statistics to console in a readable format."""
         stats = self.get_stats()
         
-        print("\n" + "="*60)
+        print("\n" + "="*80)
         print("DETECTION PIPELINE STATISTICS")
-        print("="*60)
+        print("="*80)
         print(f"Total Events Processed: {stats['total_events']}")
-        print(f"Alerts Generated:       {stats['alerts']} ({stats['alert_rate']})")
+        print(f"Events with Detections: {stats['alerts']} ({stats['alert_rate']})")
         print(f"Critical Alerts:        {stats['critical']}")
-        print(f"\nLayer Detections:")
-        print(f"  L1 (Hash):  {stats['layer_hits']['l1']}")
-        print(f"  L2 (Sigma): {stats['layer_hits']['l2']}")
-        print(f"  L3 (YARA):  {stats['layer_hits']['l3']}")
-        print(f"  L4 (AI):    {stats['layer_hits']['l4']}")
+        print(f"\nActive Layers Detection Count:")
+        print(f"  L1 (Hash Reputation): {stats['layer_hits']['l1']} detections")
+        print(f"  L2 (Sigma Rules):     {stats['layer_hits']['l2']} detections")
+        print(f"  L3 (YARA Scanner):    {stats['layer_hits']['l3']} detections")
         
         # Print L1 detailed stats if available
         if 'l1_stats' in stats:
             l1 = stats['l1_stats']
-            print(f"\n[+] L1 Hash Reputation (Simplified) Details:")
-            
-            # Local Database Stats
-            print(f"  Total Checks:        {l1.get('total_checks', 0)}")
-            print(f"  Whitelist Hits:      {l1.get('whitelist_hits', 0)} (Size: {l1.get('whitelist_size', 0)})")
-            print(f"  Local Malware Hits:  {l1.get('malware_table_hits', 0)} (Size: {l1.get('malware_db_size', 0)})")
-            
-            # API Stats
-            print(f"  API Queries:         {l1.get('api_queries', 0)}")
-            print(f"  API Errors/Limits:   {l1.get('api_errors', 0)}")
-            
-            # Summary
-            print(f"  Total Malicious:     {l1.get('malicious_found', 0)}")
-            print(f"  Detection Rate:      {l1.get('detection_rate', '0.00%')}")
+            print(f"\n[L1 Hash Reputation Details]")
+            print(f"  Total Hash Checks:    {l1.get('total_checks', 0)}")
+            print(f"  Local Malware Hits:   {l1.get('malware_table_hits', 0)} (Database: {l1.get('malware_db_size', 0)} hashes)")
+            print(f"  API Queries:          {l1.get('api_queries', 0)}")
+            print(f"  API Malicious Found:  {l1.get('api_malicious', 0)}")
+            print(f"  Total Malicious:      {l1.get('malicious_found', 0)}")
+            print(f"  Detection Rate:       {l1.get('detection_rate', '0.00%')}")
         
-        print("="*60 + "\n")
+        # Print L2 detailed stats if available
+        if 'l2_stats' in stats:
+            l2 = stats['l2_stats']
+            print(f"\n[L2 Sigma Rules Details]")
+            print(f"  Total Events Checked: {l2.get('total_checks', 0)}")
+            print(f"  Rules Matched:        {l2.get('rule_matches', 0)}")
+            if l2.get('total_checks', 0) > 0:
+                match_rate = (l2.get('rule_matches', 0) / l2.get('total_checks', 1)) * 100
+                print(f"  Match Rate:           {match_rate:.2f}%")
+        
+        print("="*80 + "\n")

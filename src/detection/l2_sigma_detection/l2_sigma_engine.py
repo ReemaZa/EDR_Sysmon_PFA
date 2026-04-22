@@ -45,7 +45,12 @@ event_id_to_folders = {
 
 class SigmaEngine:
 
-    def __init__(self, rules_dir: str = r"src\detection\l2_sigma_detection\rules\windows"):
+    def __init__(self, rules_dir: str = None):
+        # Resolve default rules directory relative to this file so loading
+        # works regardless of current working directory when the app runs.
+        if rules_dir is None:
+            base_dir = os.path.dirname(__file__)
+            rules_dir = os.path.join(base_dir, 'rules', 'windows')
         self.rules_dir = rules_dir
         self.preloaded_rules = {}
         self.fields_by_event = {}
