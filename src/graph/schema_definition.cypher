@@ -1,27 +1,52 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SYSMON THREAT DETECTION GRAPH — SCHEMA REFERENCE
-// Matches graph_builder.py v2.0 exactly.
+// SYSMON THREAT DETECTION GRAPH — SCHEMA REFERENCE v4.0
+// Matches graph_builder.py v4.0 exactly.
 //
-// DESIGN PRINCIPLES
-// ─────────────────
-// • ProcessTemplate  → always created, dedup key = sha256(image+parent_image+cmdline)
-//                      parent_image baked in: powershell-from-word ≠ powershell-from-explorer
-//                      holds NO score, NO parent link — identity only
+// KEY DESIGN DECISIONS
+// ─────────────────────
+// 1. ProcessTemplate key = sha256(image + parent_image + cmdline + user)
+//    user is part of identity: powershell run by SYSTEM ≠ by jsmith
+//    No separate :User node. No RAN_AS edge.
 //
-// • ProcessInstance  → created ONLY when total_score > 0 (detection fired)
-//                      holds score, alive flag, parent chain, kill target
+// 2. ProcessInstance holds ONLY operational fields:
+//    id (GUID), score (sum), ghost, alive, start_time, end_time
+//    NO image, cmdline, user — those live on the template via INSTANCE_OF
 //
-// • All other nodes  → always created on first encounter (MERGE on id)
+// 3. Ghost node = minimal GUID placeholder when parent never scored
+//    Fields: id, ghost=true, score=0, alive=true  — NOTHING ELSE
+//    No image, no start_time, no INSTANCE_OF
+//    Promoted in-place when any event fires on this GUID with score > 0
 //
-// • Edges            → MERGE key = edge_hash (timestamp excluded)
-//                      edge_hash = sha256(src + rel_type + dst + alert_signature)
-//                      alert_signature = sha256(sorted techniques + tactics)
-//                      same pair + same alert class → count++
-//                      same pair + different alert  → new edge
+// 4. CHILD_OF always instance → instance (ghost or full)
+//    Created ONLY from Event-1 (ProcessCreate — OS spawn relationship)
+//    NEVER from injection, memory access, or any other edge type
 //
-// • Score            → lives on ProcessInstance
-//                      child inherits parent.score * 0.4
-//                      late parent linking propagates score retroactively
+// 5. Score inheritance: child.score += parent.score * 0.4
+//    Applied immediately on CHILD_OF creation if parent.score > 0
+//    Applied retroactively to all children on ghost promotion
+//    Injection / memory access targets do NOT inherit from source
+//
+// 6. Edge storage gate:
+//    Store when: process.score > 0  OR  rel_type in ALWAYS_STORE
+//    Skip when:  process.score = 0  AND rel_type NOT in ALWAYS_STORE
+//    ALWAYS_STORE = {INJECTED_THREAD, ACCESSED_MEMORY, TAMPERED, TIMESTOMPED, WROTE_ADS}
+//
+// 7. Edge MERGE key = edge_hash (timestamp NEVER in MERGE)
+//    edge_hash = sha256(src_id + rel_type + dst_id + alert_sig)
+//    alert_sig = sha256(sorted techniques + tactics)
+//    Same pair + same alert class → count++, total_score += score
+//    Same pair + different alert  → new edge
+//
+// 8. ALL scores are SUMS — no max anywhere in the system
+//    edge.total_score    += effective_score
+//    instance.score      += effective_score
+//    template.total_score += effective_score (own template only, no parent bleed)
+//
+// 9. Sigma score scale: integers 1–4
+//    effective_score = max(sigma_score, base_weight)
+//    Base weights:
+//      INJECTED_THREAD 4, ACCESSED_MEMORY 3, TAMPERED 3,
+//      TIMESTOMPED 2, WROTE_ADS 2, CREATED 1, CONNECTED 1, others 0
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -36,49 +61,76 @@ CREATE CONSTRAINT ON (n:Network)         ASSERT n.id             IS UNIQUE;
 CREATE CONSTRAINT ON (n:Registry)        ASSERT n.id             IS UNIQUE;
 CREATE CONSTRAINT ON (n:DNS)             ASSERT n.id             IS UNIQUE;
 CREATE CONSTRAINT ON (n:Driver)          ASSERT n.id             IS UNIQUE;
-CREATE CONSTRAINT ON (n:User)            ASSERT n.id             IS UNIQUE;
+// NOTE: No :User constraint — user is baked into ProcessTemplate
 
- 
+
 // ─────────────────────────────────────────
 // NODE — ProcessTemplate
-// Created for every binary seen, regardless of score.
+// Always upserted on every event.
+// total_score accumulates only from events belonging to THIS template.
+// Parent template never receives score from child events.
 // ─────────────────────────────────────────
 
 MERGE (t:ProcessTemplate {template_hash: $template_hash})
 ON CREATE SET
-    t.image          = $image,          // lowercase executable path
-    t.parent_image   = $parent_image,   // baked into identity (affects hash)
-    t.cmdline        = $cmdline,        // normalised: paths stripped, switches kept, max 256 chars
-    t.description    = $description,   // PE description when available
-    t.seen_count     = 1,
-    t.max_seen_score = 0.0              // hint only — updated when any instance gains score
+    t.image        = $image,            // lowercase exe path
+    t.parent_image = $parent_image,     // baked into hash
+    t.cmdline      = $cmdline,          // normalised (paths stripped, max 256 chars)
+    t.user         = $user,             // baked into hash
+    t.description  = $description,
+    t.seen_count   = 1,
+    t.total_score  = $score,            // sum — starts with first event's score
+    t.first_seen   = $timestamp,
+    t.last_seen    = $timestamp
 ON MATCH SET
-    t.seen_count = t.seen_count + 1;
+    t.seen_count   = t.seen_count + 1,
+    t.last_seen    = $timestamp,
+    t.total_score  = t.total_score + $score;   // always sum, never max
 
 
 // ─────────────────────────────────────────
-// NODE — ProcessInstance
-// Created ONLY when total_score > 0.
+// NODE — ProcessInstance [ghost]
+// Minimal placeholder for a parent GUID that has never scored.
+// Children know the parent image via their own template's parent_image field.
 // ─────────────────────────────────────────
 
 MERGE (p:ProcessInstance {id: $guid})
 ON CREATE SET
-    p.image                   = $image,      // lowercase executable path
-    p.cmdline                 = $cmdline,    // full command line preserved
-    p.user                    = $user,
-    p.score                   = $score,      // cumulative suspicion score (mutable)
-    p.alive                   = true,
-    p.start_time              = $timestamp,
-    p.end_time                = null,        // set by Event 5 (ProcessTerminate)
-    p.pending_parent_template = $parent_template_hash
-                                             // set when parent has no instance yet
-                                             // cleared by link_late_children()
-ON MATCH SET
-    p.score = CASE WHEN $score > p.score THEN $score ELSE p.score END;
+    p.ghost = true,
+    p.score = 0,
+    p.alive = true;
+// NO image, NO start_time, NO INSTANCE_OF — nothing else
 
 
 // ─────────────────────────────────────────
-// NODE — ProcessInstance (process exit, Event 5)
+// NODE — ProcessInstance [full] — creation or ghost promotion
+// Created when effective_score > 0 OR rel_type in ALWAYS_STORE.
+// ─────────────────────────────────────────
+
+MERGE (p:ProcessInstance {id: $guid})
+ON CREATE SET
+    p.score      = $score,
+    p.ghost      = false,
+    p.alive      = true,
+    p.start_time = $timestamp       // from event UtcTime — NOT server receive time
+ON MATCH SET
+    p.score      = p.score + $score,    // always sum
+    p.ghost      = false,
+    p.start_time = CASE WHEN p.ghost = true THEN $timestamp ELSE p.start_time END;
+// On ghost promotion: start_time is set here for the first time
+
+
+// ─────────────────────────────────────────
+// INSTANCE_OF — wired after full instance creation / ghost promotion
+// ─────────────────────────────────────────
+
+MATCH (p:ProcessInstance {id: $guid})
+MATCH (t:ProcessTemplate {template_hash: $template_hash})
+MERGE (p)-[:INSTANCE_OF]->(t);
+
+
+// ─────────────────────────────────────────
+// NODE — ProcessInstance — process exit (Event 5)
 // ─────────────────────────────────────────
 
 MATCH (p:ProcessInstance {id: $guid})
@@ -87,61 +139,54 @@ SET p.alive    = false,
 
 
 // ─────────────────────────────────────────
-// NODE — Other artifact nodes
-// Always created on first encounter.
+// NODE — Artifact nodes (always on first encounter)
 // ─────────────────────────────────────────
 
-MERGE (f:File     {id: $file_id});          // id = TargetFilename lowercase
-MERGE (n:Network  {id: $ip});               // id = DestinationIp  lowercase
-MERGE (d:DNS      {id: $query_name});       // id = QueryName      lowercase
-MERGE (reg:Registry {id: $target_object}); // id = TargetObject   lowercase
-MERGE (u:User     {id: $user});             // id = username string
-MERGE (drv:Driver {id: $sha256})            // id = SHA256 hash
-ON CREATE SET drv.image = $image_loaded;
+MERGE (f:File       {id: $file_id});        // TargetFilename lowercase
+MERGE (n:Network    {id: $dst_ip});         // DestinationIp  lowercase
+MERGE (d:DNS        {id: $query_name});     // QueryName      lowercase
+MERGE (reg:Registry {id: $target_object}); // TargetObject   lowercase
+MERGE (drv:Driver   {id: $sha256})
+    ON CREATE SET drv.image = $image_loaded;
 
 
 // ─────────────────────────────────────────
-// STRUCTURAL EDGES (no compression needed)
+// STRUCTURAL EDGES
 // ─────────────────────────────────────────
 
-// ProcessInstance → its template (one per instance, never changes)
-MATCH (p:ProcessInstance {id: $guid})
-MATCH (t:ProcessTemplate {template_hash: $template_hash})
-MERGE (p)-[:INSTANCE_OF]->(t);
-
-// ProcessInstance → user account
-MATCH (p:ProcessInstance {id: $guid})
-MATCH (u:User            {id: $user})
-MERGE (p)-[:RAN_AS]->(u);
-
-// ProcessInstance → parent ProcessInstance  (normal case: parent was seen)
+// Parent chain — always instance → instance (ghost or full)
+// Created ONLY from Event-1. Never from any other event type.
 MATCH (child:ProcessInstance  {id: $child_guid})
 MATCH (parent:ProcessInstance {id: $parent_guid})
 MERGE (child)-[:CHILD_OF]->(parent);
 
-// ProcessInstance → parent ProcessTemplate  (fallback: parent never triggered a detection)
-// Cleared and replaced with CHILD_OF when parent eventually becomes an instance.
-MATCH (child:ProcessInstance {id: $child_guid})
-MATCH (pt:ProcessTemplate    {template_hash: $parent_template_hash})
-MERGE (child)-[:CHILD_OF_TEMPLATE]->(pt);
+// Score inheritance applied in application layer after CHILD_OF is created:
+//   delta = parent.score * 0.4
+//   child.score += delta   (immediate)
+// On ghost promotion:
+//   for each child in CHILD_OF children: child.score += promoted_parent.score * 0.4
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // COMPRESSED BEHAVIOUR EDGES
 //
-// MERGE key  = edge_hash  (timestamp is NEVER part of MERGE)
-// ON CREATE  = initialise all fields
-// ON MATCH   = update last_seen, count, max_score, append finding_ids (cap 20)
+// MERGE key   = edge_hash (timestamp excluded)
+// total_score = running SUM (not max)
+// ON CREATE   → initialise all fields
+// ON MATCH    → last_seen, count++, total_score += score, append finding_ids
 //
-// edge_hash  = sha256({src, rel_type, dst, alert_sig})
-// alert_sig  = sha256(sorted(techniques + tactics))
+// Storage gate (enforced in application layer before running these queries):
+//   process.score > 0  OR  rel_type in ALWAYS_STORE
 //
-// Base weights enforced in application layer:
-//   CREATED          0.3
-//   CONNECTED        0.2
-//   INJECTED_THREAD  0.9   (both endpoints always created as instances)
-//   ACCESSED_MEMORY  0.8   (both endpoints always created as instances)
-//   (others)         detection.total_score
+// Base weights (effective_score = max(sigma_score, base)):
+//   INJECTED_THREAD  4  ALWAYS_STORE
+//   ACCESSED_MEMORY  3  ALWAYS_STORE
+//   TAMPERED         3  ALWAYS_STORE
+//   TIMESTOMPED      2  ALWAYS_STORE
+//   WROTE_ADS        2  ALWAYS_STORE
+//   CREATED          1
+//   CONNECTED        1
+//   all others       0
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -156,24 +201,24 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
-    r.finding_ids = $finding_ids,   // list, capped at 20, deduped
+    r.total_score = $score,
+    r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 2 — FileCreateTime (Timestomp)
-// Minimum score enforced: 0.6
+// ALWAYS_STORE — base weight 2
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -183,24 +228,24 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 3 — NetworkConnect
-// Base weight: 0.2
+// Stored only when process.score > 0. Base weight 1.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -210,25 +255,26 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
-    r.port        = $port,          // DestinationPort
+    r.port        = $port,
     r.protocol    = $protocol
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 6 — DriverLoad
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -238,23 +284,24 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 7 — ImageLoad
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -264,24 +311,25 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 8 — CreateRemoteThread
-// Base weight: 0.9  — both endpoints ALWAYS created as instances
+// ALWAYS_STORE — base weight 4
+// Both endpoints scored independently. No CHILD_OF. No inheritance.
 // ─────────────────────────────────────────
 
 MATCH (src:ProcessInstance {id: $src_guid})
@@ -291,7 +339,7 @@ ON CREATE SET
     r.first_seen     = $timestamp,
     r.last_seen      = $timestamp,
     r.count          = 1,
-    r.max_score      = $score,
+    r.total_score    = $score,
     r.finding_ids    = $finding_ids,
     r.techniques     = $techniques,
     r.tactics        = $tactics,
@@ -299,17 +347,18 @@ ON CREATE SET
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 10 — ProcessAccess
-// Base weight: 0.8  — both endpoints ALWAYS created as instances
+// ALWAYS_STORE — base weight 3
+// Both endpoints scored independently. No CHILD_OF. No inheritance.
 // ─────────────────────────────────────────
 
 MATCH (src:ProcessInstance {id: $src_guid})
@@ -319,24 +368,25 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
-    r.access_mask = $access_mask    // GrantedAccess hex value
+    r.access_mask = $access_mask
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 11 — FileCreate
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -346,7 +396,7 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
@@ -354,17 +404,17 @@ ON CREATE SET
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Events 12 / 13 / 14 — Registry (add / set / rename)
-// event_type baked into edge_hash via alert_sig — different ops = different edges
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -374,7 +424,7 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
@@ -382,17 +432,17 @@ ON CREATE SET
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 15 — CreateStreamHash (ADS)
-// Minimum score enforced: 0.5
+// ALWAYS_STORE — base weight 2
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -402,7 +452,7 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
@@ -410,16 +460,17 @@ ON CREATE SET
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 22 — DNSQuery
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -429,23 +480,24 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 23 — FileDelete
+// Stored only when process.score > 0. Base weight 0.
 // ─────────────────────────────────────────
 
 MATCH (i:ProcessInstance {id: $guid})
@@ -455,24 +507,25 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ─────────────────────────────────────────
 // Event 25 — ProcessTampering
-// Minimum score enforced: 0.7  — both endpoints ALWAYS created as instances
+// ALWAYS_STORE — base weight 3
+// Both endpoints scored independently. No CHILD_OF. No inheritance.
 // ─────────────────────────────────────────
 
 MATCH (attacker:ProcessInstance {id: $attacker_guid})
@@ -482,92 +535,88 @@ ON CREATE SET
     r.first_seen  = $timestamp,
     r.last_seen   = $timestamp,
     r.count       = 1,
-    r.max_score   = $score,
+    r.total_score = $score,
     r.finding_ids = $finding_ids,
     r.techniques  = $techniques,
     r.tactics     = $tactics,
-    r.type        = $tamper_type    // e.g. "process hollowing"
+    r.type        = $tamper_type
 ON MATCH SET
     r.last_seen   = $timestamp,
     r.count       = r.count + 1,
-    r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+    r.total_score = r.total_score + $score,
     r.finding_ids = CASE
         WHEN size(r.finding_ids) < 20
-        THEN r.finding_ids + [x IN $finding_ids WHERE NOT x IN r.finding_ids]
+        THEN r.finding_ids + $fids
         ELSE r.finding_ids
-    END;
+    END
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MAINTENANCE QUERIES  (run periodically — not at ingestion time)
+// MAINTENANCE  (run hourly)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── Prune dead low-score instances older than 24 hours
-  //MATCH (p:ProcessInstance)
-  //WHERE p.alive = false
-  //  AND p.end_time < (timestamp() - 86400000)
-  //  AND p.score < 0.3
-  //DETACH DELETE p;
-  //
-  //// ── Compress high-frequency benign network edges (strip finding_ids, keep counts)
-  //MATCH ()-[r:CONNECTED]->(:Network)
-  //WHERE r.count > 100
-  //  AND r.max_score < 0.2
-  //SET   r.compressed = true
-  //REMOVE r.finding_ids;
-  //
-  //// ── Remove orphan artifact nodes (no edges, not a template or user)
-  //MATCH (n)
-  //WHERE NOT (n)--()
-  //  AND NOT n:ProcessTemplate
-  //  AND NOT n:User
-  //DELETE n;
+// Prune dead full instances older than 24h with low score
+MATCH (p:ProcessInstance)
+WHERE p.ghost  = false
+  AND p.alive  = false
+  AND p.score  < 3
+  AND p.end_time < (timestamp() - 86400000)
+DETACH DELETE p;
 
-// ── Update template max_seen_score hint when an instance score rises
-MATCH (p:ProcessInstance)-[:INSTANCE_OF]->(t:ProcessTemplate)
-WHERE p.score > t.max_seen_score
-SET t.max_seen_score = p.score;
+// Prune orphan artifact nodes
+MATCH (n)
+WHERE NOT (n)--()
+  AND NOT n:ProcessTemplate
+DELETE n;
+
+// Compress high-frequency low-score network edges
+MATCH ()-[r:CONNECTED]->(:Network)
+WHERE r.count > 100 AND r.total_score < 3
+SET   r.compressed = true
+REMOVE r.finding_ids;
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LLM CONTEXT EXTRACTION  (run on alert — feeds LLM prompt)
+// LLM CONTEXT EXTRACTION  (run on alert)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── Extract top-5 highest-scoring attack chains (depth up to 8 hops)
-//MATCH path = (entry:ProcessInstance)-[*1..8]->(terminal)
-//WHERE ANY(r IN relationships(path) WHERE r.max_score > 0.5)
-//  AND NONE(r IN relationships(path) WHERE r.count > 200 AND r.max_score < 0.2)
-//WITH path,
-//     reduce(s = 0, r IN relationships(path) | s + r.max_score) AS chain_score
-//ORDER BY chain_score DESC
-//LIMIT 5
-//RETURN
-//    [n IN nodes(path) | {
-//        id:    n.id,
-//        label: labels(n)[0],
-//        image: n.image,
-//        score: n.score
-//    }] AS node_chain,
-//    [r IN relationships(path) | {
-//        type:       type(r),
-//        first_seen: r.first_seen,
-//        last_seen:  r.last_seen,
-//        count:      r.count,
-//        max_score:  r.max_score,
-//        techniques: r.techniques,
-//        tactics:    r.tactics,
-//        finding_ids: r.finding_ids
-//    }] AS edge_chain,
-//    chain_score;
-//
-// ── Chain gap check tool (exposed to LLM as check_chain_gaps)
-MATCH (p:ProcessInstance {id: $guid})
-OPTIONAL MATCH (p)-[:CHILD_OF]->(parent_inst:ProcessInstance)
-OPTIONAL MATCH (p)-[:CHILD_OF_TEMPLATE]->(parent_tmpl:ProcessTemplate)
+// Top-5 highest-scoring attack chains (depth 1–8)
+MATCH path = (entry:ProcessInstance)-[*1..8]->(terminal)
+WHERE ANY(r IN relationships(path) WHERE r.total_score > 2)
+  AND NONE(r IN relationships(path) WHERE r.compressed = true)
+WITH path,
+     reduce(s = 0, r IN relationships(path) | s + r.total_score) AS chain_score
+ORDER BY chain_score DESC
+LIMIT 5
 RETURN
-    p.id                      AS id,
-    p.score                   AS score,
-    p.image                   AS image,
-    parent_inst.id            AS parent_instance_id,
-    parent_tmpl.template_hash AS parent_template_hash,
-    parent_tmpl.image         AS parent_template_image;
+    [n IN nodes(path) | {
+        id:    n.id,
+        label: labels(n)[0],
+        score: n.score,
+        ghost: n.ghost
+    }] AS node_chain,
+    [r IN relationships(path) | {
+        type:        type(r),
+        first_seen:  r.first_seen,
+        last_seen:   r.last_seen,
+        count:       r.count,
+        total_score: r.total_score,
+        techniques:  r.techniques,
+        tactics:     r.tactics,
+        finding_ids: r.finding_ids
+    }] AS edge_chain,
+    chain_score;
+
+// Chain gap check — LLM tool check_chain_gaps($guid)
+MATCH (p:ProcessInstance {id: $guid})
+OPTIONAL MATCH (p)-[:CHILD_OF]->(parent:ProcessInstance)
+OPTIONAL MATCH (p)-[:INSTANCE_OF]->(t:ProcessTemplate)
+RETURN
+    p.id          AS id,
+    p.score       AS score,
+    p.ghost       AS ghost,
+    t.image       AS image,
+    t.user        AS user,
+    parent.id     AS parent_id,
+    parent.score  AS parent_score,
+    parent.ghost  AS parent_ghost;

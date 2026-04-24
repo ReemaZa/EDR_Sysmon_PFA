@@ -1,64 +1,77 @@
 """
-graph_builder.py
-================
-Sysmon → Memgraph builder implementing the agreed design:
+graph_builder.py  —  Sysmon → Memgraph  (v4.0)
+================================================
 
-NODE STRATEGY
-─────────────
-• ProcessTemplate  — dedup key = sha256(image + parent_image + cmdline_pattern)
-                     stores: image, parent_image, description, seen_count,
-                             max_seen_score (hint only, updated when instances score)
-                     NEVER deleted.
+DESIGN SUMMARY
+──────────────
+ProcessTemplate
+    Key  : sha256(image + parent_image + normalised_cmdline + user)
+    Holds: image, parent_image, cmdline, user, description,
+           first_seen, last_seen, seen_count, total_score (sum)
+    Rule : always upserted on every event, never deleted.
+           total_score += effective_score of events belonging to THIS template only.
+           Parent template never receives bleed from child events.
 
-• ProcessInstance  — created ONLY when total_score > 0 (detection fired).
-                     stores: guid, pid, cmdline, user, host, score, alive,
-                             start_time, end_time
-                     Links: INSTANCE_OF → ProcessTemplate
-                            CHILD_OF    → parent ProcessInstance  (if parent exists & score>0)
-                                       → parent ProcessTemplate   (fallback: parent not yet instance)
+ProcessInstance [full]
+    Key  : id = Sysmon ProcessGuid
+    Holds: id, score (sum), ghost=false, alive, start_time, end_time
+    Rule : created only when effective_score > 0 OR rel_type in ALWAYS_STORE.
+           No image/cmdline/user — those live on the template.
 
-• All other nodes (File, Network, DNS, Registry, Driver, User) — always created on
-  first encounter, never duplicated (MERGE on id).
+ProcessInstance [ghost]
+    Key  : id = Sysmon ProcessGuid of parent
+    Holds: id, ghost=true, score=0, alive=true   — NOTHING ELSE.
+    Rule : created when a child instance needs CHILD_OF → parent
+           but parent has never scored.
+           No image, no start_time, no INSTANCE_OF.
+           Promoted in-place when any event fires on this GUID with score > 0.
 
-EDGE STRATEGY
-─────────────
-Every edge carries a compressed hash so identical structural+semantic events collapse
-into one edge.  timestamp is NOT part of MERGE — instead first_seen / last_seen /
-count are maintained.
+Ghost promotion
+    ON MATCH when ghost=true and new score arrives:
+        fill start_time, ghost=false, score += new_score
+        wire INSTANCE_OF → template
+        propagate score * 0.4 to all existing CHILD_OF children
 
-  edge_hash = sha256(src_id + rel_type + dst_id + finding_type_signature)
+CHILD_OF
+    Always instance → instance (ghost or full).
+    Only created from Event-1 (ProcessCreate) — OS spawn relationship.
+    Never from injection, memory access, or any other edge type.
 
-  finding_type_signature = sha256(sorted(techniques + tactics))
-  This means: same pair + same alert class → same edge (count++)
-              same pair + different alert   → different edge
+Score inheritance
+    child.score += parent.score * 0.4
+    Applied immediately when CHILD_OF is created and parent.score > 0.
+    Applied retroactively to all children when ghost is promoted.
+    Injection / memory access edges do NOT create CHILD_OF and do NOT inherit.
 
-  ON CREATE : set all fields
-  ON MATCH  : update last_seen, count, max_score, append new finding_ids (capped at 20)
+Edge storage gate
+    Store when: process.score > 0  OR  rel_type in ALWAYS_STORE
+    Skip when : process.score = 0  AND rel_type NOT in ALWAYS_STORE
+                → only bump template (seen_count++, last_seen)
 
-SCORE INHERITANCE
-─────────────────
-Edge weights (base contributions):
-  CREATED          0.3
-  CONNECTED        0.2
-  INJECTED_THREAD  0.9
-  ACCESSED_MEMORY  0.8
-  (all others)     use detection total_score directly
+ALWAYS_STORE = {INJECTED_THREAD, ACCESSED_MEMORY, TAMPERED, TIMESTOMPED, WROTE_ADS}
 
-When a ProcessInstance is created:
-  1. Its own score = detection total_score
-  2. If parent Instance exists → child.score += parent.score * 0.4
-  3. When a parent Instance is created LATER, it scans children linked via
-     CHILD_OF→template and updates their scores.
+Edge compression
+    MERGE key = edge_hash = sha256(src_id + rel_type + dst_id + alert_sig)
+    alert_sig  = sha256(sorted(techniques + tactics))
+    ON CREATE: first_seen, last_seen, count=1, total_score=score, finding_ids, ...
+    ON MATCH : last_seen, count++, total_score += score, finding_ids appended (cap 20)
+    Timestamp NEVER in MERGE key.
 
-LATE PARENT LINKING
-───────────────────
-If parent had no instance when child was created, child stores
-  pending_parent_template = parent_template_hash
-When parent eventually becomes an instance (score > 0), GraphBuilder.link_late_children()
-is called automatically, which:
-  - Finds all ProcessInstances whose pending_parent_template matches
-  - Creates CHILD_OF edges
-  - Propagates parent score to those children
+Sigma score scale: 1–4 integers.
+Base weights (floor): effective_score = max(sigma_score, base_weight)
+    INJECTED_THREAD  4
+    ACCESSED_MEMORY  3
+    TAMPERED         3
+    TIMESTOMPED      2
+    WROTE_ADS        2
+    CREATED          1
+    CONNECTED        1
+    all others       0  (use sigma score directly)
+
+Score destinations per event:
+    edge.total_score     += effective_score
+    instance.score       += effective_score
+    template.total_score += effective_score   (own template only, no parent bleed)
 """
 
 import hashlib
@@ -73,22 +86,28 @@ from gqlalchemy import Memgraph
 MEMGRAPH_HOST = "localhost"
 MEMGRAPH_PORT = 7687
 
-# ── Edge base weights (independent of detection score)
-EDGE_WEIGHTS: dict[str, float] = {
-    "CREATED":          0.3,
-    "CONNECTED":        0.2,
-    "INJECTED_THREAD":  0.9,
-    "ACCESSED_MEMORY":  0.8,
+# Sigma scale 1–4
+EDGE_WEIGHTS: dict[str, int] = {
+    "INJECTED_THREAD": 4,
+    "ACCESSED_MEMORY": 3,
+    "TAMPERED":        3,
+    "TIMESTOMPED":     2,
+  
+  
 }
 
-# ── Score threshold: only create a ProcessInstance above this
-INSTANCE_SCORE_THRESHOLD = 0.0   # > 0 means any positive detection creates instance
+ALWAYS_STORE: set[str] = {
+    "INJECTED_THREAD",
+    "ACCESSED_MEMORY",
+    "TAMPERED",
+    "TIMESTOMPED"
+    
+  
+    
+}
 
-# ── Parent-score inheritance weight
 PARENT_INHERITANCE = 0.4
-
-# ── Max finding_ids stored per edge
-FINDING_IDS_CAP = 20
+FINDING_IDS_CAP    = 20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,11 +117,11 @@ class GraphBuilder:
         self.db = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
         self._init_schema()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # DB HELPERS
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # DB LAYER
+    # ─────────────────────────────────────────
 
-    def _run(self, query: str, params: dict = {}):
+    def _run(self, query: str, params: dict = {}) -> bool:
         action = "UNKNOWN"
         for kw in ("MERGE", "CREATE", "MATCH", "SET", "DELETE"):
             if kw in query.upper():
@@ -126,25 +145,23 @@ class GraphBuilder:
             return []
 
     def _init_schema(self):
-        constraints = [
+        for c in [
             "CREATE CONSTRAINT ON (n:ProcessTemplate) ASSERT n.template_hash IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:ProcessInstance) ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:File)            ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:Network)         ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:Registry)        ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:DNS)             ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:Driver)          ASSERT n.id IS UNIQUE",
-            "CREATE CONSTRAINT ON (n:User)            ASSERT n.id IS UNIQUE",
-        ]
-        for c in constraints:
+            "CREATE CONSTRAINT ON (n:ProcessInstance) ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:File)            ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:Network)         ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:Registry)        ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:DNS)             ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:Driver)          ASSERT n.id             IS UNIQUE",
+        ]:
             try:
                 self._run(c)
             except Exception:
                 pass
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
     # HASH HELPERS
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
 
     @staticmethod
     def _now() -> str:
@@ -152,65 +169,81 @@ class GraphBuilder:
 
     @staticmethod
     def _h(obj) -> str:
-        raw = json.dumps(obj, sort_keys=True, ensure_ascii=True)
-        return hashlib.sha256(raw.encode()).hexdigest()
+        return hashlib.sha256(
+            json.dumps(obj, sort_keys=True, ensure_ascii=True).encode()
+        ).hexdigest()
 
     @classmethod
-    def _template_hash(cls, image: str, parent_image: str, cmdline: str) -> str:
-        """
-        Template identity = (image, parent_image, cmdline).
-        parent_image is baked in so powershell-from-word ≠ powershell-from-explorer.
-        cmdline is normalised to its basename+flags (strip paths, keep switches).
-        """
-        def normalise_cmd(cmd: str) -> str:
-            # keep only the exe name and flags, drop full paths and variable args
+    def _template_hash(cls, image: str, parent_image: str,
+                       cmdline: str, user: str) -> str:
+        def norm(cmd: str) -> str:
             cmd = cmd.lower().strip()
-            cmd = re.sub(r"[a-z]:\\[^\s]+\\", "", cmd)   # strip paths
+            cmd = re.sub(r"[a-z]:\\[^\s]+\\", "", cmd)
             cmd = re.sub(r"\s+", " ", cmd)
-            return cmd[:256]                               # cap length
-
+            return cmd[:256]
         return cls._h({
             "image":        (image        or "").lower(),
             "parent_image": (parent_image or "").lower(),
-            "cmdline":      normalise_cmd(cmdline or ""),
+            "cmdline":      norm(cmdline  or ""),
+            "user":         (user         or "").lower(),
         })
 
     @classmethod
     def _edge_hash(cls, src_id: str, rel_type: str, dst_id: str,
                    techniques: list, tactics: list) -> str:
-        """
-        Edge identity = (src, rel_type, dst, alert-class-signature).
-        Two events that differ only in timestamp / individual finding_id
-        but share the same technique+tactic set → same edge → count++.
-        Two events with a different technique set → different edge.
-        """
-        sig = cls._h({"techniques": sorted(techniques), "tactics": sorted(tactics)})
+        sig = cls._h({
+            "techniques": sorted(techniques),
+            "tactics":    sorted(tactics),
+        })
         return cls._h({
-            "src":      src_id,
-            "rel":      rel_type,
-            "dst":      dst_id,
+            "src":       src_id,
+            "rel":       rel_type,
+            "dst":       dst_id,
             "alert_sig": sig,
         })
 
     @staticmethod
     def _edge_params(detection: Optional[dict]) -> dict:
         if not detection:
-            return {"finding_ids": [], "techniques": [], "tactics": [], "total_score": 0.0}
+            return {
+                "finding_ids": [],
+                "techniques":  [],
+                "tactics":     [],
+                "total_score": 0,
+            }
         return {
             "finding_ids": detection.get("finding_ids", []),
             "techniques":  detection.get("techniques",  []),
             "tactics":     detection.get("tactics",     []),
-            "total_score": float(detection.get("total_score", 0.0)),
+            "total_score": int(detection.get("total_score", 0)),
         }
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # TEMPLATE HELPERS
-    # ──────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _effective_score(sigma_score: int, rel_type: str) -> int:
+        base = EDGE_WEIGHTS.get(rel_type, 0)
+        return max(sigma_score, base)
 
-    def _upsert_template(self, image: str, parent_image: str,
-                         cmdline: str, description: str = "") -> str:
-        """Always upsert a template. Returns template_hash."""
-        t_hash = self._template_hash(image, parent_image, cmdline)
+    # ─────────────────────────────────────────
+    # TEMPLATE
+    # ─────────────────────────────────────────
+
+    def _upsert_template(
+        self,
+        image:        str,
+        parent_image: str,
+        cmdline:      str,
+        user:         str,
+        description:  str = "",
+        timestamp:    str = "",
+        score:        int = 0,
+    ) -> str:
+        """
+        Always upsert. Returns template_hash.
+        total_score accumulates only scores from events belonging to THIS template.
+        Parent template never receives child score bleed.
+        """
+        t_hash = self._template_hash(image, parent_image, cmdline, user)
+        ts     = timestamp or self._now()
         self._run(
             """
             MERGE (t:ProcessTemplate {template_hash: $t_hash})
@@ -218,124 +251,185 @@ class GraphBuilder:
                 t.image        = $image,
                 t.parent_image = $parent_image,
                 t.cmdline      = $cmdline,
+                t.user         = $user,
                 t.description  = $description,
                 t.seen_count   = 1,
-                t.max_seen_score = 0.0
+                t.total_score  = $score,
+                t.first_seen   = $ts,
+                t.last_seen    = $ts
             ON MATCH SET
-                t.seen_count = t.seen_count + 1
+                t.seen_count  = t.seen_count + 1,
+                t.last_seen   = $ts,
+                t.total_score = t.total_score + $score
             """,
             {
                 "t_hash":       t_hash,
                 "image":        (image        or "").lower(),
                 "parent_image": (parent_image or "").lower(),
                 "cmdline":      (cmdline      or "").lower(),
+                "user":         (user         or "").lower(),
                 "description":  (description  or "").lower(),
+                "score":        score,
+                "ts":           ts,
             },
         )
         return t_hash
 
-    def _get_template_max_score(self, t_hash: str) -> float:
-        rows = self._fetch(
-            "MATCH (t:ProcessTemplate {template_hash: $h}) RETURN t.max_seen_score AS s",
-            {"h": t_hash},
-        )
-        return float(rows[0]["s"]) if rows else 0.0
-
-    def _update_template_max_score(self, t_hash: str, score: float):
-        self._run(
-            """
-            MATCH (t:ProcessTemplate {template_hash: $h})
-            SET t.max_seen_score = CASE
-                WHEN $score > t.max_seen_score THEN $score
-                ELSE t.max_seen_score
-            END
-            """,
-            {"h": t_hash, "score": score},
-        )
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # INSTANCE HELPERS
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # INSTANCE QUERIES
+    # ─────────────────────────────────────────
 
     def _instance_exists(self, guid: str) -> bool:
-        rows = self._fetch(
+        return bool(self._fetch(
             "MATCH (p:ProcessInstance {id: $guid}) RETURN p.id AS id",
             {"guid": guid},
-        )
-        return bool(rows)
+        ))
 
-    def _get_instance_score(self, guid: str) -> float:
+    def _get_score(self, guid: str) -> int:
         rows = self._fetch(
-            "MATCH (p:ProcessInstance {id: $guid}) RETURN p.score AS s",
+            "MATCH (p:ProcessInstance {id: $guid}) RETURN p.score AS score",
             {"guid": guid},
         )
-        return float(rows[0]["s"]) if rows else 0.0
+        return int(rows[0]["score"] or 0) if rows else 0
 
-    def _create_instance(
-        self,
-        guid: str,
-        image: str,
-        parent_image: str,
-        cmdline: str,
-        description: str,
-        user: str,
-        score: float,
-        t_hash: str,
-        pending_parent_template: str = "",
-        timestamp: str = "",
-    ):
-        """Create ProcessInstance node and wire INSTANCE_OF + RAN_AS."""
-        ts = timestamp or self._now()
+    def _is_ghost(self, guid: str) -> bool:
+        rows = self._fetch(
+            "MATCH (p:ProcessInstance {id: $guid}) RETURN p.ghost AS ghost",
+            {"guid": guid},
+        )
+        return bool(rows[0]["ghost"]) if rows else False
+
+    # ─────────────────────────────────────────
+    # GHOST CREATION
+    # ─────────────────────────────────────────
+
+    def _create_ghost(self, guid: str):
+        """
+        Minimal placeholder. Only id, ghost=true, score=0, alive=true.
+        No image, no start_time, no INSTANCE_OF.
+        Children know the parent image via their own template's parent_image field.
+        """
         self._run(
             """
             MERGE (p:ProcessInstance {id: $guid})
             ON CREATE SET
-                p.image                   = $image,
-                p.cmdline                 = $cmdline,
-                p.user                    = $user,
-                p.score                   = $score,
-                p.alive                   = true,
-                p.start_time              = $ts,
-                p.pending_parent_template = $ppt
-            ON MATCH SET
-                p.score = CASE WHEN $score > p.score THEN $score ELSE p.score END
+                p.ghost = true,
+                p.score = 0,
+                p.alive = true
             """,
-            {
-                "guid":  guid,
-                "image": (image   or "").lower(),
-                "cmdline": (cmdline or "").lower(),
-                "user":  (user    or "UNKNOWN"),
-                "score": score,
-                "ts":    ts,
-                "ppt":   pending_parent_template,
-            },
+            {"guid": guid},
         )
-        # INSTANCE_OF → template
+
+    # ─────────────────────────────────────────
+    # FULL INSTANCE CREATION / GHOST PROMOTION
+    # ─────────────────────────────────────────
+
+    def _create_or_promote_instance(
+        self,
+        guid:         str,
+        image:        str,
+        parent_image: str,
+        cmdline:      str,
+        user:         str,
+        description:  str,
+        score:        int,
+        timestamp:    str,
+    ) -> str:
+        if not guid:
+            return ""
+
+        t_hash    = self._template_hash(image, parent_image, cmdline, user)
+        ts        = timestamp or self._now()
+        was_ghost = self._is_ghost(guid)  # read ghost state BEFORE any write
+
         self._run(
             """
-            MATCH (p:ProcessInstance   {id: $guid})
-            MATCH (t:ProcessTemplate   {template_hash: $t_hash})
+            MERGE (p:ProcessInstance {id: $guid})
+            ON CREATE SET
+                p.score      = $score,
+                p.ghost      = false,
+                p.alive      = true,
+                p.start_time = $ts
+            ON MATCH SET
+                p.score      = p.score + $score,
+                p.ghost      = false,
+                p.start_time = CASE WHEN $was_ghost = true THEN $ts ELSE p.start_time END
+            """,
+            {"guid": guid, "score": score, "ts": ts, "was_ghost": was_ghost},
+        )
+
+        self._run(
+            """
+            MATCH (p:ProcessInstance {id: $guid})
+            MATCH (t:ProcessTemplate {template_hash: $t_hash})
             MERGE (p)-[:INSTANCE_OF]->(t)
             """,
             {"guid": guid, "t_hash": t_hash},
         )
-        # RAN_AS → user
-        if user:
-            self._run("MERGE (u:User {id: $user})", {"user": user or "UNKNOWN"})
-            self._run(
-                """
-                MATCH (p:ProcessInstance {id: $guid})
-                MATCH (u:User {id: $user})
-                MERGE (p)-[:RAN_AS]->(u)
-                """,
-                {"guid": guid, "user": user or "UNKNOWN"},
-            )
-        # Update template hint
-        self._update_template_max_score(t_hash, score)
 
-    def _link_to_parent(self, child_guid: str, parent_guid: str,
-                        child_score: float, parent_score: float):
-        """Create CHILD_OF edge and apply parent inheritance to child."""
+        return guid
+
+    # ─────────────────────────────────────────
+    # SCORE PROPAGATION
+    # ─────────────────────────────────────────
+
+    def _propagate_to_children(self, parent_guid: str, parent_score: int):
+        """
+        Push parent_score * 0.4 to all direct CHILD_OF children.
+        Called on ghost promotion only.
+        """
+        children = self._fetch(
+            """
+            MATCH (c:ProcessInstance)-[:CHILD_OF]->(p:ProcessInstance {id: $guid})
+            RETURN c.id AS cid
+            """,
+            {"guid": parent_guid},
+        )
+        delta = int(parent_score * PARENT_INHERITANCE)
+        if delta <= 0:
+            return
+        for c in children:
+            self._run(
+                "MATCH (p:ProcessInstance {id: $guid}) SET p.score = p.score + $d",
+                {"guid": c["cid"], "d": delta},
+            )
+
+    def _add_score(self, guid: str, delta: int):
+        if not guid or delta == 0:
+            return
+        self._run(
+            "MATCH (p:ProcessInstance {id: $guid}) SET p.score = p.score + $d",
+            {"guid": guid, "d": delta},
+        )
+
+    # ─────────────────────────────────────────
+    # PARENT CHAIN
+    # ─────────────────────────────────────────
+
+    def _ensure_parent_and_link(
+        self,
+        child_guid:   str,
+        parent_guid:  str,
+        timestamp:    str,
+    ):
+        """
+        Guarantees parent exists (full or ghost) then wires CHILD_OF.
+        Applies immediate score inheritance if parent.score > 0.
+        Called only from Event-1 (ProcessCreate).
+        No other event type creates CHILD_OF.
+        """
+        if not parent_guid or not child_guid:
+            return
+
+        if not self._instance_exists(parent_guid):
+            # parent never scored — create minimal ghost
+            self._create_ghost(parent_guid)
+        parent_score = self._get_score(parent_guid)
+        delta = int(parent_score * PARENT_INHERITANCE)
+
+        if delta > 0:
+            self._add_score(child_guid, delta)
+        # wire CHILD_OF (idempotent)
         self._run(
             """
             MATCH (child:ProcessInstance  {id: $child_guid})
@@ -344,117 +438,41 @@ class GraphBuilder:
             """,
             {"child_guid": child_guid, "parent_guid": parent_guid},
         )
-        # Inherit parent score
-        inherited = parent_score * PARENT_INHERITANCE
-        if inherited > 0:
-            self._run(
-                """
-                MATCH (p:ProcessInstance {id: $guid})
-                SET p.score = p.score + $delta
-                """,
-                {"guid": child_guid, "delta": inherited},
-            )
 
-    def _link_to_parent_template(self, child_guid: str, parent_t_hash: str):
-        """Fallback: parent has no instance yet — link child to parent template."""
-        self._run(
-            """
-            MATCH (child:ProcessInstance {id: $child_guid})
-            MATCH (pt:ProcessTemplate    {template_hash: $t_hash})
-            MERGE (child)-[:CHILD_OF_TEMPLATE]->(pt)
-            """,
-            {"child_guid": child_guid, "t_hash": parent_t_hash},
-        )
+      
+    
+    # ─────────────────────────────────────────
+    # EDGE STORAGE GATE
+    # ─────────────────────────────────────────
 
-    def link_late_children(self, parent_guid: str):
-        """
-        Called after a parent ProcessInstance is created.
-        Finds all ProcessInstances that stored this parent's template hash
-        in pending_parent_template and had no instance parent yet.
-        Wires CHILD_OF edges and propagates parent score.
-        """
-        rows = self._fetch(
-            """
-            MATCH (parent:ProcessInstance {id: $parent_guid})-[:INSTANCE_OF]->(pt:ProcessTemplate)
-            RETURN pt.template_hash AS t_hash, parent.score AS pscore
-            """,
-            {"parent_guid": parent_guid},
-        )
-        if not rows:
-            return
-        t_hash       = rows[0]["t_hash"]
-        parent_score = float(rows[0]["pscore"] or 0)
+    def _should_store_edge(self, rel_type: str, process_score: int) -> bool:
+        return process_score > 0 or rel_type in ALWAYS_STORE
 
-        # Find children waiting for this template
-        children = self._fetch(
-            """
-            MATCH (child:ProcessInstance {pending_parent_template: $t_hash})
-            WHERE NOT (child)-[:CHILD_OF]->(:ProcessInstance)
-            RETURN child.id AS guid, child.score AS cscore
-            """,
-            {"t_hash": t_hash},
-        )
-        for c in children:
-            self._link_to_parent(c["guid"], parent_guid, float(c["cscore"] or 0), parent_score)
-            # Clear the pending field
-            self._run(
-                "MATCH (p:ProcessInstance {id: $guid}) SET p.pending_parent_template = ''",
-                {"guid": c["guid"]},
-            )
-
-    def _update_process_score(self, guid: str, delta: float):
-        if not guid or delta == 0:
-            return
-        self._run(
-            """
-            MATCH (p:ProcessInstance {id: $guid})
-            SET p.score = coalesce(p.score, 0) + $delta
-            """,
-            {"guid": guid, "delta": delta},
-        )
-
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
     # GENERIC EDGE UPSERT
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
 
     def _merge_edge(
         self,
-        src_id: str,
-        src_label: str,
-        rel_type: str,
-        dst_id: str,
-        dst_label: str,
-        ep: dict,
-        timestamp: str,
-        extra_create: dict = {},   # additional ON CREATE fields
+        src_id:       str,
+        src_label:    str,
+        rel_type:     str,
+        dst_id:       str,
+        dst_label:    str,
+        ep:           dict,
+        eff_score:    int,
+        timestamp:    str,
+        extra_create: dict = {},
     ):
         """
-        Single universal edge upsert.
-        MERGE key = edge_hash only (timestamp excluded → deduplication works).
-        ON CREATE : populate all fields.
-        ON MATCH  : update last_seen, count, max_score, append new finding_ids.
+        Compressed edge upsert.
+        MERGE key = edge_hash (timestamp excluded).
+        total_score is a running SUM, not max.
         """
-        e_hash = self._edge_hash(src_id, rel_type, dst_id,
-                                 ep["techniques"], ep["tactics"])
-        base_weight = EDGE_WEIGHTS.get(rel_type, 0.0)
-        effective_score = max(ep["total_score"], base_weight)
-
-        # Build extra SET clauses for ON CREATE
-        extra_sets = ""
-        for k in extra_create:
-            extra_sets += f", r.{k} = ${k}"
-
-        params = {
-            "src_id":    src_id,
-            "dst_id":    dst_id,
-            "e_hash":    e_hash,
-            "ts":        timestamp,
-            "fids":      ep["finding_ids"][:FINDING_IDS_CAP],
-            "techs":     ep["techniques"],
-            "tacs":      ep["tactics"],
-            "score":     effective_score,
-            **extra_create,
-        }
+        e_hash    = self._edge_hash(
+            src_id, rel_type, dst_id, ep["techniques"], ep["tactics"]
+        )
+        extra_set = "".join(f", r.{k} = ${k}" for k in extra_create)
 
         self._run(
             f"""
@@ -465,542 +483,557 @@ class GraphBuilder:
                 r.first_seen   = $ts,
                 r.last_seen    = $ts,
                 r.count        = 1,
+                r.total_score  = $score,
                 r.finding_ids  = $fids,
                 r.techniques   = $techs,
-                r.tactics      = $tacs,
-                r.max_score    = $score
-                {extra_sets}
+                r.tactics      = $tacs
+                {extra_set}
             ON MATCH SET
                 r.last_seen   = $ts,
                 r.count       = r.count + 1,
-                r.max_score   = CASE WHEN $score > r.max_score THEN $score ELSE r.max_score END,
+                r.total_score = r.total_score + $score,
                 r.finding_ids = CASE
                     WHEN size(r.finding_ids) < {FINDING_IDS_CAP}
-                    THEN r.finding_ids + [x IN $fids WHERE NOT x IN r.finding_ids]
+                    THEN r.finding_ids + $fids
                     ELSE r.finding_ids
                 END
             """,
-            params,
+            {
+                "src_id": src_id,
+                "dst_id": dst_id,
+                "e_hash": e_hash,
+                "ts":     timestamp,
+                "score":  eff_score,
+                "fids":   ep["finding_ids"][:FINDING_IDS_CAP],
+                "techs":  ep["techniques"],
+                "tacs":   ep["tactics"],
+                **extra_create,
+            },
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ENSURE PROCESS — lightweight: only creates template, no instance
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _ensure_process(self, event: dict, guid_key: str = "ProcessGuid") -> Optional[str]:
-        """
-        Returns the guid if a ProcessInstance exists.
-        If it doesn't exist, returns None (caller decides whether to create it).
-        Always ensures the template exists as a side-effect.
-        """
-        d = event if "Image" in event or "image" in event else event.get("data", event)
-
-        guid        = d.get(guid_key) or d.get("process_guid") or d.get("ProcessGuid")
-        image       = d.get("Image")       or d.get("image")       or ""
-        parent_img  = d.get("ParentImage") or d.get("parent_image") or ""
-        cmdline     = d.get("CommandLine") or d.get("cmdline")     or ""
-        description = d.get("Description") or d.get("description") or ""
-
-        # Always upsert template
-        if image:
-            self._upsert_template(image, parent_img, cmdline, description)
-
-        if not guid:
-            return None
-
-        return guid if self._instance_exists(guid) else None
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # DECIDE & CREATE INSTANCE (used by every handler)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _get_or_create_instance(
-        self,
-        guid: str,
-        image: str,
-        parent_image: str,
-        cmdline: str,
-        description: str,
-        user: str,
-        score: float,
-        parent_guid: str = "",
-        timestamp: str = "",
-    ) -> str:
-        """
-        Creates a ProcessInstance if score > threshold OR if it already exists.
-        Handles parent linking (instance or template fallback).
-        Returns guid if instance exists/created, else empty string.
-        """
-        if not guid:
-            return ""
-
-        t_hash = self._template_hash(image, parent_image, cmdline)
-        # Always upsert template first
-        self._upsert_template(image, parent_image, cmdline, description)
-
-        if score <= INSTANCE_SCORE_THRESHOLD and not self._instance_exists(guid):
-            # Score is zero — no instance, just template
-            return ""
-
-        # Determine pending_parent_template for late-linking
-        parent_t_hash = self._template_hash(parent_image, "", "") if parent_image else ""
-
-        self._create_instance(
-            guid=guid, image=image, parent_image=parent_image,
-            cmdline=cmdline, description=description, user=user,
-            score=score, t_hash=t_hash,
-            pending_parent_template=parent_t_hash,
-            timestamp=timestamp,
-        )
-
-        # Link to parent
-        if parent_guid and self._instance_exists(parent_guid):
-            parent_score = self._get_instance_score(parent_guid)
-            self._link_to_parent(guid, parent_guid, score, parent_score)
-        elif parent_t_hash:
-            self._link_to_parent_template(guid, parent_t_hash)
-
-        # Check for late children waiting for this instance
-        self.link_late_children(guid)
-
-        return guid
-
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
     # EVENT HANDLERS
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
 
     def handle_event_1(self, event: dict, detection: Optional[dict] = None):
-        """ProcessCreate."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
-        parent_guid  = d.get("ParentProcessGuid") or d.get("parent_process_guid") or ""
-        child_guid   = d.get("ProcessGuid")       or d.get("process_guid")        or ""
-        parent_image = d.get("ParentImage")        or ""
-        child_image  = d.get("Image")              or ""
+        parent_guid  = d.get("ParentProcessGuid") or ""
+        child_guid   = d.get("ProcessGuid")       or ""
+        parent_image = (d.get("ParentImage")       or "").lower()
+        child_image  = (d.get("Image")             or "").lower()
         parent_cmd   = d.get("ParentCommandLine")  or ""
         child_cmd    = d.get("CommandLine")        or ""
         description  = d.get("Description")        or ""
-        user         = d.get("User")               or ""
+        user         = (d.get("User")              or "").lower()
+        parent_user  = (d.get("ParentUser")        or "").lower()  # ← separate field
 
-        # ── always upsert both templates
-        parent_t_hash = self._upsert_template(parent_image, "", parent_cmd)
-        child_t_hash  = self._upsert_template(child_image, parent_image, child_cmd, description)
+        eff = self._effective_score(ep["total_score"], "CREATED")
 
-        score = ep["total_score"]
+        # parent gets its own user, not the child's
+        self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
+        self._upsert_template(child_image, parent_image, child_cmd, user,
+                              description, ts, eff)
 
-        # ── parent instance (created if it has score context from prior events)
-        if parent_guid and not self._instance_exists(parent_guid) and score > INSTANCE_SCORE_THRESHOLD:
-            self._get_or_create_instance(
-                guid=parent_guid, image=parent_image, parent_image="",
-                cmdline=parent_cmd, description="", user="",
-                score=0.0,   # parent itself has no direct score here
-                timestamp=ts,
+        if eff > 0:
+            self._create_or_promote_instance(
+                guid=child_guid, image=child_image,
+                parent_image=parent_image, cmdline=child_cmd,
+                user=user, description=description,
+                score=eff, timestamp=ts,
             )
 
-        # ── child instance
-        child_inst = self._get_or_create_instance(
-            guid=child_guid, image=child_image, parent_image=parent_image,
-            cmdline=child_cmd, description=description, user=user,
-            score=score, parent_guid=parent_guid, timestamp=ts,
-        )
+        if child_guid and self._instance_exists(child_guid):
+            self._ensure_parent_and_link(child_guid, parent_guid, ts)
 
-        # ── CREATED edge (instance→instance if both exist, else skip edge)
-        if child_inst and parent_guid and self._instance_exists(parent_guid):
+        if (eff > 0
+                and child_guid  and self._instance_exists(child_guid)
+                and parent_guid and self._instance_exists(parent_guid)):
             self._merge_edge(
                 src_id=parent_guid, src_label="ProcessInstance",
                 rel_type="CREATED",
                 dst_id=child_guid,  dst_label="ProcessInstance",
-                ep=ep, timestamp=ts,
+                ep=ep, eff_score=eff, timestamp=ts,
             )
-            self._update_process_score(parent_guid, score * 0.3)
-            self._update_process_score(child_guid,  score)
+            # ← _add_score removed here; instance score already set in _create_or_promote_instance
 
     def handle_event_2(self, event: dict, detection: Optional[dict] = None):
-        """Timestomp — always suspicious, always create instance."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        guid    = d.get("ProcessGuid") or d.get("process_guid") or ""
-        file_id = (d.get("TargetFilename") or "").lower()
-        if not guid or not file_id:
-            return
-
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=max(ep["total_score"], 0.6),   # timestomp is always suspicious
-            timestamp=ts,
-        )
-        if not inst:
-            return
-
-        self._run("MERGE (f:File {id: $id})", {"id": file_id})
-        self._merge_edge("ProcessInstance", "ProcessInstance", "TIMESTOMPED",
-                         file_id, "File", ep, ts)  # wrong order fix:
-        self._merge_edge(
-            src_id=guid, src_label="ProcessInstance",
-            rel_type="TIMESTOMPED",
-            dst_id=file_id, dst_label="File",
-            ep=ep, timestamp=ts,
-        )
-        self._update_process_score(guid, ep["total_score"])
-
-    def handle_event_3(self, event: dict, detection: Optional[dict] = None):
-        """NetworkConnect."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        guid   = d.get("ProcessGuid") or d.get("process_guid") or ""
-        dst_ip = (d.get("DestinationIp") or d.get("destination_ip") or "").lower()
-        if not guid or not dst_ip:
-            return
-
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
-            return
-
-        self._run("MERGE (n:Network {id: $ip})", {"ip": dst_ip})
-        self._merge_edge(
-            src_id=guid, src_label="ProcessInstance",
-            rel_type="CONNECTED",
-            dst_id=dst_ip, dst_label="Network",
-            ep=ep, timestamp=ts,
-            extra_create={
-                "port":     int(d.get("DestinationPort") or 0),
-                "protocol": d.get("Protocol") or "",
-            },
-        )
-        self._update_process_score(guid, ep["total_score"])
-
-    def handle_event_6(self, event: dict, detection: Optional[dict] = None):
-        """DriverLoad."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        guid   = d.get("ProcessGuid") or d.get("process_guid") or ""
-        sha256 = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower()
-        image  = (d.get("ImageLoaded") or "").lower()
-        if not guid or not sha256:
-            return
-
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
-            return
-
-        self._run(
-            "MERGE (drv:Driver {id: $sha256}) ON CREATE SET drv.image = $image",
-            {"sha256": sha256, "image": image},
-        )
-        self._merge_edge(
-            src_id=guid, src_label="ProcessInstance",
-            rel_type="LOADED_DRIVER",
-            dst_id=sha256, dst_label="Driver",
-            ep=ep, timestamp=ts,
-        )
-        self._update_process_score(guid, ep["total_score"])
-
-    def handle_event_7(self, event: dict, detection: Optional[dict] = None):
-        """ImageLoad."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        guid   = d.get("ProcessGuid") or d.get("process_guid") or ""
-        sha256 = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower()
-        image  = (d.get("ImageLoaded") or "").lower()
-        if not guid or not sha256:
-            return
-
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
-            return
-
-        self._run(
-            "MERGE (img:Driver {id: $sha256}) ON CREATE SET img.image = $image",
-            {"sha256": sha256, "image": image},
-        )
-        self._merge_edge(
-            src_id=guid, src_label="ProcessInstance",
-            rel_type="LOADED_IMAGE",
-            dst_id=sha256, dst_label="Driver",
-            ep=ep, timestamp=ts,
-        )
-        self._update_process_score(guid, ep["total_score"])
-
-    def handle_event_8(self, event: dict, detection: Optional[dict] = None):
-        """CreateRemoteThread — always create both instances, always high score."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        src_guid = d.get("SourceProcessGuid") or d.get("source_process_guid") or ""
-        tgt_guid = d.get("TargetProcessGuid") or d.get("target_process_guid") or ""
-        if not src_guid or not tgt_guid:
-            return
-
-        forced_score = max(ep["total_score"], EDGE_WEIGHTS["INJECTED_THREAD"])
-
-        src_inst = self._get_or_create_instance(
-            guid=src_guid, image=d.get("SourceImage",""), parent_image="",
-            cmdline="", description="", user="",
-            score=forced_score, timestamp=ts,
-        )
-        tgt_inst = self._get_or_create_instance(
-            guid=tgt_guid, image=d.get("TargetImage",""), parent_image="",
-            cmdline="", description="", user="",
-            score=forced_score, timestamp=ts,
-        )
-        if not src_inst or not tgt_inst:
-            return
-
-        self._merge_edge(
-            src_id=src_guid, src_label="ProcessInstance",
-            rel_type="INJECTED_THREAD",
-            dst_id=tgt_guid, dst_label="ProcessInstance",
-            ep=ep, timestamp=ts,
-            extra_create={"start_function": d.get("StartFunction") or ""},
-        )
-        self._update_process_score(src_guid, forced_score)
-        self._update_process_score(tgt_guid, forced_score)
-
-    def handle_event_10(self, event: dict, detection: Optional[dict] = None):
-        """ProcessAccess — always create both instances."""
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
-
-        src_guid = d.get("SourceProcessGUID") or d.get("source_guid") or ""
-        tgt_guid = d.get("TargetProcessGUID") or d.get("target_guid") or ""
-        if not src_guid or not tgt_guid:
-            return
-
-        forced_score = max(ep["total_score"], EDGE_WEIGHTS["ACCESSED_MEMORY"])
-
-        src_inst = self._get_or_create_instance(
-            guid=src_guid, image=d.get("SourceImage",""), parent_image="",
-            cmdline="", description="", user="",
-            score=forced_score, timestamp=ts,
-        )
-        tgt_inst = self._get_or_create_instance(
-            guid=tgt_guid, image=d.get("TargetImage",""), parent_image="",
-            cmdline="", description="", user="",
-            score=forced_score, timestamp=ts,
-        )
-        if not src_inst or not tgt_inst:
-            return
-
-        self._merge_edge(
-            src_id=src_guid, src_label="ProcessInstance",
-            rel_type="ACCESSED_MEMORY",
-            dst_id=tgt_guid, dst_label="ProcessInstance",
-            ep=ep, timestamp=ts,
-            extra_create={"access_mask": d.get("GrantedAccess") or ""},
-        )
-        self._update_process_score(src_guid, forced_score)
-
-    def handle_event_11(self, event: dict, detection: Optional[dict] = None):
-        """FileCreate."""
+        """FileCreateTime — Timestomp. ALWAYS_STORE."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
         guid    = d.get("ProcessGuid") or ""
         file_id = (d.get("TargetFilename") or "").lower()
+        image   = (d.get("Image")          or "").lower()
+        cmd     = d.get("CommandLine")     or ""
+        user    = (d.get("User")           or "").lower()
         if not guid or not file_id:
             return
 
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
+        eff = self._effective_score(ep["total_score"], "TIMESTOMPED")
+
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
         )
-        if not inst:
+        self._run("MERGE (f:File {id: $id})", {"id": file_id})
+        self._merge_edge(
+            src_id=guid, src_label="ProcessInstance",
+            rel_type="TIMESTOMPED",
+            dst_id=file_id, dst_label="File",
+            ep=ep, eff_score=eff, timestamp=ts,
+        )
+        #self._add_score(guid, eff)
+
+    def handle_event_3(self, event: dict, detection: Optional[dict] = None):
+        """NetworkConnect. Stored only when process.score > 0."""
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        guid   = d.get("ProcessGuid") or ""
+        dst_ip = (d.get("DestinationIp") or "").lower()
+        image  = (d.get("Image")         or "").lower()
+        cmd    = d.get("CommandLine")    or ""
+        user   = (d.get("User")          or "").lower()
+        if not guid or not dst_ip:
             return
 
+        eff       = self._effective_score(ep["total_score"], "CONNECTED")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("CONNECTED", cur_score):
+            self._upsert_template(image, "", cmd, user, "", ts, 0)
+            return
+
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
+        self._run("MERGE (n:Network {id: $ip})", {"ip": dst_ip})
+        self._merge_edge(
+            src_id=guid, src_label="ProcessInstance",
+            rel_type="CONNECTED",
+            dst_id=dst_ip, dst_label="Network",
+            ep=ep, eff_score=eff, timestamp=ts,
+            extra_create={
+                "port":     int(d.get("DestinationPort") or 0),
+                "protocol": d.get("Protocol") or "",
+            },
+        )
+        #self._add_score(guid, eff)
+
+    def handle_event_6(self, event: dict, detection: Optional[dict] = None):
+        """DriverLoad. Stored only when process.score > 0."""
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        guid      = d.get("ProcessGuid") or ""
+        sha256    = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower()
+        img_loaded = (d.get("ImageLoaded") or "").lower()
+        image     = (d.get("Image")        or "").lower()
+        user      = (d.get("User")         or "").lower()
+        if not guid or not sha256:
+            return
+
+        eff       = self._effective_score(ep["total_score"], "LOADED_DRIVER")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("LOADED_DRIVER", cur_score):
+            self._upsert_template(image, "", "", user, "", ts, 0)
+            return
+
+        self._upsert_template(image, "", "", user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline="", user=user, description="",
+            score=eff, timestamp=ts,
+        )
+        self._run(
+            "MERGE (drv:Driver {id: $s}) ON CREATE SET drv.image = $img",
+            {"s": sha256, "img": img_loaded},
+        )
+        self._merge_edge(
+            src_id=guid, src_label="ProcessInstance",
+            rel_type="LOADED_DRIVER",
+            dst_id=sha256, dst_label="Driver",
+            ep=ep, eff_score=eff, timestamp=ts,
+        )
+        #self._add_score(guid, eff)
+
+    def handle_event_7(self, event: dict, detection: Optional[dict] = None):
+        """ImageLoad. Stored only when process.score > 0."""
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        guid       = d.get("ProcessGuid") or ""
+        sha256     = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower()
+        img_loaded = (d.get("ImageLoaded") or "").lower()
+        image      = (d.get("Image")       or "").lower()
+        user       = (d.get("User")        or "").lower()
+        if not guid or not sha256:
+            return
+
+        eff       = self._effective_score(ep["total_score"], "LOADED_IMAGE")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("LOADED_IMAGE", cur_score):
+            self._upsert_template(image, "", "", user, "", ts, 0)
+            return
+
+        self._upsert_template(image, "", "", user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline="", user=user, description="",
+            score=eff, timestamp=ts,
+        )
+        self._run(
+            "MERGE (img:Driver {id: $s}) ON CREATE SET img.image = $i",
+            {"s": sha256, "i": img_loaded},
+        )
+        self._merge_edge(
+            src_id=guid, src_label="ProcessInstance",
+            rel_type="LOADED_IMAGE",
+            dst_id=sha256, dst_label="Driver",
+            ep=ep, eff_score=eff, timestamp=ts,
+        )
+        #self._add_score(guid, eff)
+
+    def handle_event_8(self, event: dict, detection: Optional[dict] = None):
+        """
+        CreateRemoteThread. ALWAYS_STORE.
+        Both source and target get scored independently.
+        NO CHILD_OF created — injection is not a spawn relationship.
+        NO inheritance between source and target.
+        """
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        src_guid  = d.get("SourceProcessGuid") or ""
+        tgt_guid  = d.get("TargetProcessGuid") or ""
+        src_image = (d.get("SourceImage") or "").lower()
+        tgt_image = (d.get("TargetImage") or "").lower()
+        src_user  = (d.get("SourceUser")  or "").lower()
+        tgt_user  = (d.get("TargetUser")  or "").lower()
+        if not src_guid or not tgt_guid:
+            return
+
+        eff = self._effective_score(ep["total_score"], "INJECTED_THREAD")
+
+        # source
+        self._upsert_template(src_image, "", "", src_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=src_guid, image=src_image, parent_image="",
+            cmdline="", user=src_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(src_guid, eff)
+
+        # target — scored independently, no inheritance from source
+        self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=tgt_guid, image=tgt_image, parent_image="",
+            cmdline="", user=tgt_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(tgt_guid, eff)
+
+        self._merge_edge(
+            src_id=src_guid, src_label="ProcessInstance",
+            rel_type="INJECTED_THREAD",
+            dst_id=tgt_guid, dst_label="ProcessInstance",
+            ep=ep, eff_score=eff, timestamp=ts,
+            extra_create={"start_function": d.get("StartFunction") or ""},
+        )
+
+    def handle_event_10(self, event: dict, detection: Optional[dict] = None):
+        """
+        ProcessAccess. ALWAYS_STORE.
+        Both source and target get scored independently.
+        NO CHILD_OF. NO inheritance.
+        """
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        src_guid  = d.get("SourceProcessGUID") or ""
+        tgt_guid  = d.get("TargetProcessGUID") or ""
+        src_image = (d.get("SourceImage") or "").lower()
+        tgt_image = (d.get("TargetImage") or "").lower()
+        src_user  = (d.get("SourceUser")  or "").lower()
+        tgt_user  = (d.get("TargetUser")  or "").lower()
+        if not src_guid or not tgt_guid:
+            return
+
+        eff = self._effective_score(ep["total_score"], "ACCESSED_MEMORY")
+
+        self._upsert_template(src_image, "", "", src_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=src_guid, image=src_image, parent_image="",
+            cmdline="", user=src_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(src_guid, eff)
+
+        self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=tgt_guid, image=tgt_image, parent_image="",
+            cmdline="", user=tgt_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(tgt_guid, eff)
+
+        self._merge_edge(
+            src_id=src_guid, src_label="ProcessInstance",
+            rel_type="ACCESSED_MEMORY",
+            dst_id=tgt_guid, dst_label="ProcessInstance",
+            ep=ep, eff_score=eff, timestamp=ts,
+            extra_create={"access_mask": d.get("GrantedAccess") or ""},
+        )
+
+    def handle_event_11(self, event: dict, detection: Optional[dict] = None):
+        """FileCreate. Stored only when process.score > 0."""
+        d  = event.get("data", event)
+        ep = self._edge_params(detection)
+        ts = d.get("UtcTime") or self._now()
+
+        guid    = d.get("ProcessGuid") or ""
+        file_id = (d.get("TargetFilename") or "").lower()
+        image   = (d.get("Image")          or "").lower()
+        cmd     = d.get("CommandLine")     or ""
+        user    = (d.get("User")           or "").lower()
+        if not guid or not file_id:
+            return
+
+        eff       = self._effective_score(ep["total_score"], "CREATED_FILE")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("CREATED_FILE", cur_score):
+            self._upsert_template(image, "", cmd, user, "", ts, 0)
+            return
+
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="CREATED_FILE",
             dst_id=file_id, dst_label="File",
-            ep=ep, timestamp=ts,
+            ep=ep, eff_score=eff, timestamp=ts,
             extra_create={"size": int(d.get("Size") or 0)},
         )
-        self._update_process_score(guid, ep["total_score"])
+        #self._add_score(guid, eff)
 
-    def _handle_registry(self, event: dict, event_type: str, detection: Optional[dict] = None):
+    def _handle_registry(self, event: dict, event_type: str,
+                         detection: Optional[dict] = None):
+        """Registry events 12/13/14. Stored only when process.score > 0."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
         guid   = d.get("ProcessGuid") or ""
         reg_id = (d.get("TargetObject") or "").lower()
+        image  = (d.get("Image")        or "").lower()
+        cmd    = d.get("CommandLine")   or ""
+        user   = (d.get("User")         or "").lower()
         if not guid or not reg_id:
             return
 
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
+        eff       = self._effective_score(ep["total_score"], "MODIFIED_REGISTRY")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("MODIFIED_REGISTRY", cur_score):
+            self._upsert_template(image, "", cmd, user, "", ts, 0)
             return
 
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
         self._run("MERGE (reg:Registry {id: $id})", {"id": reg_id})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="MODIFIED_REGISTRY",
             dst_id=reg_id, dst_label="Registry",
-            ep=ep, timestamp=ts,
+            ep=ep, eff_score=eff, timestamp=ts,
             extra_create={"event_type": event_type},
         )
-        self._update_process_score(guid, ep["total_score"])
+        #self._add_score(guid, eff)
 
     def handle_event_12(self, e, d=None): self._handle_registry(e, "add",    d)
     def handle_event_13(self, e, d=None): self._handle_registry(e, "set",    d)
     def handle_event_14(self, e, d=None): self._handle_registry(e, "rename", d)
 
     def handle_event_15(self, event: dict, detection: Optional[dict] = None):
-        """CreateStreamHash (ADS)."""
+        """CreateStreamHash — ADS. ALWAYS_STORE."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
         guid    = d.get("ProcessGuid") or ""
         file_id = (d.get("TargetFilename") or "").lower()
+        image   = (d.get("Image")          or "").lower()
+        cmd     = d.get("CommandLine")     or ""
+        user    = (d.get("User")           or "").lower()
         if not guid or not file_id:
             return
 
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=max(ep["total_score"], 0.5),
-            timestamp=ts,
-        )
-        if not inst:
-            return
+        eff = self._effective_score(ep["total_score"], "WROTE_ADS")
 
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="WROTE_ADS",
             dst_id=file_id, dst_label="File",
-            ep=ep, timestamp=ts,
+            ep=ep, eff_score=eff, timestamp=ts,
             extra_create={"stream_name": d.get("StreamName") or ""},
         )
-        self._update_process_score(guid, ep["total_score"])
+        #self._add_score(guid, eff)
 
     def handle_event_22(self, event: dict, detection: Optional[dict] = None):
-        """DNSQuery."""
+        """DNSQuery. Stored only when process.score > 0."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
         guid  = d.get("ProcessGuid") or ""
-        query = (d.get("QueryName") or "").lower()
+        query = (d.get("QueryName")  or "").lower()
+        image = (d.get("Image")      or "").lower()
+        cmd   = d.get("CommandLine") or ""
+        user  = (d.get("User")       or "").lower()
         if not guid or not query:
             return
 
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
+        eff       = self._effective_score(ep["total_score"], "QUERIED_DNS")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("QUERIED_DNS", cur_score):
+            self._upsert_template(image, "", cmd, user, "", ts, 0)
             return
 
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
         self._run("MERGE (dns:DNS {id: $q})", {"q": query})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="QUERIED_DNS",
             dst_id=query, dst_label="DNS",
-            ep=ep, timestamp=ts,
+            ep=ep, eff_score=eff, timestamp=ts,
         )
-        self._update_process_score(guid, ep["total_score"])
+        #self._add_score(guid, eff)
 
     def handle_event_23(self, event: dict, detection: Optional[dict] = None):
-        """FileDelete."""
+        """FileDelete. Stored only when process.score > 0."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
         guid    = d.get("ProcessGuid") or ""
         file_id = (d.get("TargetFilename") or "").lower()
+        image   = (d.get("Image")          or "").lower()
+        cmd     = d.get("CommandLine")     or ""
+        user    = (d.get("User")           or "").lower()
         if not guid or not file_id:
             return
 
-        inst = self._get_or_create_instance(
-            guid=guid, image=d.get("Image",""), parent_image=d.get("ParentImage",""),
-            cmdline=d.get("CommandLine",""), description="", user=d.get("User",""),
-            score=ep["total_score"], timestamp=ts,
-        )
-        if not inst:
+        eff       = self._effective_score(ep["total_score"], "DELETED")
+        cur_score = self._get_score(guid)
+
+        if not self._should_store_edge("DELETED", cur_score):
+            self._upsert_template(image, "", cmd, user, "", ts, 0)
             return
 
+        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=guid, image=image, parent_image="",
+            cmdline=cmd, user=user, description="",
+            score=eff, timestamp=ts,
+        )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="DELETED",
             dst_id=file_id, dst_label="File",
-            ep=ep, timestamp=ts,
+            ep=ep, eff_score=eff, timestamp=ts,
         )
-        self._update_process_score(guid, ep["total_score"])
+        #self._add_score(guid, eff)
 
     def handle_event_25(self, event: dict, detection: Optional[dict] = None):
-        """ProcessTampering."""
+        """
+        ProcessTampering. ALWAYS_STORE.
+        Both attacker and victim scored independently.
+        NO CHILD_OF. NO inheritance.
+        """
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
-        attacker_guid = d.get("ProcessGuid") or ""
-        victim_guid   = d.get("TargetProcessGuid") or d.get("target_process_guid") or ""
-        if not attacker_guid or not victim_guid:
+        atk_guid  = d.get("ProcessGuid")       or ""
+        vic_guid  = d.get("TargetProcessGuid") or ""
+        atk_image = (d.get("Image")        or "").lower()
+        vic_image = (d.get("TargetImage")  or "").lower()
+        atk_user  = (d.get("User")         or "").lower()
+        vic_user  = (d.get("TargetUser")   or "").lower()
+        if not atk_guid or not vic_guid:
             return
 
-        forced_score = max(ep["total_score"], 0.7)
+        eff = self._effective_score(ep["total_score"], "TAMPERED")
 
-        for g, img_key in [(attacker_guid, "Image"), (victim_guid, "TargetImage")]:
-            self._get_or_create_instance(
-                guid=g, image=d.get(img_key,""), parent_image="",
-                cmdline="", description="", user="",
-                score=forced_score, timestamp=ts,
-            )
+        self._upsert_template(atk_image, "", "", atk_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=atk_guid, image=atk_image, parent_image="",
+            cmdline="", user=atk_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(atk_guid, eff)
+
+        self._upsert_template(vic_image, "", "", vic_user, "", ts, eff)
+        self._create_or_promote_instance(
+            guid=vic_guid, image=vic_image, parent_image="",
+            cmdline="", user=vic_user, description="",
+            score=eff, timestamp=ts,
+        )
+        #self._add_score(vic_guid, eff)
 
         self._merge_edge(
-            src_id=attacker_guid, src_label="ProcessInstance",
+            src_id=atk_guid, src_label="ProcessInstance",
             rel_type="TAMPERED",
-            dst_id=victim_guid, dst_label="ProcessInstance",
-            ep=ep, timestamp=ts,
+            dst_id=vic_guid, dst_label="ProcessInstance",
+            ep=ep, eff_score=eff, timestamp=ts,
             extra_create={"type": d.get("Type") or ""},
         )
-        self._update_process_score(attacker_guid, forced_score)
-        self._update_process_score(victim_guid,   forced_score)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # PROCESS EXIT
-    # ──────────────────────────────────────────────────────────────────────────
 
     def handle_event_5(self, event: dict, detection: Optional[dict] = None):
-        """ProcessTerminate — mark instance as dead."""
+        """ProcessTerminate — mark instance dead."""
         d    = event.get("data", event)
-        guid = d.get("ProcessGuid") or d.get("process_guid") or ""
-        ts   = d.get("UtcTime") or self._now()
+        guid = d.get("ProcessGuid") or ""
+        ts   = d.get("UtcTime")     or self._now()
         if guid:
             self._run(
                 """
@@ -1010,82 +1043,89 @@ class GraphBuilder:
                 {"guid": guid, "ts": ts},
             )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # LLM CHAIN-GAP TOOL
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # LLM TOOL
+    # ─────────────────────────────────────────
 
     def check_chain_gaps(self, guid: str) -> dict:
         """
-        Tool for the LLM: given a ProcessInstance guid, returns a report of
-        any gaps in the parent chain (nodes linked only to a template, not an instance).
+        LLM tool. Given a ProcessInstance GUID, returns parent chain info
+        and flags any ghost parents (parents that never triggered a detection).
         """
-        result = {"guid": guid, "gaps": [], "chain": []}
-
         rows = self._fetch(
             """
             MATCH (p:ProcessInstance {id: $guid})
-            OPTIONAL MATCH (p)-[:CHILD_OF]->(parent_inst:ProcessInstance)
-            OPTIONAL MATCH (p)-[:CHILD_OF_TEMPLATE]->(parent_tmpl:ProcessTemplate)
+            OPTIONAL MATCH (p)-[:CHILD_OF]->(parent:ProcessInstance)
+            OPTIONAL MATCH (p)-[:INSTANCE_OF]->(t:ProcessTemplate)
             RETURN
-                p.id AS id, p.score AS score, p.image AS image,
-                parent_inst.id    AS parent_inst_id,
-                parent_tmpl.template_hash AS parent_tmpl_hash,
-                parent_tmpl.image         AS parent_tmpl_image
+                p.id         AS id,
+                p.score      AS score,
+                p.ghost      AS ghost,
+                t.image      AS image,
+                t.user       AS user,
+                parent.id    AS parent_id,
+                parent.score AS parent_score,
+                parent.ghost AS parent_ghost
             """,
             {"guid": guid},
         )
         if not rows:
-            return {"error": f"No ProcessInstance found for guid={guid}"}
+            return {"error": f"ProcessInstance {guid} not found"}
 
-        r = rows[0]
-        result["chain"].append({
-            "id": r["id"], "image": r["image"], "score": r["score"]
-        })
+        r    = rows[0]
+        gaps = []
 
-        if r["parent_inst_id"]:
-            result["chain"].append({"id": r["parent_inst_id"], "type": "instance"})
-        elif r["parent_tmpl_hash"]:
-            result["gaps"].append({
-                "type":         "parent_only_in_template",
-                "template_hash": r["parent_tmpl_hash"],
-                "parent_image":  r["parent_tmpl_image"],
-                "message":       (
-                    f"Parent '{r['parent_tmpl_image']}' has no ProcessInstance "
-                    f"(never triggered a detection). Chain is incomplete here."
+        if r.get("parent_ghost"):
+            gaps.append({
+                "type":        "ghost_parent",
+                "parent_id":   r["parent_id"],
+                "message": (
+                    f"Parent (guid={r['parent_id']}) is a ghost — "
+                    f"it has never triggered a detection. "
+                    f"Chain is structurally complete but parent "
+                    f"has no behavioral data. Check child template's "
+                    f"parent_image field to identify the binary."
                 ),
             })
+        elif not r.get("parent_id"):
+            gaps.append({
+                "type":    "no_parent",
+                "message": "No parent — process predates monitoring or is a root process.",
+            })
 
-        return result
+        return {
+            "guid":         r["id"],
+            "image":        r.get("image"),
+            "user":         r.get("user"),
+            "score":        r["score"],
+            "ghost":        r["ghost"],
+            "parent_id":    r.get("parent_id"),
+            "parent_score": r.get("parent_score"),
+            "parent_ghost": r.get("parent_ghost"),
+            "gaps":         gaps,
+        }
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
     # DISPATCHER
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
 
     _HANDLERS = {
-        1:  "handle_event_1",
-        2:  "handle_event_2",
-        3:  "handle_event_3",
-        5:  "handle_event_5",
-        6:  "handle_event_6",
-        7:  "handle_event_7",
-        8:  "handle_event_8",
-        10: "handle_event_10",
-        11: "handle_event_11",
-        12: "handle_event_12",
-        13: "handle_event_13",
-        14: "handle_event_14",
-        15: "handle_event_15",
-        22: "handle_event_22",
-        23: "handle_event_23",
-        25: "handle_event_25",
+        1:  "handle_event_1",   2:  "handle_event_2",
+        3:  "handle_event_3",   5:  "handle_event_5",
+        6:  "handle_event_6",   7:  "handle_event_7",
+        8:  "handle_event_8",   10: "handle_event_10",
+        11: "handle_event_11",  12: "handle_event_12",
+        13: "handle_event_13",  14: "handle_event_14",
+        15: "handle_event_15",  22: "handle_event_22",
+        23: "handle_event_23",  25: "handle_event_25",
     }
 
     def process_event(self, event: dict, detection: Optional[dict] = None):
         try:
-            event_id     = int(event.get("event_id", -1))
-            handler_name = self._HANDLERS.get(event_id)
-            if handler_name:
-                getattr(self, handler_name)(event, detection)
+            event_id = int(event.get("event_id", -1))
+            handler  = self._HANDLERS.get(event_id)
+            if handler:
+                getattr(self, handler)(event, detection)
             else:
                 print(f"[GRAPH] No handler for event_id={event_id}")
         except Exception:
