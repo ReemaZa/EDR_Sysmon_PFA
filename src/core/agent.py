@@ -165,8 +165,8 @@ def process_event(evt):
 
     # Print clear event header
     print("\n" + "=" * 10)
-    print(f"📋 EVENT #{event_id:4d} | Type: {event_type:20s} | Time: {timestamp}")
-    print(f"   Computer: {computer:30s} | Process: {image}")
+    print(f" EVENT #{event_id} | Type: {event_type} | Time: {timestamp}")
+    #print(f"   Computer: {computer:30s} | Process: {image}")
     print("=" * 10)
     
 
@@ -193,17 +193,9 @@ def process_event(evt):
             layer_name = result.layer_name
             threat_level = result.threat_level.name
             
-            # Layer header with threat level
-            if threat_level == "CRITICAL":
-                layer_icon = "🔴"
-            elif threat_level == "HIGH":
-                layer_icon = "🟠"
-            elif threat_level == "MEDIUM":
-                layer_icon = "🟡"
-            else:
-                layer_icon = "🟢"
+
             
-            print(f"\n{layer_icon} {layer_name:20s} [{threat_level:10s}]")
+            print(f"\n {layer_name:20s} [{threat_level:10s}]")
             print("   " + "-" * 110)
             
             # Display all matches
@@ -241,7 +233,7 @@ def process_event(evt):
                 "metadata": result.metadata
             })
     else:
-        print(f"\n✅ No detections from any layer (L1, L2, L3)")
+        print(f"\n No detections from any layer (L1, L2, L3)")
         print("   " + "-" * 110)
     
     print("=" * 120)
@@ -278,33 +270,42 @@ def main():
         enable_l4=False,
     )
 
-    # If READ_FROM_FILE is True, use the LogReplayEngine instead of the live watcher
+    # If READ_FROM_FILE is True, replay events from log file and exit
     if READ_FROM_FILE:
         try:
             # Import locally to avoid adding tests dependency to runtime when not used
             from tests.log_replay import LogReplayEngine
 
             print(f"[INFO] Running in log-replay mode. Reading events from: {LOG_REPLAY_FILE}")
-            # Use the same layers configuration as the detection_pipeline above
+            print(f"[INFO] After replay completes, the program will exit.\n")
+            
+            # Create engine with callback to use the same process_event logic
             engine = LogReplayEngine(
                 log_file=LOG_REPLAY_FILE,
                 enable_l1=detection_pipeline.enable_l1,
                 enable_l2=detection_pipeline.enable_l2,
                 enable_l3=detection_pipeline.enable_l3,
                 enable_l4=detection_pipeline.enable_l4,
+                event_callback=process_event  # ← Pass the callback so all agent logic is applied
             )
-            # Replay events synchronously and print a summary
+            # Replay events synchronously
             engine.replay(verbose=True)
             # Print pipeline stats from the engine's pipeline
             if engine.pipeline:
                 engine.pipeline.print_stats()
+            
+            print("[INFO] Log replay completed. Exiting.\n")
             sys.exit(0)
         except Exception as e:
             print(f"[ERROR] Failed to run log replay engine: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
+    # If READ_FROM_FILE is False, listen for real-time events
     watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
 
-    # Define AFTER watcher and stop_event exist
+    # Define signal handlers
     def _stop(signum, frame):
         print("\n" + "=" * 70)
         print("Stopping watcher...")
@@ -319,10 +320,10 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    # Start listening for real-time events
     watcher.start()
 
     # Loop instead of a long blocking wait — allows signals to be processed
-     #stop_event.wait()
     while not stop_event.is_set():
         time.sleep(0.2)
 
