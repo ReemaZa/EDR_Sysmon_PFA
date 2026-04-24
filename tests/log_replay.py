@@ -63,7 +63,8 @@ class LogReplayEngine:
         enable_l3: bool = True,
         enable_l4: bool = False,
         output_dir: str = 'tests/results',
-        event_delimiter: str = '---'
+        event_delimiter: str = '---',
+        event_callback: Optional[callable] = None
     ):
         """
         Initialize the log replay engine.
@@ -76,11 +77,15 @@ class LogReplayEngine:
             enable_l4: Enable L4 AI/ML Engine layer
             output_dir: Directory to save results
             event_delimiter: Marker separating events in the log file (or None for line-based)
+            event_callback: Optional callback function to process each event (e.g., agent.process_event)
+                           If provided, events will be passed to this callback instead of being
+                           processed directly by the pipeline.
         """
         self.log_file = log_file
         self.event_delimiter = event_delimiter
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.event_callback = event_callback
         
         # Initialize pipeline with specified layers
         self.pipeline = DetectionPipeline(
@@ -154,7 +159,8 @@ class LogReplayEngine:
         FLOW:
         1. Load events from file
         2. Parse each event
-        3. Process through pipeline
+        3. If callback is provided, pass to callback (e.g., agent.process_event)
+           Otherwise, process through pipeline directly
         4. Collect verdicts and alerts
         5. Generate statistics
         
@@ -194,7 +200,17 @@ class LogReplayEngine:
             successful_parses += 1
             self.events.append(parsed_event)
             
-            # Process through pipeline
+            # Route through callback if provided (e.g., agent.process_event)
+            # This ensures all agent logic (GUID discovery, graph building, etc.) is applied
+            if self.event_callback:
+                try:
+                    self.event_callback(parsed_event)
+                except Exception as e:
+                    print(f"[ERROR] Callback error on event {idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Also process through pipeline to collect verdicts for statistics
             verdict = self.pipeline.process_event(parsed_event)
             
             # Store verdict result

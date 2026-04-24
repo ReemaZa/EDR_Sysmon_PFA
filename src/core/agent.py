@@ -153,16 +153,14 @@ def process_event(evt):
     event_type = evt.get('event_type', 'Unknown')
     event_id   = evt.get('event_id', 0)
     timestamp  = evt.get('timestamp', '')
+    image = evt.get('image', 'N/A')
 
-    # Format based on threat level
-    if verdict.is_malicious():
-        alert_icon  = "🔴 ALERT"
-        threat_name = verdict.threat_level.name
-    else:
-        alert_icon  = "ℹ️ "
-        threat_name = "Clean"
-
-    print(f"{alert_icon} [{event_id:2d}] {timestamp} | {event_type:30s} | Threat: {threat_name}")
+    # Print clear event header
+    print("\n" + "=" * 10)
+    print(f" EVENT #{event_id} | Type: {event_type} | Time: {timestamp}")
+    #print(f"   Computer: {computer:30s} | Process: {image}")
+    print("=" * 10)
+    
 
     output = []
     # ================= GRAPH BUILDER =================
@@ -179,6 +177,58 @@ def process_event(evt):
     
     except Exception as e:
         print("[GRAPH ERROR]", str(e))
+
+
+    # Display results from each layer
+    if verdict.layer_results:
+        for result in verdict.layer_results:
+            layer_name = result.layer_name
+            threat_level = result.threat_level.name
+            
+
+            
+            print(f"\n {layer_name:20s} [{threat_level:10s}]")
+            print("   " + "-" * 110)
+            
+            # Display all matches
+            if result.matches:
+                print(f"   Matches ({len(result.matches)}):")
+                for idx, match in enumerate(result.matches, 1):
+                    print(f"      [{idx}] {match}")
+            else:
+                print(f"   ✓ No matches detected")
+            
+            # Display metadata
+            if result.metadata:
+                print(f"\n   Details:")
+                metadata = result.metadata
+                
+                # Handle different metadata structures based on layer
+                if isinstance(metadata, dict):
+                    for key, value in metadata.items():
+                        if isinstance(value, (str, int, float, bool)):
+                            print(f"      • {key}: {value}")
+                        elif isinstance(value, list):
+                            print(f"      • {key}: {', '.join(map(str, value[:3]))}{'...' if len(value) > 3 else ''}")
+                        elif isinstance(value, dict):
+                            print(f"      • {key}: {str(value)[:80]}...")
+                else:
+                    print(f"      {str(metadata)[:100]}")
+            
+            print("   " + "-" * 110)
+            
+            output.append({
+                "event": evt,
+                "layer_name": layer_name,
+                "threat_level": threat_level,
+                "matches": result.matches,
+                "metadata": result.metadata
+            })
+    else:
+        print(f"\n No detections from any layer (L1, L2, L3)")
+        print("   " + "-" * 110)
+    
+    print("=" * 120)
 
     # 👉 Save to file AFTER the loop
     with open("results.json", "a") as f:
@@ -212,9 +262,42 @@ def main():
         enable_l4=False,
     )
 
+    # If READ_FROM_FILE is True, replay events from log file and exit
+    if READ_FROM_FILE:
+        try:
+            # Import locally to avoid adding tests dependency to runtime when not used
+            from tests.log_replay import LogReplayEngine
+
+            print(f"[INFO] Running in log-replay mode. Reading events from: {LOG_REPLAY_FILE}")
+            print(f"[INFO] After replay completes, the program will exit.\n")
+            
+            # Create engine with callback to use the same process_event logic
+            engine = LogReplayEngine(
+                log_file=LOG_REPLAY_FILE,
+                enable_l1=detection_pipeline.enable_l1,
+                enable_l2=detection_pipeline.enable_l2,
+                enable_l3=detection_pipeline.enable_l3,
+                enable_l4=detection_pipeline.enable_l4,
+                event_callback=process_event  # ← Pass the callback so all agent logic is applied
+            )
+            # Replay events synchronously
+            engine.replay(verbose=True)
+            # Print pipeline stats from the engine's pipeline
+            if engine.pipeline:
+                engine.pipeline.print_stats()
+            
+            print("[INFO] Log replay completed. Exiting.\n")
+            sys.exit(0)
+        except Exception as e:
+            print(f"[ERROR] Failed to run log replay engine: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+    # If READ_FROM_FILE is False, listen for real-time events
     watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
 
-    # Define AFTER watcher and stop_event exist
+    # Define signal handlers
     def _stop(signum, frame):
         print("\n" + "=" * 70)
         print("Stopping watcher...")
@@ -229,10 +312,10 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    # Start listening for real-time events
     watcher.start()
 
     # Loop instead of a long blocking wait — allows signals to be processed
-     #stop_event.wait()
     while not stop_event.is_set():
         time.sleep(0.2)
 

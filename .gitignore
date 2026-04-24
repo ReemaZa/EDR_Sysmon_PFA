@@ -51,3 +51,4 @@ src/detection/l1_hash_check/*.csv
 # Résultats de tests et logs
 results.json
 *.log
+
