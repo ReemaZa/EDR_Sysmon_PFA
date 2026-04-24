@@ -1,0 +1,101 @@
+{
+  "description": "Critical Windows system resources that must never be tampered with by EDR automated responses",
+  "version": "1.0",
+  "last_updated": "2026-04-22",
+  
+  "protected_processes": {
+    "critical_system": [
+      "csrss.exe",
+      "wininit.exe",
+      "winlogon.exe",
+      "services.exe",
+      "lsass.exe",
+      "smss.exe",
+      "system",
+      "dwm.exe",
+      "explorer.exe"
+    ],
+    "security": [
+      "msmpeng.exe",
+      "mssense.exe",
+      "senseir.exe",
+      "sensecncproxy.exe",
+      "sensesampleuploader.exe"
+    ],
+    "boot_critical": [
+      "ntoskrnl.exe",
+      "hal.dll",
+      "bootmgr.exe"
+    ],
+    "session_manager": [
+      "svchost.exe",
+      "RuntimeBroker.exe",
+      "sihost.exe"
+    ]
+  },
+  
+  "protected_directories": [
+    "C:\\Windows\\System32",
+    "C:\\Windows\\SysWOW64",
+    "C:\\Windows\\WinSxS",
+    "C:\\Windows\\Boot",
+    "C:\\Windows\\System32\\drivers",
+    "C:\\Windows\\System32\\config",
+    "C:\\Program Files\\Windows Defender",
+    "C:\\Program Files\\Windows Defender Advanced Threat Protection",
+    "C:\\ProgramData\\Microsoft\\Windows Defender"
+  ],
+  
+  "protected_files": {
+    "kernel": [
+      "C:\\Windows\\System32\\ntoskrnl.exe",
+      "C:\\Windows\\System32\\hal.dll",
+      "C:\\Windows\\System32\\ntdll.dll",
+      "C:\\Windows\\System32\\kernel32.dll",
+      "C:\\Windows\\System32\\kernelbase.dll"
+    ],
+    "critical_dlls": [
+      "C:\\Windows\\System32\\user32.dll",
+      "C:\\Windows\\System32\\advapi32.dll",
+      "C:\\Windows\\System32\\gdi32.dll",
+      "C:\\Windows\\System32\\ole32.dll",
+      "C:\\Windows\\System32\\shell32.dll",
+      "C:\\Windows\\System32\\msvcrt.dll"
+    ],
+    "registry_hives": [
+      "C:\\Windows\\System32\\config\\SAM",
+      "C:\\Windows\\System32\\config\\SECURITY",
+      "C:\\Windows\\System32\\config\\SOFTWARE",
+      "C:\\Windows\\System32\\config\\SYSTEM",
+      "C:\\Windows\\System32\\config\\DEFAULT"
+    ],
+    "bootloader": [
+      "C:\\bootmgr",
+      "C:\\Windows\\Boot\\BCD"
+    ],
+    "drivers": [
+      "C:\\Windows\\System32\\drivers\\*.sys"
+    ]
+  },
+  
+  "protected_file_patterns": [
+    "*.sys",
+    "ntoskrnl.*",
+    "hal.*",
+    "bootmgr.*",
+    "winload.*"
+  ],
+  
+  "min_protected_pids": {
+    "description": "PIDs below this threshold are typically system-critical kernel processes",
+    "threshold": 1000,
+    "exceptions": []
+  },
+  
+  "warnings": {
+    "process_termination": "CRITICAL: Attempt to terminate protected Windows system process. This action could cause system instability or crash.",
+    "file_quarantine": "CRITICAL: Attempt to quarantine protected Windows system file. This action could render the system unbootable.",
+    "file_deletion": "CRITICAL: Attempt to delete protected Windows system file. This action would likely cause immediate system failure.",
+    "general": "CRITICAL: Operation blocked - target is a protected Windows system resource."
+  }
+}

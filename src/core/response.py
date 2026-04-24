@@ -1,11 +1,11 @@
 """
-EDR AI Agent Response Functions
+EDR AI Agent Response Functions (with Windows System Protection)
 Supports two modes for every action:
   - automatic : executes immediately (for high-confidence, time-critical automation)
   - approval  : prints a structured request and waits for operator confirmation
 
 Every function returns a dict with keys:
-  status   : "executed" | "pending_approval" | "approved" | "rejected" | "error"
+  status   : "executed" | "pending_approval" | "approved" | "rejected" | "error" | "blocked"
   action   : name of the action
   target   : the identifier passed in
   details  : free-form information
@@ -44,6 +44,113 @@ logging.basicConfig(
 log = logging.getLogger("edr")
 
 Mode = Literal["automatic", "approval"]
+
+# ── Protected Resources ───────────────────────────────────────────────────────
+
+class WindowsProtection:
+    """Manages protection of critical Windows system resources"""
+    
+    def __init__(self, config_path: str = "../../data/windows_protected_resources.json"):
+        self.config_path = config_path
+        self.config = self._load_config()
+    
+    def _load_config(self) -> Dict:
+        """Load protected resources configuration"""
+        try:
+            config_file = Path(self.config_path)
+            if config_file.exists():
+                return json.loads(config_file.read_text())
+            else:
+                log.warning(f"Protected resources config not found at {self.config_path}")
+                return self._default_config()
+        except Exception as e:
+            log.error(f"Failed to load protection config: {e}")
+            return self._default_config()
+    
+    def _default_config(self) -> Dict:
+        """Minimal fallback protection config"""
+        return {
+            "protected_processes": {
+                "critical_system": ["csrss.exe", "wininit.exe", "winlogon.exe", 
+                                   "services.exe", "lsass.exe", "smss.exe", "system"]
+            },
+            "protected_directories": ["C:\\Windows\\System32", "C:\\Windows\\SysWOW64"],
+            "protected_files": {"kernel": [], "critical_dlls": [], "registry_hives": []},
+            "min_protected_pids": {"threshold": 1000},
+            "warnings": {
+                "process_termination": "CRITICAL: Protected system process",
+                "file_quarantine": "CRITICAL: Protected system file",
+                "file_deletion": "CRITICAL: Protected system file",
+                "general": "CRITICAL: Protected system resource"
+            }
+        }
+    
+    def is_protected_process(self, pid: Optional[int] = None, 
+                            name: Optional[str] = None) -> tuple[bool, str]:
+        """
+        Check if a process is protected
+        Returns: (is_protected, reason)
+        """
+        # Check by PID threshold
+        if pid is not None:
+            threshold = self.config.get("min_protected_pids", {}).get("threshold", 1000)
+            if pid < threshold:
+                return (True, f"PID {pid} is below protected threshold ({threshold})")
+        
+        # Check by process name
+        if name is not None:
+            name_lower = name.lower()
+            for category, processes in self.config.get("protected_processes", {}).items():
+                protected_names = [p.lower() for p in processes]
+                if name_lower in protected_names:
+                    return (True, f"Process '{name}' is in protected category: {category}")
+        
+        return (False, "")
+    
+    def is_protected_file(self, file_path: str) -> tuple[bool, str]:
+        """
+        Check if a file is protected
+        Returns: (is_protected, reason)
+        """
+        path = Path(file_path).resolve()
+        path_str = str(path)
+        path_lower = path_str.lower()
+        
+        # Check protected directories
+        for protected_dir in self.config.get("protected_directories", []):
+            if path_lower.startswith(protected_dir.lower()):
+                return (True, f"File is in protected directory: {protected_dir}")
+        
+        # Check exact file matches
+        for category, files in self.config.get("protected_files", {}).items():
+            for protected_file in files:
+                if path_lower == protected_file.lower():
+                    return (True, f"File is protected ({category}): {protected_file}")
+        
+        # Check file patterns
+        patterns = self.config.get("protected_file_patterns", [])
+        for pattern in patterns:
+            if pattern.startswith("*."):
+                ext = pattern[1:]  # e.g., ".sys"
+                if path_str.lower().endswith(ext):
+                    return (True, f"File matches protected pattern: {pattern}")
+            elif "*" in pattern:
+                # Simple wildcard matching for patterns like "ntoskrnl.*"
+                pattern_prefix = pattern.split("*")[0].lower()
+                if path.name.lower().startswith(pattern_prefix):
+                    return (True, f"File matches protected pattern: {pattern}")
+        
+        return (False, "")
+    
+    def get_warning(self, action: str) -> str:
+        """Get appropriate warning message for an action"""
+        return self.config.get("warnings", {}).get(action, 
+                    self.config.get("warnings", {}).get("general", "CRITICAL: Protected resource"))
+
+
+# Global protection instance
+_protection = WindowsProtection()
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -241,11 +348,34 @@ def process_termination(
     pid   : Process ID to kill.
     force : SIGKILL (True) vs SIGTERM (False).
     """
+    
+    # PROTECTION CHECK: Verify this is not a protected process
+    is_protected, reason = _protection.is_protected_process(pid=pid)
+    
+    if is_protected:
+        warning_msg = _protection.get_warning("process_termination")
+        log.error(f"{warning_msg} - {reason}")
+        print(f"\n{'!' * 60}")
+        print(f"  {warning_msg}")
+        print(f"  PID: {pid}")
+        print(f"  Reason: {reason}")
+        print(f"  Action BLOCKED for system safety")
+        print(f"{'!' * 60}\n")
+        return _result("blocked", "process_termination", str(pid), 
+                      {"reason": reason, "warning": warning_msg})
+    
     def _terminate():
         try:
             import psutil
             proc = psutil.Process(pid)
-            info = {"name": proc.name(), "exe": proc.exe(), "cmdline": proc.cmdline()}
+            proc_name = proc.name()
+            
+            # Additional check by process name
+            is_protected_name, reason_name = _protection.is_protected_process(name=proc_name)
+            if is_protected_name:
+                raise PermissionError(f"Protected process: {reason_name}")
+            
+            info = {"name": proc_name, "exe": proc.exe(), "cmdline": proc.cmdline()}
             if force:
                 proc.kill()
             else:
@@ -275,6 +405,21 @@ def file_quarantine(
     file_path     : Absolute path to the file.
     quarantine_dir: Destination
     """
+    
+    # PROTECTION CHECK: Verify this is not a protected file
+    is_protected, reason = _protection.is_protected_file(file_path)
+    
+    if is_protected:
+        warning_msg = _protection.get_warning("file_quarantine")
+        log.error(f"{warning_msg} - {reason}")
+        print(f"\n{'!' * 60}")
+        print(f"  {warning_msg}")
+        print(f"  File: {file_path}")
+        print(f"  Reason: {reason}")
+        print(f"  Action BLOCKED for system safety")
+        print(f"{'!' * 60}\n")
+        return _result("blocked", "file_quarantine", file_path, 
+                      {"reason": reason, "warning": warning_msg})
 
     def _quarantine():
         src = Path(file_path)
@@ -343,6 +488,22 @@ def file_deletion(
     secure_wipe : Overwrite with random bytes before deletion.
     passes      : Number of overwrite passes (default 3; DoD 5220.22-M uses 7).
     """
+    
+    # PROTECTION CHECK: Verify this is not a protected file
+    is_protected, reason = _protection.is_protected_file(file_path)
+    
+    if is_protected:
+        warning_msg = _protection.get_warning("file_deletion")
+        log.error(f"{warning_msg} - {reason}")
+        print(f"\n{'!' * 60}")
+        print(f"  {warning_msg}")
+        print(f"  File: {file_path}")
+        print(f"  Reason: {reason}")
+        print(f"  Action BLOCKED for system safety")
+        print(f"{'!' * 60}\n")
+        return _result("blocked", "file_deletion", file_path, 
+                      {"reason": reason, "warning": warning_msg})
+    
     def _delete():
         p = Path(file_path)
         if not p.exists():
@@ -379,18 +540,6 @@ def patching(
     target         : Hostname / asset GUID (audit trail; runs locally in this stub).
     package_manager: "winget" | "choco" | "pip"
     packages       : Specific packages to update. None = full system upgrade.
-
-    Requirements
-    -------------------------
-    - Root / Administrator privileges on the target.
-    - Network access to patch repo (conflicts with host_isolation — sequence carefully).
-    - Compatibility testing: blind patching can break dependent services.
-    - Reboot handling: kernel and many Windows patches require restart.
-    - 0-day: if no patch exists, compensating controls (isolation, WAF rule,
-      virtual patching via IDS signature) are required in the interim.
-
-    Recommended flow:
-      isolate -> patch -> health-check -> release isolation
     """
     def _patch():
         cmd_map = {
