@@ -16,14 +16,6 @@ from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
 
-# Toggle: when True, the agent will read events from a local test file using
-# the LogReplayEngine (useful for testing). When False, it reads from live
-# Sysmon via the event watcher.
-# Set this to True or False as needed.
-READ_FROM_FILE = True
-# Path to the test log file (used only when READ_FROM_FILE == True)
-LOG_REPLAY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'tests', 'logs', 'windows-sysmon-T1003.001.txt')
-
 
 # Global pipeline instance
 detection_pipeline = None
