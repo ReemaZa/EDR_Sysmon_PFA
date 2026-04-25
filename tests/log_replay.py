@@ -1,360 +1,180 @@
 """
-Log Replay Engine: Replays Sysmon logs from a text file for testing the EDR pipeline.
+Log Replay Engine — pure event source for offline testing.
 
 RESPONSIBILITY:
-    - Read Sysmon event logs from a text file
-    - Parse each log entry as XML (same format as live events)
-    - Feed events to the detection pipeline
-    - Generate reports and statistics
-    - Support both individual files and batch testing
+    - Read Sysmon XML events from a text file
+    - Parse each event with the same ingestion.parse_sysmon_event() used live
+    - Call the caller-supplied event_callback for every event
+      (this is the same process_event() the live watcher calls)
+    - Print a concise summary when replay finishes
 
-FEATURES:
-    - Format compatibility: Uses same parsing as live events (ingestion.py)
-    - Timestamp tracking: Maintains event order and timing
-    - Progress reporting: Shows processing status
-    - Statistics collection: Generates comprehensive reports
-    - Results export: Saves detailed results to JSON/CSV
+The engine intentionally owns NO detection logic — all analysis happens inside
+the callback, keeping both live and replay paths identical in behaviour.
 
 USAGE:
     from tests.log_replay import LogReplayEngine
-    
-    engine = LogReplayEngine(log_file='tests/logs/attack_scenario.txt')
-    results = engine.replay()
-    engine.print_report()
+
+    engine = LogReplayEngine(
+        log_file='tests/logs/attack_scenario.txt',
+        event_callback=agent.process_event,
+    )
+    engine.replay(verbose=True)
+    engine.print_stats()
 """
 
-import sys
 import os
-import json
-from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+import sys
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
-# Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.core.ingestion import parse_sysmon_event
 
 
 class LogReplayEngine:
     """
-    Replays Sysmon event logs from a text file through the detection pipeline.
-    
-    ARCHITECTURE:
-    1. Load log file (text containing XML events, one per line or separated by markers)
-    2. Parse each event using the same ingestion.parse_sysmon_event() function
-    3. Feed to pipeline.process_event() for detection
-    4. Collect results and statistics
-    5. Generate comprehensive report
-    
-    SUPPORTED LOG FORMATS:
-    - XML per line: Each line is a complete XML event
-    - Delimited XML: Events separated by "---" or custom delimiter
-    - Raw XML: Multi-line XML events
+    Replays Sysmon events from a text file, forwarding each event to a callback.
+
+    The callback must have the signature:
+        def callback(event: dict) -> None
+
+    It should be the same function used in live mode — typically agent.process_event().
     """
-    
+
     def __init__(
         self,
         log_file: str,
+        event_callback: Callable[[Dict[str, Any]], None],
+        event_delimiter: str = '---',
+        # Legacy pipeline-toggle kwargs accepted but ignored —
+        # pipeline configuration lives in the callback's pipeline, not here.
         enable_l1: bool = True,
         enable_l2: bool = True,
-        enable_l3: bool = True,
+        enable_l3: bool = False,
         enable_l4: bool = False,
-        output_dir: str = 'tests/results',
-        event_delimiter: str = '---',
-        event_callback: Optional[callable] = None
     ):
         """
-        Initialize the log replay engine.
-        
         Args:
-            log_file: Path to the text file containing Sysmon logs
-            enable_l1: Enable L1 Hash Reputation layer
-            enable_l2: Enable L2 Sigma Rules layer
-            enable_l3: Enable L3 YARA Scanner layer
-            enable_l4: Enable L4 AI/ML Engine layer
-            output_dir: Directory to save results
-            event_delimiter: Marker separating events in the log file (or None for line-based)
-            event_callback: Optional callback function to process each event (e.g., agent.process_event)
-                           If provided, events will be passed to this callback instead of being
-                           processed directly by the pipeline.
+            log_file:        Path to the file containing Sysmon XML events.
+            event_callback:  Function called for every successfully parsed event.
+                             Must be the same handler used in live mode.
+            event_delimiter: Token that separates events in the file.
+                             Pass None (or empty string) for one-event-per-line format.
         """
-        self.log_file = log_file
-        self.event_delimiter = event_delimiter
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file       = log_file
         self.event_callback = event_callback
-        
-        # Initialize pipeline with specified layers
-        self.pipeline = DetectionPipeline(
-            enable_l1=enable_l1,
-            enable_l2=enable_l2,
-            enable_l3=enable_l3,
-            enable_l4=enable_l4
-        )
-        
-        # Results collection
-        self.events: List[Dict[str, Any]] = []
-        self.verdicts: List[Dict[str, Any]] = []
-        self.alerts: List[Dict[str, Any]] = []
-        self.processing_time: float = 0
-        self.start_time: Optional[datetime] = None
-        self.end_time: Optional[datetime] = None
-        
-    def _read_events_from_file(self) -> List[str]:
-        """
-        Read raw event strings from the log file.
-        
-        Supports two formats:
-        1. Delimiter-based: Events separated by a marker (e.g., '---')
-        2. Line-based: Each line is one event
-        
-        Returns:
-            List of raw event strings (XML)
-        """
+        self.event_delimiter = event_delimiter
+
+        # ── Counters (populated during replay) ────────────────────────────
+        self._total_raw: int    = 0   # raw chunks read from file
+        self._parsed: int       = 0   # successfully parsed events
+        self._parse_errors: int = 0   # chunks that failed to parse
+        self._callback_errors: int = 0  # events where callback raised
+        self._start_time: Optional[datetime] = None
+        self._end_time:   Optional[datetime] = None
+
+    # ── File reading ───────────────────────────────────────────────────────
+
+    def _read_raw_events(self) -> List[str]:
+        """Return a list of raw XML strings from the log file."""
         if not os.path.exists(self.log_file):
             raise FileNotFoundError(f"Log file not found: {self.log_file}")
-        
-        with open(self.log_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Try delimiter-based first
-        if self.event_delimiter and self.event_delimiter in content:
-            events = content.split(self.event_delimiter)
-            events = [e.strip() for e in events if e.strip()]
-            print(f"[*] Loaded {len(events)} events using delimiter '{self.event_delimiter}'")
-            return events
-        
-        # Fall back to line-based
-        events = [line.strip() for line in content.split('\n') if line.strip()]
-        print(f"[*] Loaded {len(events)} events (line-based parsing)")
-        return events
-    
-    def _parse_event(self, raw_event: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse a raw event string using the standard ingestion parser.
-        
-        This ensures compatibility with live event parsing.
-        
-        Args:
-            raw_event: Raw XML event string
-            
-        Returns:
-            Parsed event dict or None if parsing failed
-        """
-        try:
-            # Use the same parser as live events
-            parsed = parse_sysmon_event(raw_event)
-            return parsed
-        except Exception as e:
-            print(f"[!] Parse error on event: {str(e)[:100]}...")
-            return None
-    
-    def replay(self, verbose: bool = True) -> List[Dict[str, Any]]:
-        """
-        Replay all events through the detection pipeline.
-        
-        FLOW:
-        1. Load events from file
-        2. Parse each event
-        3. If callback is provided, pass to callback (e.g., agent.process_event)
-           Otherwise, process through pipeline directly
-        4. Collect verdicts and alerts
-        5. Generate statistics
-        
-        Args:
-            verbose: Print progress information
-            
-        Returns:
-            List of detection results
-        """
-        self.start_time = datetime.now()
-        
-        # Read raw events from file
-        try:
-            raw_events = self._read_events_from_file()
-        except FileNotFoundError as e:
-            print(f"[ERROR] {e}")
-            return []
-        
-        if not raw_events:
-            print("[WARNING] No events found in log file")
-            return []
-        
-        print(f"[*] Processing {len(raw_events)} events...")
-        print(f"[*] Pipeline configuration: L1={self.pipeline.enable_l1}, "
-              f"L2={self.pipeline.enable_l2}, L3={self.pipeline.enable_l3}, "
-              f"L4={self.pipeline.enable_l4}\n")
-        
-        # Process each event
-        successful_parses = 0
-        for idx, raw_event in enumerate(raw_events, 1):
-            # Parse event
-            parsed_event = self._parse_event(raw_event)
-            
-            if parsed_event is None:
-                continue
-            
-            successful_parses += 1
-            self.events.append(parsed_event)
-            
-            # Route through callback if provided (e.g., agent.process_event)
-            # This ensures all agent logic (GUID discovery, graph building, etc.) is applied
-            if self.event_callback:
-                try:
-                    self.event_callback(parsed_event)
-                except Exception as e:
-                    print(f"[ERROR] Callback error on event {idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Also process through pipeline to collect verdicts for statistics
-            verdict = self.pipeline.process_event(parsed_event)
-            
-            # Store verdict result
-            verdict_dict = {
-                'event_index': idx,
-                'event_id': parsed_event.get('event_id'),
-                'timestamp': parsed_event.get('timestamp'),
-                'computer': parsed_event.get('computer'),
-                'threat_level': verdict.threat_level.name,
-                'is_malicious': verdict.is_malicious(),
-                'layer_results': [
-                    {
-                        'layer': r.layer_name,
-                        'threat_level': r.threat_level.name,
-                        'matches': r.matches,
-                        'metadata': r.metadata
-                    }
-                    for r in verdict.layer_results
-                ]
-            }
-            self.verdicts.append(verdict_dict)
-            
-            # Collect alerts
-            if verdict.is_malicious():
-                self.alerts.append(verdict_dict)
-            
-            # Progress report
-            if verbose and (idx % 100 == 0 or idx == len(raw_events)):
-                print(f"[*] Processed {idx}/{len(raw_events)} events "
-                      f"({successful_parses} parsed, {len(self.alerts)} alerts)")
-            
-        
-        self.end_time = datetime.now()
-        self.processing_time = (self.end_time - self.start_time).total_seconds()
-        
-        if verbose:
-            print(f"\n[+] Replay complete in {self.processing_time:.2f}s")
-        
-        return self.verdicts
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """
-        Generate comprehensive statistics about the replay session.
-        
-        Returns:
-            Dictionary with statistics
-        """
-        total_events = len(self.verdicts)
-        total_alerts = len(self.alerts)
-        
-        # Count by threat level
-        threat_counts = {
-            'CRITICAL': len([a for a in self.alerts if a['threat_level'] == 'CRITICAL']),
-            'HIGH': len([a for a in self.alerts if a['threat_level'] == 'HIGH']),
-            'MEDIUM': len([a for a in self.alerts if a['threat_level'] == 'MEDIUM']),
-            'LOW': len([a for a in self.alerts if a['threat_level'] == 'LOW']),
-        }
-        
-        # Layer detection counts
-        layer_counts = {'l1': 0, 'l2': 0, 'l3': 0, 'l4': 0}
-        for alert in self.alerts:
-            for layer_result in alert['layer_results']:
-                layer_name = layer_result['layer'].lower()
-                if layer_name in layer_counts:
-                    layer_counts[layer_name] += 1
-        
-        # Event type distribution
-        event_type_counts = {}
-        for event in self.events:
-            event_id = event.get('event_id', 'Unknown')
-            event_type_counts[event_id] = event_type_counts.get(event_id, 0) + 1
-        
-        # Alert rate
-        alert_rate = (total_alerts / total_events * 100) if total_events > 0 else 0
-        
-        # Events per second
-        eps = total_events / max(self.processing_time, 0.001)
-        
-        return {
-            'total_events': total_events,
-            'total_alerts': total_alerts,
-            'alert_rate': f"{alert_rate:.2f}%",
-            'threat_counts': threat_counts,
-            'layer_detections': layer_counts,
-            'event_type_distribution': event_type_counts,
-            'processing_time': f"{self.processing_time:.2f}s",
-            'events_per_second': f"{eps:.2f}",
-            'pipeline_stats': self.pipeline.get_stats()
-        }
-    
-    def export_results_json(self, filename: str = 'replay_results.json') -> str:
-        """
-        Export detailed results to JSON file.
-        
-        Args:
-            filename: Name of the output file
-            
-        Returns:
-            Path to the created file
-        """
-        output_path = self.output_dir / filename
-        
-        results = {
-            'timestamp': datetime.now().isoformat(),
-            'log_file': self.log_file,
-            'statistics': self.get_statistics(),
-            'verdicts': self.verdicts,
-            'alerts': self.alerts
-        }
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, default=str)
-        
-        return str(output_path)
-    
-    def export_alerts_csv(self, filename: str = 'alerts.csv') -> str:
-        """
-        Export alerts to CSV for analysis.
-        
-        Args:
-            filename: Name of the output file
-            
-        Returns:
-            Path to the created file
-        """
-        import csv
-        
-        output_path = self.output_dir / filename
-        
-        if not self.alerts:
-            print("[*] No alerts to export")
-            return str(output_path)
-        
-        with open(output_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'event_index', 'event_id', 'timestamp', 'computer',
-                'threat_level', 'layer_results'
-            ])
-            writer.writeheader()
-            
-            for alert in self.alerts:
-                alert_copy = alert.copy()
-                alert_copy['layer_results'] = json.dumps(alert_copy['layer_results'])
-                writer.writerow(alert_copy)
-        
-        return str(output_path)
 
+        with open(self.log_file, 'r', encoding='utf-8') as fh:
+            content = fh.read()
+
+        if self.event_delimiter and self.event_delimiter in content:
+            chunks = [c.strip() for c in content.split(self.event_delimiter) if c.strip()]
+            print(f"[Replay] Delimiter '{self.event_delimiter}' found — "
+                  f"{len(chunks)} event(s) loaded")
+            return chunks
+
+        # Fallback: one event per line
+        chunks = [line.strip() for line in content.splitlines() if line.strip()]
+        print(f"[Replay] Line-based parsing — {len(chunks)} event(s) loaded")
+        return chunks
+
+    # ── Main replay loop ───────────────────────────────────────────────────
+
+    def replay(self, verbose: bool = True) -> None:
+        """
+        Parse every event in the file and pass it to the callback.
+
+        The callback handles all detection, graphing, and storage — exactly as
+        it does for live events.  This method only tracks counts for the
+        end-of-replay summary.
+
+        Args:
+            verbose: Print a progress line every 100 events.
+        """
+        self._start_time = datetime.now()
+
+        try:
+            raw_events = self._read_raw_events()
+        except FileNotFoundError as exc:
+            print(f"[Replay][ERROR] {exc}")
+            return
+
+        self._total_raw = len(raw_events)
+
+        if self._total_raw == 0:
+            print("[Replay][WARNING] No events found in log file.")
+            return
+
+        print(f"[Replay] Starting — {self._total_raw} raw event(s) to process\n")
+
+        for idx, raw in enumerate(raw_events, start=1):
+            # Parse with the standard ingestion function
+            evt = None
+            try:
+                evt = parse_sysmon_event(raw)
+            except Exception as exc:
+                print(f"[Replay][WARN] Parse error on event {idx}: {exc}")
+
+            if evt is None:
+                self._parse_errors += 1
+                continue
+
+            self._parsed += 1
+
+            # Forward to the unified handler
+            try:
+                self.event_callback(evt)
+            except Exception as exc:
+                self._callback_errors += 1
+                print(f"[Replay][ERROR] Callback raised on event {idx}: {exc}")
+                import traceback
+                traceback.print_exc()
+
+            # Progress tick
+            if verbose and (idx % 100 == 0 or idx == self._total_raw):
+                print(f"[Replay] Progress: {idx}/{self._total_raw} raw  |  "
+                      f"{self._parsed} parsed  |  {self._parse_errors} skipped")
+
+        self._end_time = datetime.now()
+
+    # ── Stats ──────────────────────────────────────────────────────────────
+
+    def print_stats(self) -> None:
+        """Print a concise replay summary to stdout."""
+        duration = (
+            (self._end_time - self._start_time).total_seconds()
+            if self._start_time and self._end_time
+            else 0.0
+        )
+        eps = self._parsed / max(duration, 0.001)
+
+        print("\n" + "=" * 60)
+        print("LOG REPLAY — SUMMARY")
+        print("=" * 60)
+        print(f"  Log file          : {self.log_file}")
+        print(f"  Raw chunks read   : {self._total_raw}")
+        print(f"  Successfully parsed: {self._parsed}")
+        print(f"  Parse failures    : {self._parse_errors}")
+        print(f"  Callback errors   : {self._callback_errors}")
+        print(f"  Duration          : {duration:.2f}s")
+        print(f"  Throughput        : {eps:.1f} events/s")
+        print("=" * 60 + "\n")

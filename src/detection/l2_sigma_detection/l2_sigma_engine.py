@@ -299,7 +299,7 @@ class SigmaEngine:
                             #"total_score": data.get("total_score", 0),
                             "count": data["count"],
                             "source": "redis-cache",
-                            "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                            "graph_detection": self._build_graph_detection(data)  # ADD THIS
                         },
                     )
 
@@ -316,7 +316,7 @@ class SigmaEngine:
                 if matcher.match(event):
                     rule = matcher.rule
                     rule_id = str(getattr(rule, "id", "unknown"))
-                    print(f"========================id================== {rule_id}")
+                    print(f"=====================rule id================== {rule_id}")
 
                     matched_rule_ids.append(rule_id)
                     matched_rule_titles.append(rule.title)
@@ -344,6 +344,7 @@ class SigmaEngine:
                 event=event,
             )
 
+
             self.store_event(event_hash, data)
             print(f"[NEW] {event_hash}")
 
@@ -364,7 +365,7 @@ class SigmaEngine:
                     #"total_score": data["total_score"],
                     "count": 1,
                     "source": "fresh-detection",
-                    "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                    "graph_detection": self._build_graph_detection(data)  # ADD THIS
                 },
             )
 

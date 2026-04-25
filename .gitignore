@@ -52,3 +52,8 @@ src/detection/l1_hash_check/*.csv
 results.json
 *.log
 
+
+sysmon_bookmark.xml
+tests/logs_dataset/
+tests/testN01/
+tests/results/

@@ -2,10 +2,10 @@
 Detection module - Multi-layer threat detection engines.
 
 LAYERS:
-    L1: Hash Reputation (local blacklist) ✅ IMPLEMENTED
-    L2: Sigma Rules (behavioral patterns)  ✅ IMPLEMENTED
-    L3: YARA Scanner (malware signatures) 🚧 TODO
-    L4: AI/ML Engine (anomaly detection) 🚧 TODO
+    L1: Hash Reputation (local blacklist) [IMPLEMENTED]
+    L2: Sigma Rules (behavioral patterns)  [IMPLEMENTED]
+    L3: YARA Scanner (malware signatures) [TODO]
+    L4: AI/ML Engine (anomaly detection) [TODO]
 
 INTERFACE:
     All engines must implement:

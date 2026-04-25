@@ -156,6 +156,8 @@ class DetectionPipeline:
         
         target_hash = event_hashes.get('sha256') or event_hashes.get('md5') or event_hashes.get('sha1')
         if self.enable_l1 and self.l1_engine and target_hash: 
+            print(f"[DEBUG] Running L1 Hash check ")
+
             l1_result = self.l1_engine.check_event(event)
             if l1_result:
                 verdict.add_result(l1_result)
@@ -167,10 +169,10 @@ class DetectionPipeline:
                     self.stats['critical'] += 1
                     self.stats['alerts'] += 1
                     return verdict
-            print(f"DEBUG: L1 Hash Reputation check for {target_hash[:10]}: {l1_result}") # ADD THIS
         
         # ===== LAYER 2: Sigma Rules =====
         if self.enable_l2 and self.l2_engine:
+            print(f"[DEBUG] Running L2 Sigma check ")
             l2_result = self.l2_engine.check_event(event)
             if l2_result:
                 verdict.add_result(l2_result)
@@ -185,6 +187,8 @@ class DetectionPipeline:
         
         # ===== LAYER 3: YARA Scanner =====
         if self.enable_l3 and self.l3_engine:
+            print(f"[DEBUG] Running L3 YARA check")
+
             l3_result = self.l3_engine.check_event(event)
             if l3_result:
                 verdict.add_result(l3_result)
