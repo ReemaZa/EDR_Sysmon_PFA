@@ -299,7 +299,7 @@ class SigmaEngine:
                             #"total_score": data.get("total_score", 0),
                             "count": data["count"],
                             "source": "redis-cache",
-                            "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                            "graph_detection": self._build_graph_detection(data)  # ADD THIS
                         },
                     )
 
@@ -365,7 +365,7 @@ class SigmaEngine:
                     #"total_score": data["total_score"],
                     "count": 1,
                     "source": "fresh-detection",
-                    "graph_detection": self._build_graph_detection(data)  # ✅ ADD THIS
+                    "graph_detection": self._build_graph_detection(data)  # ADD THIS
                 },
             )
 

@@ -58,41 +58,41 @@ class DetectionResult:
     
     def __str__(self):
         """Pretty string representation with metadata."""
-        threat_emoji = {
-            'CRITICAL': '🔴',
-            'HIGH': '🟠',
-            'MEDIUM': '🟡',
-            'LOW': '🔵',
-            'UNKNOWN': '⚪'
-        }.get(self.threat_level.name, '❓')
+        threat_symbol = {
+            'CRITICAL': '[CRITICAL]',
+            'HIGH': '[HIGH]',
+            'MEDIUM': '[MEDIUM]',
+            'LOW': '[LOW]',
+            'UNKNOWN': '[UNKNOWN]'
+        }.get(self.threat_level.name, '[?]')
         
-        result_str = f"\n  [{self.layer_name}] {threat_emoji} {self.threat_level.name}\n"
-        result_str += f"    ├─ Matches: {len(self.matches)}\n"
+        result_str = f"\n  [{self.layer_name}] {threat_symbol} {self.threat_level.name}\n"
+        result_str += f"    +- Matches: {len(self.matches)}\n"
         
         if self.matches:
             for idx, match in enumerate(self.matches, 1):
-                result_str += f"    │  [{idx}] {match}\n"
+                result_str += f"    |  [{idx}] {match}\n"
         
         if self.metadata:
-            result_str += f"    ├─ Metadata:\n"
+            result_str += f"    +- Metadata:\n"
             if 'source' in self.metadata:
-                result_str += f"    │  ├─ Source: {self.metadata['source']}\n"
+                result_str += f"    |  +- Source: {self.metadata['source']}\n"
             if 'count' in self.metadata:
-                result_str += f"    │  ├─ Count: {self.metadata['count']}\n"
+                result_str += f"    |  +- Count: {self.metadata['count']}\n"
             
             if 'rules' in self.metadata and self.metadata['rules']:
                 rules = self.metadata['rules']
-                result_str += f"    │  ├─ Rules ({len(rules)}):\n"
+                result_str += f"    |  +- Rules ({len(rules)}):\n"
                 for idx, rule in enumerate(rules[:3], 1):
-                    result_str += f"    │  │  {idx}. {rule}\n"
+                    result_str += f"    |  |  {idx}. {rule}\n"
                 if len(rules) > 3:
-                    result_str += f"    │  │  ... and {len(rules) - 3} more\n"
+                    result_str += f"    |  |  ... and {len(rules) - 3} more\n"
             
             if 'graph_detection' in self.metadata and self.metadata['graph_detection']:
                 gd = self.metadata['graph_detection']
-                result_str += f"    │  ├─ Graph Detection:\n"
-                result_str += f"    │  │  ├─ Score: {gd.get('total_score', 0)}\n"
-                result_str += f"    │  │  ├─ Findings: {len(gd.get('finding_ids', []))}\n"
+                result_str += f"    |  +- Graph Detection:\n"
+                result_str += f"    |  |  +- Score: {gd.get('total_score', 0)}\n"
+                result_str += f"    |  |  +- Findings: {len(gd.get('finding_ids', []))}\n"
                 
                 techniques = gd.get('techniques', [])
                 tactics = gd.get('tactics', [])
@@ -101,15 +101,15 @@ class DetectionResult:
                     tech_str = ', '.join(techniques[:2])
                     if len(techniques) > 2:
                         tech_str += f" ... +{len(techniques)-2}"
-                    result_str += f"    │  │  ├─ Techniques: {tech_str}\n"
+                    result_str += f"    |  |  +- Techniques: {tech_str}\n"
                 
                 if tactics:
                     tac_str = ', '.join(tactics[:2])
                     if len(tactics) > 2:
                         tac_str += f" ... +{len(tactics)-2}"
-                    result_str += f"    │  │  └─ Tactics: {tac_str}\n"
+                    result_str += f"    |  |  +- Tactics: {tac_str}\n"
             
-            result_str += f"    └─ End Metadata\n"
+            result_str += f"    +- End Metadata\n"
         
         return result_str
 

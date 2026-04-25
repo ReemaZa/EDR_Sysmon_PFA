@@ -249,7 +249,7 @@ def process_event(evt):
         graph_builder.process_event(evt, graph_detection)
     
     except Exception as e:
-        print(f"  ❌ [GRAPH ERROR] {str(e)}")
+        print(f"  [ERROR] [GRAPH ERROR] {str(e)}")
 
     # Display results from each layer
     print("\n" + "_" * 130)
@@ -270,18 +270,18 @@ def process_event(evt):
                 "metadata": result.metadata
             })
     else:
-        print("  ✓ No detections from any layer (L1, L2, L3, L4)\n")
+        print("  [OK] No detections from any layer (L1, L2, L3, L4)\n")
     
     # Print final verdict
     if verdict:
-        threat_emoji = {
-            'CRITICAL': '🔴',
-            'HIGH': '🟠',
-            'MEDIUM': '🟡',
-            'LOW': '🔵',
-            'UNKNOWN': '⚪'
-        }.get(verdict.threat_level.name, '❓')
-        print(f"  📌 FINAL VERDICT: {threat_emoji} [{verdict.threat_level.name}]")
+        threat_symbol = {
+            'CRITICAL': '[CRITICAL]',
+            'HIGH': '[HIGH]',
+            'MEDIUM': '[MEDIUM]',
+            'LOW': '[LOW]',
+            'UNKNOWN': '[UNKNOWN]'
+        }.get(verdict.threat_level.name, '[?]')
+        print(f"  [VERDICT] FINAL VERDICT: {threat_symbol} {verdict.threat_level.name}")
     
     with open("results.json", "a") as f:
         json.dump(output, f, indent=4)
