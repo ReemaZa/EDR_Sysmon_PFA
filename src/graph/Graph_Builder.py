@@ -97,10 +97,10 @@ EDGE_WEIGHTS: dict[str, int] = {
 }
 
 ALWAYS_STORE: set[str] = {
-    "INJECTED_THREAD",
-    "ACCESSED_MEMORY",
-    "TAMPERED",
-    "TIMESTOMPED"
+    #"INJECTED_THREAD",
+    #"ACCESSED_MEMORY",
+    #"TAMPERED",
+    #"TIMESTOMPED"
     
   
     
@@ -334,11 +334,12 @@ class GraphBuilder:
         description:  str,
         score:        int,
         timestamp:    str,
+        t_hash: str
     ) -> str:
         if not guid:
             return ""
-
-        t_hash    = self._template_hash(image, parent_image, cmdline, user)
+        if not t_hash:
+            t_hash    = self._template_hash(image, parent_image, cmdline, user)
         ts        = timestamp or self._now()
         was_ghost = self._is_ghost(guid)  # read ghost state BEFORE any write
 
@@ -361,6 +362,7 @@ class GraphBuilder:
         self._run(
             """
             MATCH (p:ProcessInstance {id: $guid})
+            WHERE NOT EXISTS((p)-[:INSTANCE_OF]->())
             MATCH (t:ProcessTemplate {template_hash: $t_hash})
             MERGE (p)-[:INSTANCE_OF]->(t)
             """,
@@ -424,11 +426,7 @@ class GraphBuilder:
         if not self._instance_exists(parent_guid):
             # parent never scored — create minimal ghost
             self._create_ghost(parent_guid)
-        parent_score = self._get_score(parent_guid)
-        delta = int(parent_score * PARENT_INHERITANCE)
 
-        if delta > 0:
-            self._add_score(child_guid, delta)
         # wire CHILD_OF (idempotent)
         self._run(
             """
@@ -446,7 +444,8 @@ class GraphBuilder:
     # ─────────────────────────────────────────
 
     def _should_store_edge(self, rel_type: str, process_score: int) -> bool:
-        return process_score > 0 or rel_type in ALWAYS_STORE
+        return process_score > 0 
+    #or rel_type in ALWAYS_STORE
 
     # ─────────────────────────────────────────
     # GENERIC EDGE UPSERT
@@ -530,56 +529,63 @@ class GraphBuilder:
         user         = (d.get("User")              or "").lower()
         parent_user  = (d.get("ParentUser")        or "").lower()  # ← separate field
 
-        eff = self._effective_score(ep["total_score"], "CREATED")
+        eff = ep["total_score"]
 
         # parent gets its own user, not the child's
-        self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
-        self._upsert_template(child_image, parent_image, child_cmd, user,
+        t_hash=self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
+        t_hash=self._upsert_template(child_image, parent_image, child_cmd, user,
                               description, ts, eff)
+        parent_score = self._get_score(parent_guid)
+        delta = int(parent_score * PARENT_INHERITANCE)
 
+        eff=eff+delta
         if eff > 0:
             self._create_or_promote_instance(
                 guid=child_guid, image=child_image,
                 parent_image=parent_image, cmdline=child_cmd,
                 user=user, description=description,
-                score=eff, timestamp=ts,
+                score=eff, timestamp=ts,t_hash=t_hash
             )
 
-        if child_guid and self._instance_exists(child_guid):
-            self._ensure_parent_and_link(child_guid, parent_guid, ts)
-
-        if (eff > 0
-                and child_guid  and self._instance_exists(child_guid)
-                and parent_guid and self._instance_exists(parent_guid)):
-            self._merge_edge(
-                src_id=parent_guid, src_label="ProcessInstance",
-                rel_type="CREATED",
-                dst_id=child_guid,  dst_label="ProcessInstance",
-                ep=ep, eff_score=eff, timestamp=ts,
-            )
-            # ← _add_score removed here; instance score already set in _create_or_promote_instance
+            if child_guid and self._instance_exists(child_guid):
+                self._ensure_parent_and_link(child_guid, parent_guid, ts)
+    
+        
+                self._merge_edge(
+                    src_id=parent_guid, src_label="ProcessInstance",
+                    rel_type="CREATED",
+                    dst_id=child_guid,  dst_label="ProcessInstance",
+                    ep=ep, eff_score=eff, timestamp=ts,
+                )
+                # ← _add_score removed here; instance score already set in _create_or_promote_instance
 
     def handle_event_2(self, event: dict, detection: Optional[dict] = None):
-        """FileCreateTime — Timestomp. ALWAYS_STORE."""
+        """FileCreateTime — Timestomp."""
         d  = event.get("data", event)
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
-
-        guid    = d.get("ProcessGuid") or ""
-        file_id = (d.get("TargetFilename") or "").lower()
-        image   = (d.get("Image")          or "").lower()
-        cmd     = d.get("CommandLine")     or ""
-        user    = (d.get("User")           or "").lower()
+    
+        guid    = d.get("ProcessGuid")      or ""
+        file_id = (d.get("TargetFilename")  or "").lower()
+        image   = (d.get("Image")           or "").lower()
+        cmd     = d.get("CommandLine")      or ""
+        user    = (d.get("User")            or "").lower()
         if not guid or not file_id:
             return
+    
+        #eff       = self._effective_score(ep["total_score"], "TIMESTOMPED")
+        eff=ep["total_score"]
+        cur_score = self._get_score(guid)
+    
+        if not (eff+cur_score)> 0:
+            
+            return
 
-        eff = self._effective_score(ep["total_score"], "TIMESTOMPED")
-
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
@@ -607,15 +613,15 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "CONNECTED")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("CONNECTED", cur_score):
-            self._upsert_template(image, "", cmd, user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+           
             return
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (n:Network {id: $ip})", {"ip": dst_ip})
         self._merge_edge(
@@ -647,15 +653,15 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "LOADED_DRIVER")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("LOADED_DRIVER", cur_score):
-            self._upsert_template(image, "", "", user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+          
             return
 
-        self._upsert_template(image, "", "", user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run(
             "MERGE (drv:Driver {id: $s}) ON CREATE SET drv.image = $img",
@@ -686,15 +692,15 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "LOADED_IMAGE")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("LOADED_IMAGE", cur_score):
-            self._upsert_template(image, "", "", user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+            
             return
 
-        self._upsert_template(image, "", "", user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run(
             "MERGE (img:Driver {id: $s}) ON CREATE SET img.image = $i",
@@ -728,34 +734,40 @@ class GraphBuilder:
         if not src_guid or not tgt_guid:
             return
 
-        eff = self._effective_score(ep["total_score"], "INJECTED_THREAD")
+        eff = ep["total_score"]
+        src_cur_score = self._get_score(src_guid)
+        tgt_cur_score = self._get_score(tgt_guid)
 
-        # source
-        self._upsert_template(src_image, "", "", src_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=src_guid, image=src_image, parent_image="",
-            cmdline="", user=src_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(src_guid, eff)
+        # Source - with gate check
+        src_should_store =  (eff+src_cur_score)> 0  or  (eff+tgt_cur_score)> 0
+        
+        if src_should_store:
+            src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+            self._create_or_promote_instance(
+                guid=src_guid, image=src_image, parent_image="",
+                cmdline="", user=src_user, description="",
+                score=eff, timestamp=ts, t_hash=src_t_hash
+            )
+          
+        # Target - with gate check
+        
+            tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
+        
+            self._create_or_promote_instance(
+                guid=tgt_guid, image=tgt_image, parent_image="",
+                cmdline="", user=tgt_user, description="",
+                score=eff, timestamp=ts, t_hash=tgt_t_hash
+            )
 
-        # target — scored independently, no inheritance from source
-        self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=tgt_guid, image=tgt_image, parent_image="",
-            cmdline="", user=tgt_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(tgt_guid, eff)
-
-        self._merge_edge(
-            src_id=src_guid, src_label="ProcessInstance",
-            rel_type="INJECTED_THREAD",
-            dst_id=tgt_guid, dst_label="ProcessInstance",
-            ep=ep, eff_score=eff, timestamp=ts,
-            extra_create={"start_function": d.get("StartFunction") or ""},
-        )
-
+            # Edge only if BOTH instances exist
+            if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
+                self._merge_edge(
+                    src_id=src_guid, src_label="ProcessInstance",
+                    rel_type="INJECTED_THREAD",
+                    dst_id=tgt_guid, dst_label="ProcessInstance",
+                    ep=ep, eff_score=eff, timestamp=ts,
+                    extra_create={"start_function": d.get("StartFunction") or ""},
+                )
     def handle_event_10(self, event: dict, detection: Optional[dict] = None):
         """
         ProcessAccess. ALWAYS_STORE.
@@ -775,31 +787,40 @@ class GraphBuilder:
         if not src_guid or not tgt_guid:
             return
 
-        eff = self._effective_score(ep["total_score"], "ACCESSED_MEMORY")
+        eff = ep["total_score"]
+        src_cur_score = self._get_score(src_guid)
+        tgt_cur_score = self._get_score(tgt_guid)
 
-        self._upsert_template(src_image, "", "", src_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=src_guid, image=src_image, parent_image="",
-            cmdline="", user=src_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(src_guid, eff)
+        # Source - with gate check
+        src_should_store =  (eff+src_cur_score)> 0 or (eff+tgt_cur_score)> 0
+        
+        if src_should_store:
+            src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+            self._create_or_promote_instance(
+                guid=src_guid, image=src_image, parent_image="",
+                cmdline="", user=src_user, description="",
+                score=eff, timestamp=ts, t_hash=src_t_hash
+            )
 
-        self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=tgt_guid, image=tgt_image, parent_image="",
-            cmdline="", user=tgt_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(tgt_guid, eff)
+        # Target - with gate check
+            
+            tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
+            
+            self._create_or_promote_instance(
+                    guid=tgt_guid, image=tgt_image, parent_image="",
+                    cmdline="", user=tgt_user, description="",
+                    score=eff, timestamp=ts, t_hash=tgt_t_hash
+                )
 
-        self._merge_edge(
-            src_id=src_guid, src_label="ProcessInstance",
-            rel_type="ACCESSED_MEMORY",
-            dst_id=tgt_guid, dst_label="ProcessInstance",
-            ep=ep, eff_score=eff, timestamp=ts,
-            extra_create={"access_mask": d.get("GrantedAccess") or ""},
-        )
+            # Edge only if BOTH instances exist
+            if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
+                self._merge_edge(
+                    src_id=src_guid, src_label="ProcessInstance",
+                    rel_type="ACCESSED_MEMORY",
+                    dst_id=tgt_guid, dst_label="ProcessInstance",
+                    ep=ep, eff_score=eff, timestamp=ts,
+                    extra_create={"access_mask": d.get("GrantedAccess") or ""},
+                )
 
     def handle_event_11(self, event: dict, detection: Optional[dict] = None):
         """FileCreate. Stored only when process.score > 0."""
@@ -815,18 +836,18 @@ class GraphBuilder:
         if not guid or not file_id:
             return
 
-        eff       = self._effective_score(ep["total_score"], "CREATED_FILE")
+        eff       = ep["total_score"]
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("CREATED_FILE", cur_score):
-            self._upsert_template(image, "", cmd, user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+            
             return
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
@@ -856,15 +877,15 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "MODIFIED_REGISTRY")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("MODIFIED_REGISTRY", cur_score):
-            self._upsert_template(image, "", cmd, user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+            
             return
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (reg:Registry {id: $id})", {"id": reg_id})
         self._merge_edge(
@@ -895,12 +916,17 @@ class GraphBuilder:
             return
 
         eff = self._effective_score(ep["total_score"], "WROTE_ADS")
+        cur_score = self._get_score(guid)
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        # Gate check FIRST
+        if not (eff+cur_score)> 0:
+            return
+
+        t_hash = self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts, t_hash=t_hash
         )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
@@ -910,7 +936,6 @@ class GraphBuilder:
             ep=ep, eff_score=eff, timestamp=ts,
             extra_create={"stream_name": d.get("StreamName") or ""},
         )
-        #self._add_score(guid, eff)
 
     def handle_event_22(self, event: dict, detection: Optional[dict] = None):
         """DNSQuery. Stored only when process.score > 0."""
@@ -929,15 +954,14 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "QUERIED_DNS")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("QUERIED_DNS", cur_score):
-            self._upsert_template(image, "", cmd, user, "", ts, 0)
+        if not (eff+cur_score)> 0:
             return
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (dns:DNS {id: $q})", {"q": query})
         self._merge_edge(
@@ -965,15 +989,15 @@ class GraphBuilder:
         eff       = self._effective_score(ep["total_score"], "DELETED")
         cur_score = self._get_score(guid)
 
-        if not self._should_store_edge("DELETED", cur_score):
-            self._upsert_template(image, "", cmd, user, "", ts, 0)
+        if not (eff+cur_score)> 0:
+           
             return
 
-        self._upsert_template(image, "", cmd, user, "", ts, eff)
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,
+            score=eff, timestamp=ts,t_hash=t_hash
         )
         self._run("MERGE (f:File {id: $id})", {"id": file_id})
         self._merge_edge(
@@ -985,50 +1009,57 @@ class GraphBuilder:
         #self._add_score(guid, eff)
 
     def handle_event_25(self, event: dict, detection: Optional[dict] = None):
-        """
-        ProcessTampering. ALWAYS_STORE.
-        Both attacker and victim scored independently.
-        NO CHILD_OF. NO inheritance.
-        """
-        d  = event.get("data", event)
-        ep = self._edge_params(detection)
-        ts = d.get("UtcTime") or self._now()
+       """
+       ProcessTampering. ALWAYS_STORE.
+       Both attacker and victim scored independently.
+       NO CHILD_OF. NO inheritance.
+       """
+       d  = event.get("data", event)
+       ep = self._edge_params(detection)
+       ts = d.get("UtcTime") or self._now()
 
-        atk_guid  = d.get("ProcessGuid")       or ""
-        vic_guid  = d.get("TargetProcessGuid") or ""
-        atk_image = (d.get("Image")        or "").lower()
-        vic_image = (d.get("TargetImage")  or "").lower()
-        atk_user  = (d.get("User")         or "").lower()
-        vic_user  = (d.get("TargetUser")   or "").lower()
-        if not atk_guid or not vic_guid:
-            return
+       atk_guid  = d.get("ProcessGuid")       or ""
+       vic_guid  = d.get("TargetProcessGuid") or ""
+       atk_image = (d.get("Image")        or "").lower()
+       vic_image = (d.get("TargetImage")  or "").lower()
+       atk_user  = (d.get("User")         or "").lower()
+       vic_user  = (d.get("TargetUser")   or "").lower()
+       if not atk_guid or not vic_guid:
+           return
 
-        eff = self._effective_score(ep["total_score"], "TAMPERED")
+       eff = self._effective_score(ep["total_score"], "TAMPERED")
+       atk_cur_score = self._get_score(atk_guid)
+       vic_cur_score = self._get_score(vic_guid)
 
-        self._upsert_template(atk_image, "", "", atk_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=atk_guid, image=atk_image, parent_image="",
-            cmdline="", user=atk_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(atk_guid, eff)
+       # Attacker - with gate check
+       atk_should_store =(eff+atk_cur_score)> 0 or (eff+vic_cur_score)> 0
+       
+       if atk_should_store:
+           atk_t_hash = self._upsert_template(atk_image, "", "", atk_user, "", ts, eff )
+           self._create_or_promote_instance(
+               guid=atk_guid, image=atk_image, parent_image="",
+               cmdline="", user=atk_user, description="",
+               score=eff, timestamp=ts, t_hash=atk_t_hash
+           )
 
-        self._upsert_template(vic_image, "", "", vic_user, "", ts, eff)
-        self._create_or_promote_instance(
-            guid=vic_guid, image=vic_image, parent_image="",
-            cmdline="", user=vic_user, description="",
-            score=eff, timestamp=ts,
-        )
-        #self._add_score(vic_guid, eff)
+       # Victim - with gate check
+           vic_t_hash = self._upsert_template(vic_image, "", "", vic_user, "", ts, eff )
+        
+           self._create_or_promote_instance(
+                    guid=vic_guid, image=vic_image, parent_image="",
+                    cmdline="", user=vic_user, description="",
+                    score=eff, timestamp=ts, t_hash=vic_t_hash
+                )
 
-        self._merge_edge(
-            src_id=atk_guid, src_label="ProcessInstance",
-            rel_type="TAMPERED",
-            dst_id=vic_guid, dst_label="ProcessInstance",
-            ep=ep, eff_score=eff, timestamp=ts,
-            extra_create={"type": d.get("Type") or ""},
-        )
-
+       # Edge only if BOTH instances exist
+           if self._instance_exists(atk_guid) and self._instance_exists(vic_guid):
+               self._merge_edge(
+                   src_id=atk_guid, src_label="ProcessInstance",
+                   rel_type="TAMPERED",
+                   dst_id=vic_guid, dst_label="ProcessInstance",
+                   ep=ep, eff_score=eff, timestamp=ts,
+                   extra_create={"type": d.get("Type") or ""},
+               )
     def handle_event_5(self, event: dict, detection: Optional[dict] = None):
         """ProcessTerminate — mark instance dead."""
         d    = event.get("data", event)

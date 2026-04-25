@@ -285,8 +285,8 @@ class DetectionPipeline:
             stats_dict['l1_stats'] = self.l1_engine.get_stats()
         
         # Add L2 engine stats if available
-        if self.l2_engine:
-            stats_dict['l2_stats'] = self.l2_engine.get_stats()
+        #if self.l2_engine:
+         #   stats_dict['l2_stats'] = self.l2_engine.get_stats()
         
         # Calculate alert rate
         total = max(self.stats['total_events'], 1)
