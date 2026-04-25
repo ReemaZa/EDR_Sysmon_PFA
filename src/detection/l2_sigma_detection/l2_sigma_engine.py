@@ -316,7 +316,7 @@ class SigmaEngine:
                 if matcher.match(event):
                     rule = matcher.rule
                     rule_id = str(getattr(rule, "id", "unknown"))
-                    print(f"========================id================== {rule_id}")
+                    print(f"=====================rule id================== {rule_id}")
 
                     matched_rule_ids.append(rule_id)
                     matched_rule_titles.append(rule.title)
@@ -343,6 +343,7 @@ class SigmaEngine:
                 count=1,
                 event=event,
             )
+
 
             self.store_event(event_hash, data)
             print(f"[NEW] {event_hash}")

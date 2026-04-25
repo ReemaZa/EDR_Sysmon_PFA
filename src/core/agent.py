@@ -11,10 +11,59 @@ import signal
 import sys
 import threading
 import time
+import logging
+from datetime import datetime
 
 from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
+
+# ============================================================================
+# LOGGING SETUP: Log all console output to both console and file
+# ============================================================================
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"edr_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Create a custom logger that also captures print() statements
+class PrintLogger:
+    """Captures print() output and sends it to both console and file"""
+    def __init__(self, log_file):
+        self.log_file = log_file
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'a', encoding='utf-8')
+    
+    def write(self, message):
+        try:
+            self.terminal.write(message)
+        except UnicodeEncodeError:
+            # If console can't handle unicode, try replacing problematic chars
+            safe_message = message.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+            self.terminal.write(safe_message)
+        
+        # Always write to file as-is (file handles UTF-8)
+        self.log.write(message)
+        self.log.flush()
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
+
+# Redirect stdout to our custom logger
+sys.stdout = PrintLogger(LOG_FILE)
 
 # Toggle: when True, the agent will read events from a local test file using
 # the LogReplayEngine (useful for testing). When False, it reads from live
@@ -22,7 +71,7 @@ from src.graph.Graph_Builder import GraphBuilder
 # Set this to True or False as needed.
 READ_FROM_FILE = True
 # Path to the test log file (used only when READ_FROM_FILE == True)
-LOG_REPLAY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'tests', 'logs', 'windows-sysmon-T1003.001.txt')
+LOG_REPLAY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'tests', 'logs_dataset', 'windows-sysmon-T1003.001.txt')
 
 
 # Global pipeline instance
@@ -154,24 +203,40 @@ def process_event(evt):
     if _is_own_event(evt):
         return
 
-    # Run event through detection pipeline
-    verdict = detection_pipeline.process_event(evt)
 
     # Print brief event info
     event_type = evt.get('event_type', 'Unknown')
     event_id   = evt.get('event_id', 0)
     timestamp  = evt.get('timestamp', '')
-    image = evt.get('image', 'N/A')
-
-    # Print clear event header
-    print("\n" + "=" * 10)
-    print(f" EVENT #{event_id} | Type: {event_type} | Time: {timestamp}")
-    #print(f"   Computer: {computer:30s} | Process: {image}")
-    print("=" * 10)
     
+    # Get nested fields from data dict or top level
+    data = evt.get('data', {})
+    image = data.get('Image', evt.get('image', 'N/A'))
+    guid = data.get('ProcessGuid', evt.get('guid', 'N/A'))
+    user = data.get('User', evt.get('user', 'N/A'))
+    parent_image = data.get('ParentImage', 'N/A')
+    command_line = data.get('CommandLine', 'N/A')
 
+    # Print enhanced event header
+    print("\n" + "*" * 130)
+    print(f"EVENT PROCESSING START: #{event_id}")
+    print("=" * 130)
+    print(f"  Event Type:     {event_type}")
+    print(f"  Timestamp:      {timestamp}")
+    print(f"  Image:          {image}")
+    print(f"  Parent Image:   {parent_image}")
+    print(f"  Command Line:   {command_line}")
+    print(f"  GUID:           {guid}")
+    print(f"  User:           {user}")
+    print("=" * 130)
+
+    # Run event through detection pipeline
+    print(f"\n[PROCESSING] Running through detection layers...\n")
+    verdict = detection_pipeline.process_event(evt)
     output = []
+    
     # ================= GRAPH BUILDER =================
+    print(f"\n[GRAPH] Building threat relationships in graph...\n")
     try:
         graph_detection = None
         
@@ -184,61 +249,40 @@ def process_event(evt):
         graph_builder.process_event(evt, graph_detection)
     
     except Exception as e:
-        print("[GRAPH ERROR]", str(e))
-
+        print(f"  ❌ [GRAPH ERROR] {str(e)}")
 
     # Display results from each layer
-    if verdict.layer_results:
-        for result in verdict.layer_results:
-            layer_name = result.layer_name
-            threat_level = result.threat_level.name
-            
-
-            
-            print(f"\n {layer_name:20s} [{threat_level:10s}]")
-            print("   " + "-" * 110)
-            
-            # Display all matches
-            if result.matches:
-                print(f"   Matches ({len(result.matches)}):")
-                for idx, match in enumerate(result.matches, 1):
-                    print(f"      [{idx}] {match}")
-            else:
-                print(f"   ✓ No matches detected")
-            
-            # Display metadata
-            if result.metadata:
-                print(f"\n   Details:")
-                metadata = result.metadata
-                
-                # Handle different metadata structures based on layer
-                if isinstance(metadata, dict):
-                    for key, value in metadata.items():
-                        if isinstance(value, (str, int, float, bool)):
-                            print(f"      • {key}: {value}")
-                        elif isinstance(value, list):
-                            print(f"      • {key}: {', '.join(map(str, value[:3]))}{'...' if len(value) > 3 else ''}")
-                        elif isinstance(value, dict):
-                            print(f"      • {key}: {str(value)[:80]}...")
-                else:
-                    print(f"      {str(metadata)[:100]}")
-            
-            print("   " + "-" * 110)
+    print("\n" + "_" * 130)
+    print("DETECTION RESULTS FROM ALL LAYERS:")
+    print("_" * 130)
+    
+    if verdict and verdict.layer_results:
+        print(f"  Total Layers with Detections: {len(verdict.layer_results)}\n")
+        
+        for layer_idx, result in enumerate(verdict.layer_results, 1):
+            print(result)
             
             output.append({
                 "event": evt,
-                "layer_name": layer_name,
-                "threat_level": threat_level,
+                "layer_name": result.layer_name,
+                "threat_level": result.threat_level.name,
                 "matches": result.matches,
                 "metadata": result.metadata
             })
     else:
-        print(f"\n No detections from any layer (L1, L2, L3)")
-        print("   " + "-" * 110)
+        print("  ✓ No detections from any layer (L1, L2, L3, L4)\n")
     
-    print("=" * 120)
-
-    # 👉 Save to file AFTER the loop
+    # Print final verdict
+    if verdict:
+        threat_emoji = {
+            'CRITICAL': '🔴',
+            'HIGH': '🟠',
+            'MEDIUM': '🟡',
+            'LOW': '🔵',
+            'UNKNOWN': '⚪'
+        }.get(verdict.threat_level.name, '❓')
+        print(f"  📌 FINAL VERDICT: {threat_emoji} [{verdict.threat_level.name}]")
+    
     with open("results.json", "a") as f:
         json.dump(output, f, indent=4)
     

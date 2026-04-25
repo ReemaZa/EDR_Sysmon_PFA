@@ -200,42 +200,17 @@ class LogReplayEngine:
             successful_parses += 1
             self.events.append(parsed_event)
             
-            # Route through callback if provided (e.g., agent.process_event)
-            # This ensures all agent logic (GUID discovery, graph building, etc.) is applied
+            # Route through callback (e.g., agent.process_event)
+            # The callback handles all processing: pipeline, graph building, results storage, etc.
+            # Callback should ALWAYS be provided for proper end-to-end processing
             if self.event_callback:
                 try:
                     self.event_callback(parsed_event)
+                    # Callback processes everything including pipeline, so we skip verdict tracking here
                 except Exception as e:
                     print(f"[ERROR] Callback error on event {idx}: {e}")
                     import traceback
                     traceback.print_exc()
-            
-            # Also process through pipeline to collect verdicts for statistics
-            verdict = self.pipeline.process_event(parsed_event)
-            
-            # Store verdict result
-            verdict_dict = {
-                'event_index': idx,
-                'event_id': parsed_event.get('event_id'),
-                'timestamp': parsed_event.get('timestamp'),
-                'computer': parsed_event.get('computer'),
-                'threat_level': verdict.threat_level.name,
-                'is_malicious': verdict.is_malicious(),
-                'layer_results': [
-                    {
-                        'layer': r.layer_name,
-                        'threat_level': r.threat_level.name,
-                        'matches': r.matches,
-                        'metadata': r.metadata
-                    }
-                    for r in verdict.layer_results
-                ]
-            }
-            self.verdicts.append(verdict_dict)
-            
-            # Collect alerts
-            if verdict.is_malicious():
-                self.alerts.append(verdict_dict)
             
             # Progress report
             if verbose and (idx % 100 == 0 or idx == len(raw_events)):
