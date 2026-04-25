@@ -241,6 +241,7 @@ class LogReplayEngine:
             if verbose and (idx % 100 == 0 or idx == len(raw_events)):
                 print(f"[*] Processed {idx}/{len(raw_events)} events "
                       f"({successful_parses} parsed, {len(self.alerts)} alerts)")
+            
         
         self.end_time = datetime.now()
         self.processing_time = (self.end_time - self.start_time).total_seconds()

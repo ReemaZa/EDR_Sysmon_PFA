@@ -20,7 +20,7 @@ from src.graph.Graph_Builder import GraphBuilder
 # the LogReplayEngine (useful for testing). When False, it reads from live
 # Sysmon via the event watcher.
 # Set this to True or False as needed.
-READ_FROM_FILE = True
+READ_FROM_FILE = False
 # Path to the test log file (used only when READ_FROM_FILE == True)
 LOG_REPLAY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'tests', 'logs', 'windows-sysmon-T1003.001.txt')
 
