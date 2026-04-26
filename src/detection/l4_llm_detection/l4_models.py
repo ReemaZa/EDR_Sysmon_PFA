@@ -153,6 +153,7 @@ class AttackSummary:
     raw_llm_response: str  = ""
     expected_but_missing: List[Dict[str, str]] = field(default_factory=list)
     noise: List[Dict[str, str]] = field(default_factory=list)
+    execution_speed :str=""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INVESTIGATION CASE
