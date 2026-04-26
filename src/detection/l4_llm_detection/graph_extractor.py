@@ -134,6 +134,7 @@ class SubgraphContext:
     has_ghost_parents: bool
     total_nodes:       int
     total_edges:       int
+    unvisited_guids:   Set[str] = field(default_factory=set)  # ← add this
 
 
 @dataclass
@@ -155,6 +156,7 @@ class GraphExtractor:
         self,
         anchor_guid:    str,
         to_investigate: Set[str],
+        
     ) -> Optional[SubgraphContext]:
         """
         Build a SubgraphContext starting from anchor_guid,
@@ -193,6 +195,7 @@ class GraphExtractor:
             ),
             total_nodes       = len(instances) + len(artifacts),
             total_edges       = len(edges),
+            unvisited_guids   = to_investigate - expand_guids - include_guids,  # ← add this
         )
 
     # ── BFS ───────────────────────────────────────────────────────────────────
