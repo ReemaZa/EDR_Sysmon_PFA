@@ -81,8 +81,13 @@ ON CREATE SET
     t.seen_count   = 1,
     t.total_score  = $score,            // sum — starts with first event's score
     t.first_seen   = $timestamp,
-    t.last_seen    = $timestamp
+    t.last_seen    = $timestamp,
+    p.last_updated_at = $timestamp,     // NEW
+    p.cycle_resolved = false,            // NEW
+    p.cycle_resolved_reason = null,      // NEW
+    p.cycle_resolved_at = null           // NEW    
 ON MATCH SET
+    p.last_updated_at = $timestamp,
     t.seen_count   = t.seen_count + 1,
     t.last_seen    = $timestamp,
     t.total_score  = t.total_score + $score;   // always sum, never max

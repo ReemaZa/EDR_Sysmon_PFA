@@ -576,12 +576,12 @@ class GraphBuilder:
         #eff       = self._effective_score(ep["total_score"], "TIMESTOMPED")
         eff=ep["total_score"]
         cur_score = self._get_score(guid)
-    
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         if not (eff+cur_score)> 0:
             
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -610,14 +610,14 @@ class GraphBuilder:
         if not guid or not dst_ip:
             return
 
-        eff       = self._effective_score(ep["total_score"], "CONNECTED")
+        eff       = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         if not (eff+cur_score)> 0:
            
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -650,14 +650,14 @@ class GraphBuilder:
         if not guid or not sha256:
             return
 
-        eff       = self._effective_score(ep["total_score"], "LOADED_DRIVER")
+        eff       = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
         if not (eff+cur_score)> 0:
           
             return
 
-        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
@@ -689,14 +689,14 @@ class GraphBuilder:
         if not guid or not sha256:
             return
 
-        eff       = self._effective_score(ep["total_score"], "LOADED_IMAGE")
+        eff       = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
         if not (eff+cur_score)> 0:
             
             return
 
-        t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
@@ -740,9 +740,10 @@ class GraphBuilder:
 
         # Source - with gate check
         src_should_store =  (eff+src_cur_score)> 0  or  (eff+tgt_cur_score)> 0
-        
+        src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+        tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
         if src_should_store:
-            src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+            
             self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
@@ -751,7 +752,7 @@ class GraphBuilder:
           
         # Target - with gate check
         
-            tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
+            
         
             self._create_or_promote_instance(
                 guid=tgt_guid, image=tgt_image, parent_image="",
@@ -790,12 +791,13 @@ class GraphBuilder:
         eff = ep["total_score"]
         src_cur_score = self._get_score(src_guid)
         tgt_cur_score = self._get_score(tgt_guid)
-
+        src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+        tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
         # Source - with gate check
         src_should_store =  (eff+src_cur_score)> 0 or (eff+tgt_cur_score)> 0
         
         if src_should_store:
-            src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
+            
             self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
@@ -804,7 +806,7 @@ class GraphBuilder:
 
         # Target - with gate check
             
-            tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
+            
             
             self._create_or_promote_instance(
                     guid=tgt_guid, image=tgt_image, parent_image="",
@@ -838,12 +840,12 @@ class GraphBuilder:
 
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         if not (eff+cur_score)> 0:
             
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -873,15 +875,15 @@ class GraphBuilder:
         user   = (d.get("User")         or "").lower()
         if not guid or not reg_id:
             return
-
-        eff       = self._effective_score(ep["total_score"], "MODIFIED_REGISTRY")
+        eff       = ep["total_score"]
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         cur_score = self._get_score(guid)
 
         if not (eff+cur_score)> 0:
             
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -915,14 +917,14 @@ class GraphBuilder:
         if not guid or not file_id:
             return
 
-        eff = self._effective_score(ep["total_score"], "WROTE_ADS")
+        eff = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash = self._upsert_template(image, "", cmd, user, "", ts, eff)
         # Gate check FIRST
         if not (eff+cur_score)> 0:
             return
 
-        t_hash = self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -950,14 +952,15 @@ class GraphBuilder:
         user  = (d.get("User")       or "").lower()
         if not guid or not query:
             return
-
-        eff       = self._effective_score(ep["total_score"], "QUERIED_DNS")
+        
+        eff       = ep["total_score"]
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         cur_score = self._get_score(guid)
 
         if not (eff+cur_score)> 0:
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -986,14 +989,14 @@ class GraphBuilder:
         if not guid or not file_id:
             return
 
-        eff       = self._effective_score(ep["total_score"], "DELETED")
+        eff       = ep["total_score"]
         cur_score = self._get_score(guid)
-
+        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         if not (eff+cur_score)> 0:
            
             return
 
-        t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
+        
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
@@ -1027,15 +1030,15 @@ class GraphBuilder:
        if not atk_guid or not vic_guid:
            return
 
-       eff = self._effective_score(ep["total_score"], "TAMPERED")
+       eff = ep["total_score"]
        atk_cur_score = self._get_score(atk_guid)
        vic_cur_score = self._get_score(vic_guid)
-
+       atk_t_hash = self._upsert_template(atk_image, "", "", atk_user, "", ts, eff )
        # Attacker - with gate check
        atk_should_store =(eff+atk_cur_score)> 0 or (eff+vic_cur_score)> 0
-       
+       vic_t_hash = self._upsert_template(vic_image, "", "", vic_user, "", ts, eff )
        if atk_should_store:
-           atk_t_hash = self._upsert_template(atk_image, "", "", atk_user, "", ts, eff )
+           
            self._create_or_promote_instance(
                guid=atk_guid, image=atk_image, parent_image="",
                cmdline="", user=atk_user, description="",
@@ -1043,7 +1046,7 @@ class GraphBuilder:
            )
 
        # Victim - with gate check
-           vic_t_hash = self._upsert_template(vic_image, "", "", vic_user, "", ts, eff )
+           
         
            self._create_or_promote_instance(
                     guid=vic_guid, image=vic_image, parent_image="",
