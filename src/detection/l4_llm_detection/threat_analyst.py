@@ -37,7 +37,7 @@ from gqlalchemy import Memgraph
 from src.detection.l4_llm_detection.analyst_agent import AnalystAgent
 from src.detection.l4_llm_detection.graph_extractor import GraphExtractor
 from src.detection.l4_llm_detection.investigation_queue import InvestigationQueue
-from src.detection.l4_llm_detection.l4_models import AnalystFinding
+from src.detection.l4_llm_detection.l4_models import AttackSummary
 from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
 
 FINDINGS_FILE = "l4_findings.json"
@@ -56,7 +56,7 @@ class ThreatAnalyst:
 
     def __init__(
         self,
-        query_interval:    int = 140,
+        query_interval:    int = 30,
         threat_threshold:  int = 4,
         max_subgraph_nodes: int = 120,
     ):
@@ -184,21 +184,8 @@ class ThreatAnalyst:
 
             if subgraph is None:
                 self._log(f"[ThreatAnalyst][WARN] No subgraph returned — concluding empty")
-                empty = AnalystFinding(
-                    case_id               = anchor_item.case_id,
-                    anchor_guid           = anchor_item.anchor_guid,
-                    severity              = "LOW",
-                    confidence            = "LOW",
-                    verdict               = "BENIGN",
-                    narrative             = "Subgraph extraction returned no data.",
-                    mitre_techniques      = [],
-                    mitre_tactics         = [],
-                    patient_zero_guid     = None,
-                    active_guid           = None,
-                    false_positive_reason = "No graph data available.",
-                    raw_llm_response      = "",
-                )
-                self._queue.conclude(anchor_item, empty)
+               
+             
                 for item in rest:
                     self._queue.push(item.anchor_guid, item.trigger_score)
                 continue
@@ -278,20 +265,27 @@ class ThreatAnalyst:
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 
-    def _save_finding(self, finding: AnalystFinding) -> None:
+    def _save_finding(self, finding: AttackSummary) -> None:
+        """Save finding to JSONL file."""
         record = {
             "case_id":             finding.case_id,
             "anchor_guid":         finding.anchor_guid,
-            "produced_at":         finding.produced_at,
+            "produced_at":         datetime.utcnow().isoformat(),
             "verdict":             finding.verdict,
             "severity":            finding.severity,
             "confidence":          finding.confidence,
+            "attack_name":         finding.attack_name,
+            "summary":             finding.summary,
+            "confidence_note":     finding.confidence_note,
             "mitre_techniques":    finding.mitre_techniques,
             "mitre_tactics":       finding.mitre_tactics,
-            "patient_zero_guid":   finding.patient_zero_guid,
-            "active_guid":         finding.active_guid,
-            "narrative":           finding.narrative,
-            "false_positive_reason": finding.false_positive_reason,
+            "attack_chain":        finding.attack_chain,
+            "processes":           finding.processes,
+            "iocs":                finding.iocs,
+            "files":               finding.files,
+            "identities":          finding.identities,
+            "gaps":                finding.gaps,
+            "should_respond":      finding.should_respond,
         }
         try:
             with open(FINDINGS_FILE, "a", encoding="utf-8") as f:
@@ -299,24 +293,53 @@ class ThreatAnalyst:
         except Exception as exc:
             self._log(f"[ThreatAnalyst][WARN] Could not save finding: {exc}")
 
-    def _print_finding(self, finding: AnalystFinding) -> None:
+
+    def _print_finding(self, finding: AttackSummary) -> None:
+        """Print finding to console with formatting."""
         symbol = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(
             finding.severity, "⚪"
         )
+
         self._log(
             f"\n{'=' * 70}\n"
             f"[L4 FINDING]\n"
             f"  Case:       {finding.case_id}\n"
             f"  Anchor:     {finding.anchor_guid}\n"
+            f"  Attack:     {finding.attack_name}\n"
             f"  Verdict:    {finding.verdict}  {symbol} {finding.severity}  "
             f"(confidence: {finding.confidence})\n"
+            f"  Summary:    {finding.summary}\n"
             f"  Techniques: {', '.join(finding.mitre_techniques) or 'none'}\n"
-            f"  Tactics:    {', '.join(finding.mitre_tactics)    or 'none'}\n"
-            f"  Narrative:  {finding.narrative}\n"
-            f"{'=' * 70}\n"
+            f"  Tactics:    {', '.join(finding.mitre_tactics) or 'none'}\n"
         )
 
-    # ── STATS ─────────────────────────────────────────────────────────────────
+        # Optional: Print attack chain if present
+        if finding.attack_chain:
+            self._log(f"\n  ATTACK CHAIN ({len(finding.attack_chain)} steps):")
+            for step in finding.attack_chain[:5]:  # First 5 steps
+                self._log(f"    - {step.get('step')}: {step.get('action')} → {step.get('target', 'N/A')}")
+            if len(finding.attack_chain) > 5:
+                self._log(f"    ... and {len(finding.attack_chain) - 5} more steps")
+
+        # Optional: Print IOCs if present
+        if finding.iocs:
+            self._log(f"\n  IOCs ({len(finding.iocs)}):")
+            for ioc in finding.iocs[:3]:  # First 3 IOCs
+                self._log(f"    - {ioc.get('type')}: {ioc.get('value')}")
+            if len(finding.iocs) > 3:
+                self._log(f"    ... and {len(finding.iocs) - 3} more")
+
+        # Confidence note if present
+        if finding.confidence_note:
+            self._log(f"\n  Note: {finding.confidence_note}")
+
+        # Respond flag
+        if finding.should_respond:
+            self._log(f"\n  🚨 RESPONSE REQUIRED (verdict={finding.verdict})")
+
+        self._log(f"{'=' * 70}\n")
+
+        # ── STATS ─────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, Any]:
-        return {**self._stats, "queue": self._queue.get_stats()}
+            return {**self._stats, "queue": self._queue.get_stats()}
