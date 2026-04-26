@@ -25,7 +25,7 @@ CONFIGURATION:
     max_subgraph_nodes: hard cap on nodes sent to analyst   (default 120)
 """
 from __future__ import annotations
-
+import sys 
 import json
 import threading
 import time
@@ -64,6 +64,12 @@ class ThreatAnalyst:
         self.threat_threshold  = threat_threshold
         self.max_subgraph_nodes = max_subgraph_nodes
 
+        # ── NEW LOGGING SETUP ───────────────────────────────────────────
+        self.log_file_path = f"logs/l4_analyst_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        # Open the file in append mode
+        self._log_handle = open(self.log_file_path, "a", encoding="utf-8")
+        self._log_lock = threading.Lock()
+        # ────────────────────────────────────────────────────────────────
         # Components
         self._db        = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
         self._queue     = InvestigationQueue()
@@ -88,31 +94,47 @@ class ThreatAnalyst:
 
         # Start immediately — caller does not need to call start()
         self._thread.start()
-        print(
+        self._log(
             f"[ThreatAnalyst] Started — "
             f"interval={self.query_interval}s  "
             f"threshold={self.threat_threshold}"
         )
 
+    def _log(self, message: str):
+        """Custom logging method that bypasses the global sys.stdout."""
+        timestamp = datetime.utcnow().isoformat()
+        formatted_message = f"[{timestamp}] {message}\n"
+        
+        with self._log_lock:
+            # 1. Write to L4-specific file
+            self._log_handle.write(formatted_message)
+            self._log_handle.flush()
+            
+            # 2. Write to the ORIGINAL terminal (bypasses agent.py's PrintLogger)
+            # This ensures it shows on screen but NOT in the main agent log file.
+            sys.__stdout__.write(formatted_message)
+            sys.__stdout__.flush()
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
-        """Signal the background thread to stop and wait for it."""
-        print("[ThreatAnalyst] Shutting down...")
+        self._log("Shutting down...")
         self._stop_event.set()
         self._thread.join(timeout=self.query_interval + 5)
-        print("[ThreatAnalyst] Stopped.")
+        # Close the log handle safely
+        with self._log_lock:
+            self._log_handle.close()
+        self._log("Stopped.")
 
     # ── BACKGROUND LOOP ───────────────────────────────────────────────────────
 
     def _loop(self) -> None:
-        print("[ThreatAnalyst] Background loop started.")
+        self._log("[ThreatAnalyst] Background loop started.")
         while not self._stop_event.is_set():
             try:
                 self._tick()
             except Exception as exc:
                 import traceback
-                print(f"[ThreatAnalyst][ERROR] Tick failed: {exc}")
+                self._log(f"[ThreatAnalyst][ERROR] Tick failed: {exc}")
                 traceback.print_exc()
 
             # Sleep in 1-second increments so shutdown() is responsive
@@ -125,11 +147,11 @@ class ThreatAnalyst:
     def _tick(self) -> None:
         self._stats["ticks"] += 1
         n = self._stats["ticks"]
-        print(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
+        self._log(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
 
         # 1. Scan graph for qualifying nodes
         triggered = self._scan_graph()
-        print(f"[ThreatAnalyst] {len(triggered)} node(s) above "
+        self._log(f"[ThreatAnalyst] {len(triggered)} node(s) above "
               f"threshold={self.threat_threshold}")
 
         # 2. Push all triggers to the queue
@@ -146,13 +168,13 @@ class ThreatAnalyst:
             self._queue.mark_investigating(case)
             self._stats["cases_analysed"] += 1
 
-            print(f"[ThreatAnalyst] Extracting subgraph  "
+            self._log(f"[ThreatAnalyst] Extracting subgraph  "
                   f"case={case.case_id[:8]}  anchor={case.anchor_guid[:20]}")
 
             subgraph = self._extractor.extract(case.anchor_guid)
 
             if subgraph is None:
-                print(f"[ThreatAnalyst][WARN] No subgraph returned — concluding empty")
+                self._log(f"[ThreatAnalyst][WARN] No subgraph returned — concluding empty")
                 empty = AnalystFinding(
                     case_id               = case.case_id,
                     anchor_guid           = case.anchor_guid,
@@ -170,7 +192,7 @@ class ThreatAnalyst:
                 self._queue.conclude(case, empty)
                 continue
 
-            print(f"[ThreatAnalyst] Running analyst  "
+            self._log(f"[ThreatAnalyst] Running analyst  "
                   f"case={case.case_id[:8]}  "
                   f"nodes={subgraph.total_nodes}  edges={subgraph.total_edges}")
 
@@ -184,9 +206,9 @@ class ThreatAnalyst:
         # 4. Age WATCHING cases
         closed = self._queue.tick_watching()
         if closed:
-            print(f"[ThreatAnalyst] Closed {len(closed)} watched case(s)")
+            self._log(f"[ThreatAnalyst] Closed {len(closed)} watched case(s)")
 
-        print(f"[ThreatAnalyst] Queue state: {self._queue.get_stats()}")
+        self._log(f"[ThreatAnalyst] Queue state: {self._queue.get_stats()}")
 
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
 
@@ -208,7 +230,7 @@ class ThreatAnalyst:
                 {"threshold": self.threat_threshold},
             ))
         except Exception as exc:
-            print(f"[ThreatAnalyst][SCAN FAIL] {exc}")
+            self._log(f"[ThreatAnalyst][SCAN FAIL] {exc}")
             return []
 
         # Exclude GUIDs already under active investigation
@@ -245,13 +267,13 @@ class ThreatAnalyst:
             with open(FINDINGS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as exc:
-            print(f"[ThreatAnalyst][WARN] Could not save finding: {exc}")
+            self._log(f"[ThreatAnalyst][WARN] Could not save finding: {exc}")
 
     def _print_finding(self, finding: AnalystFinding) -> None:
         symbol = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(
             finding.severity, "⚪"
         )
-        print(
+        self._log(
             f"\n{'=' * 70}\n"
             f"[L4 FINDING]\n"
             f"  Case:       {finding.case_id}\n"
