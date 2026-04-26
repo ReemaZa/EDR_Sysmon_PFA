@@ -71,7 +71,7 @@ sys.stdout = PrintLogger(LOG_FILE)
 
 # When True  → replay events from LOG_REPLAY_FILE (testing / offline analysis)
 # When False → subscribe to live Sysmon events via EvtSubscribe
-READ_FROM_FILE = False
+READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
@@ -289,7 +289,7 @@ def main():
         enable_l1=True,
         enable_l2=True,
         enable_l3=False,
-        enable_l4=False,
+        enable_l4=True,
     )
 
     # ── REPLAY MODE ───────────────────────────────────────────────────────
