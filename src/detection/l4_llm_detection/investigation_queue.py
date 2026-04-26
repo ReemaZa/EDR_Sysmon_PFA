@@ -89,7 +89,18 @@ class InvestigationQueue:
             return case
 
     # ── ANALYST INTERFACE ─────────────────────────────────────────────────────
-
+    def pop_all_pending(self) -> List[InvestigationCase]:
+        """
+        Return ALL PENDING cases sorted by score descending.
+        Does NOT change their status — caller must call mark_investigating()
+        on the anchor case separately.
+        """
+        with self._lock:
+            pending = [
+                c for c in self._cases.values()
+                if c.status == InvestigationStatus.PENDING
+            ]
+            return sorted(pending, key=lambda c: -c.trigger_score)
     def pop_next(self) -> Optional[InvestigationCase]:
         """Return the highest-score PENDING case, or None."""
         with self._lock:

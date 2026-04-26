@@ -124,38 +124,45 @@ class ThreatAnalyst:
 
     def _tick(self) -> None:
         self._stats["ticks"] += 1
-        n = self._stats["ticks"]
-        print(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
-
-        # 1. Scan graph for qualifying nodes
+        print(f"\n[ThreatAnalyst] ══ Tick #{self._stats['ticks']} @ {datetime.utcnow().isoformat()} ══")
+    
+        # 1. Scan graph for all qualifying nodes, already sorted by score desc
         triggered = self._scan_graph()
-        print(f"[ThreatAnalyst] {len(triggered)} node(s) above "
-              f"threshold={self.threat_threshold}")
-
-        # 2. Push all triggers to the queue
+        print(f"[ThreatAnalyst] {len(triggered)} node(s) above threshold={self.threat_threshold}")
+    
+        # 2. Push all triggers to queue (deduplication handled inside push())
         for guid, score in triggered:
             self._queue.push(guid, score)
             self._stats["triggers_pushed"] += 1
-
-        # 3. Drain all PENDING cases this tick
+    
+        # 3. Process batches until no PENDING cases remain
         while True:
-            case = self._queue.pop_next()
-            if case is None:
+            pending = self._queue.pop_all_pending()
+            if not pending:
                 break
-
-            self._queue.mark_investigating(case)
+            
+            anchor_case    = pending[0]
+            to_investigate = {case.anchor_guid for case in pending[1:]}
+    
+            self._queue.mark_investigating(anchor_case)
             self._stats["cases_analysed"] += 1
-
-            print(f"[ThreatAnalyst] Extracting subgraph  "
-                  f"case={case.case_id[:8]}  anchor={case.anchor_guid[:20]}")
-
-            subgraph = self._extractor.extract(case.anchor_guid)
-
+    
+            print(
+                f"[ThreatAnalyst] Extracting subgraph  "
+                f"anchor={anchor_case.anchor_guid[:20]}  "
+                f"to_investigate={len(to_investigate)}"
+            )
+    
+            subgraph = self._extractor.extract(
+                anchor_guid    = anchor_case.anchor_guid,
+                to_investigate = to_investigate,
+            )
+    
             if subgraph is None:
-                print(f"[ThreatAnalyst][WARN] No subgraph returned — concluding empty")
+                print(f"[ThreatAnalyst][WARN] No subgraph returned for anchor={anchor_case.anchor_guid[:20]}")
                 empty = AnalystFinding(
-                    case_id               = case.case_id,
-                    anchor_guid           = case.anchor_guid,
+                    case_id               = anchor_case.case_id,
+                    anchor_guid           = anchor_case.anchor_guid,
                     severity              = "LOW",
                     confidence            = "LOW",
                     verdict               = "BENIGN",
@@ -167,25 +174,37 @@ class ThreatAnalyst:
                     false_positive_reason = "No graph data available.",
                     raw_llm_response      = "",
                 )
-                self._queue.conclude(case, empty)
+                self._queue.conclude(anchor_case, empty)
+                # Re-push the rest so they become anchors next iteration
+                for case in pending[1:]:
+                    self._queue.push(case.anchor_guid, case.trigger_score)
                 continue
-
-            print(f"[ThreatAnalyst] Running analyst  "
-                  f"case={case.case_id[:8]}  "
-                  f"nodes={subgraph.total_nodes}  edges={subgraph.total_edges}")
-
-            finding = self._analyst.analyse(case, subgraph)
+            
+            # 4. Run analyst on the combined subgraph
+            finding = self._analyst.analyse(anchor_case, subgraph)
             self._stats["findings"] += 1
-
-            self._queue.conclude(case, finding)
+    
+            # 5. Conclude anchor case
+            self._queue.conclude(anchor_case, finding)
+    
+            # 6. Conclude all absorbed cases under the same finding
+            for case in pending[1:]:
+                if case.anchor_guid not in subgraph.unvisited_guids:
+                    self._queue.conclude(case, finding)
+    
             self._save_finding(finding)
             self._print_finding(finding)
-
-        # 4. Age WATCHING cases
+    
+            # 7. Re-push not-absorbed cases — they become anchors in next iteration
+            for case in pending[1:]:
+                if case.anchor_guid in subgraph.unvisited_guids:
+                    self._queue.push(case.anchor_guid, case.trigger_score)
+    
+        # 8. Age WATCHING cases
         closed = self._queue.tick_watching()
         if closed:
             print(f"[ThreatAnalyst] Closed {len(closed)} watched case(s)")
-
+    
         print(f"[ThreatAnalyst] Queue state: {self._queue.get_stats()}")
 
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
