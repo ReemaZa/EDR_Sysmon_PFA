@@ -148,55 +148,57 @@ Rules:
         )
 
         for inst in sorted_inst:
+            # ← fetch template to get image/cmdline/user
+            tmpl = sg.templates.get(inst.template_hash or "")
+
             tags  = ""
-            tags += "  ← ANCHOR"            if inst.guid == sg.anchor_guid else ""
-            tags += "  [GHOST]"             if inst.ghost else ""
-            tags += "  [ALIVE]"             if inst.alive else "  [TERMINATED]"
+            tags += "  ← ANCHOR"   if inst.guid == sg.anchor_guid else ""
+            tags += "  [GHOST]"    if inst.ghost else ""
+            tags += "  [ALIVE]"    if inst.alive else "  [TERMINATED]"
 
             lines.append(
                 f"\n  GUID:         {inst.guid}{tags}\n"
-                f"  Image:        {inst.image        or '(unknown)'}\n"
-                f"  Parent Image: {inst.parent_image or '(unknown)'}\n"
-                f"  Command Line: {inst.cmdline       or '(unknown)'}\n"
-                f"  User:         {inst.user          or '(unknown)'}\n"
+                f"  Image:        {(tmpl.image        if tmpl else None) or '(unknown)'}\n"
+                f"  Parent Image: {(tmpl.parent_image if tmpl else None) or '(unknown)'}\n"
+                f"  Command Line: {(tmpl.cmdline       if tmpl else None) or '(unknown)'}\n"
+                f"  User:         {(tmpl.user          if tmpl else None) or '(unknown)'}\n"
                 f"  Score:        {inst.score}\n"
                 f"  Start:        {inst.start_time    or 'unknown'}\n"
                 f"  End:          {inst.end_time       or 'N/A'}"
             )
         return "\n".join(lines)
-
     def _section_behaviour_edges(self, sg: SubgraphContext) -> str:
-        if not sg.edges:
-            return ""
+            if not sg.edges:
+                return ""
 
-        lines = ["=" * 80,
-                 "BEHAVIOUR EDGES (sorted by score, highest first):",
-                 "=" * 80]
+            lines = ["=" * 80,
+                     "BEHAVIOUR EDGES (sorted by score, highest first):",
+                     "=" * 80]
 
-        for edge in sorted(sg.edges, key=lambda e: -e.total_score):
-            # Resolve destination display name
-            dst_display = edge.dst_id
-            for art in sg.artifacts:
-                if art.id == edge.dst_id:
-                    dst_display = f"{art.label}:{art.id}"
-                    break
+            for edge in sorted(sg.edges, key=lambda e: -e.total_score):
+                # Resolve destination display name
+                dst_display = edge.dst_id
+                for art in sg.artifacts:
+                    if art.id == edge.dst_id:
+                        dst_display = f"{art.label}:{art.id}"
+                        break
 
-            extra_str = ""
-            if edge.extra:
-                relevant = {k: v for k, v in edge.extra.items() if v}
-                if relevant:
-                    extra_str = f"  Extra:        {json.dumps(relevant)}\n"
+                extra_str = ""
+                if edge.extra:
+                    relevant = {k: v for k, v in edge.extra.items() if v}
+                    if relevant:
+                        extra_str = f"  Extra:        {json.dumps(relevant)}\n"
 
-            lines.append(
-                f"\n  {edge.rel_type}:  {edge.src_id}  →  {dst_display}\n"
-                f"  Score:        {edge.total_score}  "
-                f"(seen {edge.count}x,  first={edge.first_seen},  last={edge.last_seen})\n"
-                f"  Techniques:   {', '.join(edge.techniques)  or 'none'}\n"
-                f"  Tactics:      {', '.join(edge.tactics)     or 'none'}\n"
-                f"  Sigma IDs:    {', '.join(edge.finding_ids) or 'none'}\n"
-                f"{extra_str}"
-            )
-        return "\n".join(lines)
+                lines.append(
+                    f"\n  {edge.rel_type}:  {edge.src_id}  →  {dst_display}\n"
+                    f"  Score:        {edge.total_score}  "
+                    f"(seen {edge.count}x,  first={edge.first_seen},  last={edge.last_seen})\n"
+                    f"  Techniques:   {', '.join(edge.techniques)  or 'none'}\n"
+                    f"  Tactics:      {', '.join(edge.tactics)     or 'none'}\n"
+                    f"  Sigma IDs:    {', '.join(edge.finding_ids) or 'none'}\n"
+                    f"{extra_str}"
+                )
+            return "\n".join(lines)
 
     def _section_timeline(self, sg: SubgraphContext) -> str:
         if not sg.timeline:

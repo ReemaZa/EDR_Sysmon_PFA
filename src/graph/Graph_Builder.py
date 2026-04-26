@@ -555,7 +555,7 @@ class GraphBuilder:
                     src_id=parent_guid, src_label="ProcessInstance",
                     rel_type="CREATED",
                     dst_id=child_guid,  dst_label="ProcessInstance",
-                    ep=ep, eff_score=eff, timestamp=ts,
+                    ep=ep, eff_score=eff-delta, timestamp=ts,
                 )
                 # ← _add_score removed here; instance score already set in _create_or_promote_instance
 

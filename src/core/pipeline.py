@@ -156,8 +156,8 @@ class DetectionPipeline:
 
         if self.l1_engine:
             stats["l1_stats"] = self.l1_engine.get_stats()
-        if self.l2_engine:
-            stats["l2_stats"] = self.l2_engine.get_stats()
+ #       if self.l2_engine:
+#            stats["l2_stats"] = self.l2_engine.get_stats()
         if self.l4_analyst:
             stats["l4_stats"] = self.l4_analyst.get_stats()
 
