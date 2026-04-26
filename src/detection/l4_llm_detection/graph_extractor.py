@@ -134,7 +134,9 @@ class SubgraphContext:
     has_ghost_parents: bool
     total_nodes:       int
     total_edges:       int
-    unvisited_guids:   Set[str] = field(default_factory=set)  # ← add this
+    unvisited_guids:   Set[str]             = field(default_factory=set)
+    process_tree:      Dict[str, List[str]] = field(default_factory=dict)  # parent_guid → [child_guids]
+    tree_roots:        List[str]            = field(default_factory=list)   # guids with no parent in subgraph
 
 
 @dataclass
@@ -156,7 +158,6 @@ class GraphExtractor:
         self,
         anchor_guid:    str,
         to_investigate: Set[str],
-        
     ) -> Optional[SubgraphContext]:
         """
         Build a SubgraphContext starting from anchor_guid,
@@ -172,11 +173,20 @@ class GraphExtractor:
         if not instances:
             return None
 
-        edges, artifact_ids = self._fetch_behaviour_edges(all_guids)
-        artifacts            = self._fetch_artifacts(artifact_ids)
-        timeline             = self._build_timeline(edges, instances, templates)
+        edges, artifact_ids, orphan_ids = self._fetch_behaviour_edges(all_guids)
 
-        instances, artifacts, edges = self._enforce_limits(
+        if orphan_ids:
+            orphan_instances, orphan_templates = self._fetch_instances(orphan_ids)
+            # merge
+            existing_guids = {i.guid for i in instances}
+            instances  += [i for i in orphan_instances if i.guid not in existing_guids]
+            templates  |= {k: v for k, v in orphan_templates.items() if k not in templates}
+        
+        artifacts                    = self._fetch_artifacts(artifact_ids)
+        timeline                     = self._build_timeline(edges, instances, templates)
+        process_tree, tree_roots     = self._build_process_tree(all_guids)
+
+        instances, artifacts, edges  = self._enforce_limits(
             anchor_guid, instances, artifacts, edges
         )
 
@@ -195,7 +205,9 @@ class GraphExtractor:
             ),
             total_nodes       = len(instances) + len(artifacts),
             total_edges       = len(edges),
-            unvisited_guids   = to_investigate - expand_guids - include_guids,  # ← add this
+            unvisited_guids   = to_investigate - expand_guids - include_guids,
+            process_tree      = process_tree,
+            tree_roots        = tree_roots,
         )
 
     # ── BFS ───────────────────────────────────────────────────────────────────
@@ -245,9 +257,6 @@ class GraphExtractor:
                         queue.append(_QItem(guid=nguid, hops_left=HOP_RESET))
                         queued.add(nguid)
                 else:
-                    # not in list → include + fetch behavior, but still
-                    # traverse with reduced hops so we can reach deeper
-                    # to_investigate nodes through non-listed nodes
                     include_guids.add(nguid)
                     if nguid not in queued:
                         queue.append(_QItem(guid=nguid, hops_left=hops_left - 1))
@@ -259,7 +268,7 @@ class GraphExtractor:
                 nscore = int(n.get("score") or 0)
 
                 if nscore == 0:
-                    continue   # score=0 lateral → ignore completely
+                    continue
 
                 if nguid in expand_guids:
                     continue
@@ -270,7 +279,6 @@ class GraphExtractor:
                         queue.append(_QItem(guid=nguid, hops_left=HOP_RESET))
                         queued.add(nguid)
                 else:
-                    # score > 0 but not in list → include, stop
                     include_guids.add(nguid)
 
         include_guids -= expand_guids
@@ -279,12 +287,6 @@ class GraphExtractor:
     # ── QUERIES ───────────────────────────────────────────────────────────────
 
     def _fetch_child_of_neighbors(self, guid: str) -> List[Dict]:
-        """
-        Direct parent and children via CHILD_OF — one hop each direction.
-        CHILD_OF direction: (child)-[:CHILD_OF]->(parent)
-            parent of guid → MATCH (guid)-[:CHILD_OF]->(parent)
-            children of guid → MATCH (child)-[:CHILD_OF]->(guid)
-        """
         rows = self._fetch("""
             MATCH (p:ProcessInstance {id: $guid})
             OPTIONAL MATCH (p)-[:CHILD_OF]->(parent:ProcessInstance)
@@ -302,10 +304,6 @@ class GraphExtractor:
         return [dict(r) for r in rows if r.get("guid")]
 
     def _fetch_lateral_neighbors(self, guid: str) -> List[Dict]:
-        """
-        Outbound INJECTED_THREAD, ACCESSED_MEMORY, TAMPERED targets.
-        Returns guid + score of target ProcessInstance.
-        """
         rows = self._fetch("""
             MATCH (src:ProcessInstance {id: $guid})
                   -[:INJECTED_THREAD|ACCESSED_MEMORY|TAMPERED]->
@@ -320,11 +318,6 @@ class GraphExtractor:
         self,
         guids: Set[str],
     ) -> Tuple[List[InstanceNode], Dict[str, TemplateNode]]:
-        """
-        Fetch ProcessInstance + linked ProcessTemplate in one query.
-        Splits into InstanceNode (runtime only) and TemplateNode (deduplicated).
-        Ghost instances have no INSTANCE_OF so template fields will be null.
-        """
         if not guids:
             return [], {}
 
@@ -391,11 +384,6 @@ class GraphExtractor:
         self,
         guids: Set[str],
     ) -> Tuple[List[BehaviourEdge], Set[str]]:
-        """
-        All outbound behaviour edges from every guid.
-        CHILD_OF excluded — structural only.
-        Collects artifact node ids from edges pointing to artifact labels.
-        """
         if not guids:
             return [], set()
 
@@ -463,11 +451,16 @@ class GraphExtractor:
                 finding_ids = r.get("finding_ids") or [],
                 extra       = extra,
             ))
+            # Collect any process dst_ids that weren't in our original guid set
+        orphan_process_ids = {
+            e.dst_id for e in edges
+            if e.dst_id not in guids
+            and e.rel_type in LATERAL_REL_TYPES   # only processes, not artifacts
+        }
+        return edges, artifact_ids, orphan_process_ids  # ← pass back up
 
-        return edges, artifact_ids
 
     def _fetch_artifacts(self, artifact_ids: Set[str]) -> List[ArtifactNode]:
-        """File, Network, Registry, DNS, Driver nodes."""
         if not artifact_ids:
             return []
 
@@ -493,6 +486,37 @@ class GraphExtractor:
             ))
         return result
 
+    # ── PROCESS TREE ──────────────────────────────────────────────────────────
+
+    def _build_process_tree(
+        self,
+        all_guids: Set[str],
+    ) -> Tuple[Dict[str, List[str]], List[str]]:
+        """
+        Build parent→children map from CHILD_OF edges in the graph.
+        CHILD_OF direction: (child)-[:CHILD_OF]->(parent)
+        Returns (children_of dict, root_guids list).
+        """
+        rows = self._fetch("""
+            UNWIND $guids AS guid
+            MATCH (child:ProcessInstance {id: guid})-[:CHILD_OF]->(parent:ProcessInstance)
+            WHERE parent.id IN $guids
+            RETURN child.id AS child_guid, parent.id AS parent_guid
+        """, {"guids": list(all_guids)})
+
+        children_of: Dict[str, List[str]] = {g: [] for g in all_guids}
+        has_parent:  Set[str]             = set()
+
+        for r in rows:
+            child  = r.get("child_guid")
+            parent = r.get("parent_guid")
+            if child and parent:
+                children_of[parent].append(child)
+                has_parent.add(child)
+
+        roots = [g for g in all_guids if g not in has_parent]
+        return children_of, roots
+
     # ── TIMELINE ──────────────────────────────────────────────────────────────
 
     def _build_timeline(
@@ -501,11 +525,6 @@ class GraphExtractor:
         instances: List[InstanceNode],
         templates: Dict[str, TemplateNode],
     ) -> List[Dict[str, str]]:
-        """
-        Chronological list of events.
-        Uses template image for process start labels since
-        image lives on ProcessTemplate, not ProcessInstance.
-        """
         events = []
 
         for inst in instances:
