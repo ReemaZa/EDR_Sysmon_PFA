@@ -245,6 +245,7 @@ Rules:
         print("[Analyst] PROMPT THAT WILL BE SENT TO LLM:")
         print("█" * 80)
         print(prompt)
+        
         print("█" * 80 + "\n")
 
         # ── REAL API CALL (disabled until ready) ──────────────────────────
