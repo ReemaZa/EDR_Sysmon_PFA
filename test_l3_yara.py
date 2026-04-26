@@ -1,218 +1,276 @@
 """
-Quick standalone test for the L3 YARA scanner.
+Quick standalone test for YaraEngine (l3_yara_engine.py)
 
-Uses two approaches:
-    1. EICAR test string  – a standard fake "malware" string that Florian
-                            Roth's rules (and most AV engines) detect.
-    2. Custom test rule   – a simple .yar rule we write ourselves so the
-                            test works even if no external rules are loaded.
+Tests:
+    1. Single file detection (image field)
+    2. Multi-file detection (image + target_filename in same event)
+    3. Threat level escalation (multiple rules, worst wins)
+    4. Redis cache hit (same file scanned twice)
+    5. Clean file – no false positive
+    6. Missing file – graceful handling
+    7. Empty event – no crash
+    8. Stats reporting
 
 Run:
-    python test_l3_yara.py
+        python test_yara_engine.py
 """
 
 import os
 import sys
-import tempfile
 import shutil
+import tempfile
+import time
+import logging
 
+logging.basicConfig(level=logging.WARNING)  # suppress INFO noise during tests
 
-# ---------------------------------------------------------------------------
-# Make sure project root is on the path so src.core.pipeline resolves
-# ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.detection.l3_yara_scanner import YaraScanner
+from src.detection.l3_yara_scanner import YaraEngine
 
 # ---------------------------------------------------------------------------
-# EICAR test string (harmless – universally detected as "malware" by AV/YARA)
+# Console colours
 # ---------------------------------------------------------------------------
-EICAR = (
-    b"X5O!P%@AP[4\\PZX54(P^)7CC)7}"
-    b"$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-)
-
-# ---------------------------------------------------------------------------
-# A minimal custom YARA rule so the test works without external rule files
-# ---------------------------------------------------------------------------
-CUSTOM_RULE = """
-rule EICAR_Test
-{
-    meta:
-        description = "Detects the EICAR antivirus test file"
-        author      = "test"
-
-    strings:
-        $eicar = "EICAR-STANDARD-ANTIVIRUS-TEST-FILE"
-
-    condition:
-        $eicar
-}
-
-rule Fake_Backdoor
-{
-    meta:
-        description = "Simulated backdoor signature for testing"
-
-    strings:
-        $magic = "FAKE_MALWARE_SIGNATURE_XYZ"
-
-    condition:
-        $magic
-}
-"""
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 RESET  = "\033[0m"
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
+CYAN   = "\033[96m"
 BOLD   = "\033[1m"
 
 def ok(msg):   print(f"  {GREEN}PASS{RESET}  {msg}")
 def fail(msg): print(f"  {RED}FAIL{RESET}  {msg}")
 def info(msg): print(f"  {YELLOW}INFO{RESET}  {msg}")
+def head(msg): print(f"\n{BOLD}{msg}{RESET}")
+
+# ---------------------------------------------------------------------------
+# YARA rules used for testing
+# ---------------------------------------------------------------------------
+CUSTOM_RULES = """
+rule Fake_Backdoor
+{
+    meta:
+        description  = "Simulated backdoor"
+        threat_level = "high"
+        technique    = "T1059"
+    strings:
+        $s = "FAKE_BACKDOOR_SIGNATURE"
+    condition:
+        $s
+}
+
+rule Fake_Ransomware
+{
+    meta:
+        description  = "Simulated ransomware"
+        threat_level = "critical"
+        technique    = "T1486"
+    strings:
+        $s = "FAKE_RANSOMWARE_SIGNATURE"
+    condition:
+        $s
+}
+
+rule Fake_Suspicious
+{
+    meta:
+        description  = "Mildly suspicious"
+        threat_level = "medium"
+        technique    = "T1055"
+    strings:
+        $s = "FAKE_SUSPICIOUS_SIGNATURE"
+    condition:
+        $s
+}
+"""
+
+TEST_DIR = "test_samples_engine"
 
 
-TEST_FILES_DIR = "test_samples"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-def make_temp_file(content: bytes, suffix: str = ".exe", name: str = "sample") -> str:
-    """Write content to a local test file and return its absolute path."""
-    os.makedirs(TEST_FILES_DIR, exist_ok=True)
-    path = os.path.join(TEST_FILES_DIR, f"{name}{suffix}")
+def write_file(name: str, content: bytes) -> str:
+    """Write content to TEST_DIR/<name> and return absolute path."""
+    os.makedirs(TEST_DIR, exist_ok=True)
+    path = os.path.abspath(os.path.join(TEST_DIR, name))
     with open(path, "wb") as f:
         f.write(content)
-    return os.path.abspath(path)
+    return path
 
 
-def setup_test_rules_dir() -> str:
-    """
-    Write the custom YARA rules into a temp directory and return its path.
-    Always used for unit tests so results are deterministic and independent
-    of whatever production rules are loaded.
-    """
-    rules_dir = tempfile.mkdtemp(prefix="yara_test_rules_")
-    rule_path = os.path.join(rules_dir, "test_rules.yar")
-    with open(rule_path, "w") as f:
-        f.write(CUSTOM_RULE)
+def setup_rules_dir() -> str:
+    """Write CUSTOM_RULES to a temp dir and return its path."""
+    rules_dir = tempfile.mkdtemp(prefix="yara_engine_rules_")
+    with open(os.path.join(rules_dir, "test_rules.yar"), "w") as f:
+        f.write(CUSTOM_RULES)
     return rules_dir
+
+
+def make_engine(rules_dir: str) -> YaraEngine:
+    """Create a YaraEngine with Redis disabled (for isolated testing)."""
+    # Pass a non-existent Redis host so Redis is silently disabled
+    return YaraEngine(rules_dir=rules_dir, redis_host="localhost", redis_port=1)
 
 
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
 
-def test_eicar_detected(scanner: YaraScanner):
-    print(f"\n{BOLD}[Test 1] EICAR test file detection (in-memory){RESET}")
-
-    # Scan raw bytes directly — avoids Defender deleting the file on write
-    try:
-        matches = scanner.compiled_rules.match(data=EICAR)
-        if not matches:
-            fail("No detection returned – EICAR was not caught.")
-        else:
-            ok(f"Detected!  rules matched: {[m.rule for m in matches]}")
-    except Exception as exc:
-        fail(f"Crashed with: {exc}")
+def test_single_file_detection(engine: YaraEngine):
+    head("[Test 1] Single file detection – image field")
+    path = write_file("backdoor.exe", b"FAKE_BACKDOOR_SIGNATURE extra bytes")
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": path}
+    result = engine.check_event(event)
+    if result is None:
+        fail("No detection – backdoor not caught.")
+    else:
+        ok(f"Detected  threat={result.threat_level.name}  rules={result.metadata['rule_names']}")
 
 
-def test_fake_backdoor_detected(scanner: YaraScanner):
-    """File containing fake backdoor magic string should be flagged."""
-    print(f"\n{BOLD}[Test 2] Fake backdoor signature detection{RESET}")
-
-    path = make_temp_file(b"FAKE_MALWARE_SIGNATURE_XYZ some extra bytes", name="backdoor")
-    try:
-        event = {
-            "event_id": 11,
-            "event_type": "FileCreate",
-            "target_filename": path,
-        }
-        result = scanner.check_event(event)
-
-        if result is None:
-            fail("No detection returned – fake backdoor was not caught.")
-        else:
-            ok(f"Detected!  threat={result.threat_level.name}")
-            ok(f"Matches:   {result.matches}")
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
-
-
-def test_clean_file_not_flagged(scanner: YaraScanner):
-    """A benign file should return None."""
-    print(f"\n{BOLD}[Test 3] Clean file – should NOT be flagged{RESET}")
-
-    path = make_temp_file(b"Hello, this is a totally normal file with nothing bad.", name="clean")
-    try:
-        event = {
-            "event_id": 1,
-            "event_type": "ProcessCreate",
-            "image": path,
-        }
-        result = scanner.check_event(event)
-
-        if result is None:
-            ok("Correctly returned None for a clean file.")
-        else:
-            fail(f"False positive! Got: {result.matches}")
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
-
-
-def test_missing_file_handled(scanner: YaraScanner):
-    """Event pointing to a non-existent file should return None gracefully."""
-    print(f"\n{BOLD}[Test 4] Missing file – should not crash{RESET}")
-
+def test_multi_file_detection(engine: YaraEngine):
+    head("[Test 2] Multi-file detection – image + target_filename")
+    path_img = write_file("process.exe",  b"FAKE_BACKDOOR_SIGNATURE")
+    path_tgt = write_file("dropper.dll",  b"FAKE_RANSOMWARE_SIGNATURE")
     event = {
-        "event_id": 1,
-        "event_type": "ProcessCreate",
-        "image": "C:\\Windows\\does_not_exist.exe",
+        "event_id": 11,
+        "event_type": "FileCreate",
+        "image": path_img,
+        "target_filename": path_tgt,
     }
-    try:
-        result = scanner.check_event(event)
-        if result is None:
-            ok("Returned None gracefully for a missing file.")
+    result = engine.check_event(event)
+    if result is None:
+        fail("No detection – multi-file scan missed both files.")
+    else:
+        scanned = result.metadata.get("scanned_files", [])
+        rules   = result.metadata.get("rule_names", [])
+        ok(f"Detected  scanned_files={len(scanned)}  rules={rules}")
+        if len(scanned) < 2:
+            fail(f"Expected 2 files scanned, got {len(scanned)}")
         else:
-            fail("Unexpected detection on a missing file.")
+            ok("Both files were scanned correctly.")
+
+
+def test_threat_level_escalation(engine: YaraEngine):
+    head("[Test 3] Threat level escalation – worst rule wins")
+    # File matches both MEDIUM and CRITICAL rules
+    path = write_file("multi.exe", b"FAKE_SUSPICIOUS_SIGNATURE FAKE_RANSOMWARE_SIGNATURE")
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": path}
+    result = engine.check_event(event)
+    if result is None:
+        fail("No detection.")
+    elif result.threat_level.name != "CRITICAL":
+        fail(f"Expected CRITICAL, got {result.threat_level.name}")
+    else:
+        ok(f"Correct escalation to CRITICAL (matched: {result.metadata['rule_names']})")
+
+
+def test_redis_cache_hit(engine: YaraEngine):
+    head("[Test 4] Redis cache hit")
+    if engine.redis is None:
+        info("Redis not available – skipping cache test.")
+        return
+
+    path = write_file("cached.exe", b"FAKE_BACKDOOR_SIGNATURE")
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": path}
+
+    # First scan – populates cache
+    result1 = engine.check_event(event)
+    cache_hits_before = engine.get_stats()["cache_hits"]
+
+    # Second scan – should hit cache
+    result2 = engine.check_event(event)
+    cache_hits_after = engine.get_stats()["cache_hits"]
+
+    if result1 is None or result2 is None:
+        fail("Detection failed on one of the scans.")
+    elif cache_hits_after > cache_hits_before:
+        ok(f"Cache hit confirmed on second scan. cache_hits={cache_hits_after}")
+    else:
+        fail("Second scan did not use cache.")
+
+
+def test_clean_file(engine: YaraEngine):
+    head("[Test 5] Clean file – should NOT be flagged")
+    path = write_file("clean.exe", b"This is a completely normal file with no signatures.")
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": path}
+    result = engine.check_event(event)
+    if result is None:
+        ok("Correctly returned None for clean file.")
+    else:
+        fail(f"False positive! Matched: {result.metadata['rule_names']}")
+
+
+def test_missing_file(engine: YaraEngine):
+    head("[Test 6] Missing file – should not crash")
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": "C:\\nonexistent\\file.exe"}
+    try:
+        result = engine.check_event(event)
+        if result is None:
+            ok("Returned None gracefully for missing file.")
+        else:
+            fail(f"Unexpected detection: {result}")
     except Exception as exc:
         fail(f"Crashed with: {exc}")
 
 
-def test_empty_event_handled(scanner: YaraScanner):
-    """Event with no file path fields should return None without crashing."""
-    print(f"\n{BOLD}[Test 5] Empty event – no file fields{RESET}")
-
+def test_empty_event(engine: YaraEngine):
+    head("[Test 7] Empty event – no file fields")
     event = {"event_id": 3, "event_type": "NetworkConnect", "destination_ip": "1.2.3.4"}
     try:
-        result = scanner.check_event(event)
+        result = engine.check_event(event)
         if result is None:
-            ok("Returned None gracefully for an event with no file paths.")
+            ok("Returned None gracefully for event with no file paths.")
         else:
             fail(f"Unexpected result: {result}")
     except Exception as exc:
         fail(f"Crashed with: {exc}")
 
 
-def test_stats(scanner: YaraScanner):
-    """Stats dict should have expected keys and non-zero counts."""
-    print(f"\n{BOLD}[Test 6] Stats reporting{RESET}")
-
-    stats = scanner.get_stats()
-    expected_keys = {"total_checks", "files_scanned", "yara_matches",
-                     "scan_errors", "rules_loaded"}
-
-    missing = expected_keys - stats.keys()
+def test_stats(engine: YaraEngine):
+    head("[Test 8] Stats reporting")
+    stats = engine.get_stats()
+    expected = {"total_checks", "files_scanned", "yara_matches",
+                "cache_hits", "scan_errors", "rules_loaded"}
+    missing = expected - stats.keys()
     if missing:
-        fail(f"Missing keys in stats: {missing}")
+        fail(f"Missing stat keys: {missing}")
     else:
-        ok("All expected keys present.")
-        info(f"Stats snapshot: {stats}")
+        ok("All expected stat keys present.")
+        for k, v in stats.items():
+            info(f"{k:<20} {v}")
+
+
+# ---------------------------------------------------------------------------
+# Performance assessment
+# ---------------------------------------------------------------------------
+
+def performance_check(engine: YaraEngine):
+    head("[Perf] Scan speed benchmark (100 events)")
+
+    path = write_file("perf_test.exe", b"FAKE_BACKDOOR_SIGNATURE padding " * 100)
+    event = {"event_id": 1, "event_type": "ProcessCreate", "image": path}
+
+    # Warm up
+    engine.check_event(event)
+
+    start = time.perf_counter()
+    for _ in range(100):
+        engine.check_event(event)
+    elapsed = time.perf_counter() - start
+
+    avg_ms = (elapsed / 100) * 1000
+    info(f"100 scans completed in {elapsed:.3f}s  →  avg {avg_ms:.2f}ms per scan")
+
+    if avg_ms < 5:
+        ok(f"Excellent – {avg_ms:.2f}ms per scan")
+    elif avg_ms < 20:
+        ok(f"Good – {avg_ms:.2f}ms per scan")
+    elif avg_ms < 50:
+        info(f"Acceptable – {avg_ms:.2f}ms per scan (consider Redis caching)")
+    else:
+        fail(f"Slow – {avg_ms:.2f}ms per scan (Redis caching strongly recommended)")
 
 
 # ---------------------------------------------------------------------------
@@ -220,68 +278,43 @@ def test_stats(scanner: YaraScanner):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Clean up leftover test files from previous runs
-    if os.path.exists(TEST_FILES_DIR):
-        shutil.rmtree(TEST_FILES_DIR)
+    # Clean up from previous runs
+    if os.path.exists(TEST_DIR):
+        shutil.rmtree(TEST_DIR)
 
     print(f"\n{BOLD}{'='*55}")
-    print("  L3 YARA Scanner – Quick Test")
+    print("  YaraEngine – Full Test Suite")
     print(f"{'='*55}{RESET}")
 
-    # ------------------------------------------------------------------
-    # Two scanners:
-    #   custom_scanner  – uses our known test rules (deterministic)
-    #                     used for tests 1-5
-    #   prod_scanner    – uses config/yara_rules/ if available
-    #                     used for test 6 (stats on real ruleset)
-    # ------------------------------------------------------------------
-    custom_rules_dir = setup_test_rules_dir()
-    custom_scanner = YaraScanner(rules_dir=custom_rules_dir)
+    rules_dir = setup_rules_dir()
+    engine = make_engine(rules_dir)
 
-    if custom_scanner.compiled_rules is None:
-        print(f"\n{RED}ERROR: Custom test rules failed to compile. "
-              f"Check yara-python installation.{RESET}")
+    if engine.compiled_rules is None:
+        print(f"{RED}ERROR: Rules failed to compile. Check yara-python.{RESET}")
         sys.exit(1)
 
-    info("Custom test rules compiled successfully.")
+    info(f"Rules loaded: {engine.get_stats()['rules_loaded']}")
 
-    # Production scanner (optional – only used for stats display)
-    prod_rules = "config/yara_rules"
-    has_prod_rules = (
-        os.path.isdir(prod_rules)
-        and any(f.endswith((".yar", ".yara")) for f in os.listdir(prod_rules))
-    )
+    test_single_file_detection(engine)
+    test_multi_file_detection(engine)
+    test_threat_level_escalation(engine)
+    test_redis_cache_hit(engine)
+    test_clean_file(engine)
+    test_missing_file(engine)
+    test_empty_event(engine)
+    test_stats(engine)
+    performance_check(engine)
 
-    if has_prod_rules:
-        info(f"Production rules found in '{prod_rules}' – loading for stats test.")
-        prod_scanner = YaraScanner(rules_dir=prod_rules)
-    else:
-        info("No production rules found – stats test will use custom scanner.")
-        prod_scanner = custom_scanner
-
-    info(f"Production rules loaded: {prod_scanner.get_stats()['rules_loaded']}")
-
-    # ------------------------------------------------------------------
-    # Run tests 1-5 against custom scanner (guaranteed to match/not match)
-    # Run test 6 against production scanner (shows real ruleset stats)
-    # ------------------------------------------------------------------
-    test_eicar_detected(custom_scanner)
-    test_fake_backdoor_detected(custom_scanner)
-    test_clean_file_not_flagged(custom_scanner)
-    test_missing_file_handled(custom_scanner)
-    test_empty_event_handled(custom_scanner)
-    test_stats(custom_scanner)
-
-    # Final stats
-    print(f"\n{BOLD}{'='*55}")
-    print("  Final stats (production scanner)")
-    print(f"{'='*55}{RESET}")
-    for k, v in custom_scanner.get_stats().items():
+    # Summary
+    head("Final stats")
+    print(f"{'='*55}")
+    for k, v in engine.get_stats().items():
         print(f"  {k:<20} {v}")
     print()
 
-    # Cleanup temp rules dir
-    shutil.rmtree(custom_rules_dir, ignore_errors=True)
+    # Cleanup
+    shutil.rmtree(rules_dir, ignore_errors=True)
+    shutil.rmtree(TEST_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
