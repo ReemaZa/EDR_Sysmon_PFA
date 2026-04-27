@@ -49,7 +49,14 @@ class ArtifactNode:
     id:    str
     label: str
     extra: Dict[str, Any] = field(default_factory=dict)
-
+@dataclass
+class ResponderOutput:
+    case_id:           str
+    anchor_guid:       str
+    analysis_id:       str
+    verdict:           str                  # "MALICIOUS" | "SUSPICIOUS"
+    actions:           List[Dict[str, Any]] # executor reads this
+    raw_llm_response:  str
 
 @dataclass
 class BehaviourEdge:

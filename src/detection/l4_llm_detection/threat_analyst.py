@@ -37,7 +37,7 @@ from gqlalchemy import Memgraph
 from src.detection.l4_llm_detection.analyst_agent import AnalystAgent
 from src.detection.l4_llm_detection.graph_extractor import GraphExtractor
 from src.detection.l4_llm_detection.investigation_queue import InvestigationQueue
-from src.detection.l4_llm_detection.l4_models import AttackSummary
+from src.detection.l4_llm_detection.l4_models import AttackSummary, ResponderOutput
 from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
 
 FINDINGS_FILE = "l4_findings.json"
@@ -265,81 +265,74 @@ class ThreatAnalyst:
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 
-    def _save_finding(self, finding: AttackSummary) -> None:
-        """Save finding to JSONL file."""
+    def _save_finding(self, finding: ResponderOutput) -> None:
+        """Save responder decision to JSONL file.
+
+        Note: This saves the RESPONDER's actions, not the analyst's raw findings.
+        The analyst now produces ResponderOutput directly (actions + minimal verdict).
+        Heavy attack metadata (techniques, tactics, attack_chain, processes, iocs, files,
+        identities, gaps) is NO LONGER stored here because:
+
+        1. LLM now produces actions, not attack narratives
+        2. Our prompt explicitly removed techniques/tactics from LLM output
+        3. Attack details are ephemeral — only actions and verdict matter for response
+        """
         record = {
             "case_id":             finding.case_id,
             "anchor_guid":         finding.anchor_guid,
             "produced_at":         datetime.utcnow().isoformat(),
             "verdict":             finding.verdict,
-            "severity":            finding.severity,
-            "confidence":          finding.confidence,
-            "attack_name":         finding.attack_name,
-            "summary":             finding.summary,
-            "confidence_note":     finding.confidence_note,
-            "mitre_techniques":    finding.mitre_techniques,
-            "mitre_tactics":       finding.mitre_tactics,
-            "attack_chain":        finding.attack_chain,
-            "processes":           finding.processes,
-            "iocs":                finding.iocs,
-            "files":               finding.files,
-            "identities":          finding.identities,
-            "gaps":                finding.gaps,
-            "should_respond":      finding.should_respond,
+            "actions":             finding.actions,           # ← new: machine-executable responses
+            "analysis_id":         finding.analysis_id,
+            "raw_llm_response":    finding.raw_llm_response,  # ← for debugging only
         }
         try:
             with open(FINDINGS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as exc:
-            self._log(f"[ThreatAnalyst][WARN] Could not save finding: {exc}")
+            self._log(f"[ThreatAnalyst][WARN] Could not save responder decision: {exc}")
 
 
-    def _print_finding(self, finding: AttackSummary) -> None:
-        """Print finding to console with formatting."""
-        symbol = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(
-            finding.severity, "⚪"
-        )
-
+    def _print_finding(self, finding: ResponderOutput) -> None:
+        """Print responder decision to console with formatting."""
+        # Severity is gone — verdict alone drives response severity
+        verdict_symbol = {
+            "MALICIOUS": "🔴", 
+            "SUSPICIOUS": "🟠"
+        }.get(finding.verdict, "⚪")
+    
         self._log(
             f"\n{'=' * 70}\n"
-            f"[L4 FINDING]\n"
+            f"[RESPONDER DECISION]\n"
             f"  Case:       {finding.case_id}\n"
             f"  Anchor:     {finding.anchor_guid}\n"
-            f"  Attack:     {finding.attack_name}\n"
-            f"  Verdict:    {finding.verdict}  {symbol} {finding.severity}  "
-            f"(confidence: {finding.confidence})\n"
-            f"  Summary:    {finding.summary}\n"
-            f"  Techniques: {', '.join(finding.mitre_techniques) or 'none'}\n"
-            f"  Tactics:    {', '.join(finding.mitre_tactics) or 'none'}\n"
+            f"  Analysis:   {finding.analysis_id}\n"
+            f"  Verdict:    {finding.verdict} {verdict_symbol}\n"
+            f"  Actions:    {len(finding.actions)} response(s)\n"
         )
-
-        # Optional: Print attack chain if present
-        if finding.attack_chain:
-            self._log(f"\n  ATTACK CHAIN ({len(finding.attack_chain)} steps):")
-            for step in finding.attack_chain[:5]:  # First 5 steps
-                self._log(f"    - {step.get('step')}: {step.get('action')} → {step.get('target', 'N/A')}")
-            if len(finding.attack_chain) > 5:
-                self._log(f"    ... and {len(finding.attack_chain) - 5} more steps")
-
-        # Optional: Print IOCs if present
-        if finding.iocs:
-            self._log(f"\n  IOCs ({len(finding.iocs)}):")
-            for ioc in finding.iocs[:3]:  # First 3 IOCs
-                self._log(f"    - {ioc.get('type')}: {ioc.get('value')}")
-            if len(finding.iocs) > 3:
-                self._log(f"    ... and {len(finding.iocs) - 3} more")
-
-        # Confidence note if present
-        if finding.confidence_note:
-            self._log(f"\n  Note: {finding.confidence_note}")
-
-        # Respond flag
-        if finding.should_respond:
-            self._log(f"\n  🚨 RESPONSE REQUIRED (verdict={finding.verdict})")
-
+    
+        # Print actions with full details
+        if finding.actions:
+            self._log(f"\n  EXECUTABLE ACTIONS:")
+            for idx, action in enumerate(finding.actions, 1):
+                self._log(
+                    f"\n    [{idx}] PRIORITY {action.get('priority', 0)}: {action.get('type')}\n"
+                    f"        target: {action.get('target_type')}={action.get('target_value')}\n"
+                    f"        scope:  {action.get('scope')}\n"
+                    f"        reason: {action.get('reason', 'No reason provided')}"
+                )
+        else:
+            self._log(f"\n  ⚪ NO ACTIONS — monitoring only")
+    
+        # Show raw LLM response preview for debugging (optional)
+        if finding.raw_llm_response and len(finding.raw_llm_response) <= 500:
+            self._log(f"\n  RAW LLM (preview): {finding.raw_llm_response[:200]}...")
+        elif finding.raw_llm_response:
+            self._log(f"\n  RAW LLM: {len(finding.raw_llm_response)} chars (see JSONL)")
+    
         self._log(f"{'=' * 70}\n")
-
-        # ── STATS ─────────────────────────────────────────────────────────────────
-
+    
+            # ── STATS ─────────────────────────────────────────────────────────────────
+    
     def get_stats(self) -> Dict[str, Any]:
             return {**self._stats, "queue": self._queue.get_stats()}

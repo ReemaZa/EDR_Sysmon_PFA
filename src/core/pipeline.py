@@ -52,7 +52,7 @@ class DetectionPipeline:
         if enable_l4:
             from src.detection.l4_llm_detection.threat_analyst import ThreatAnalyst
             self.l4_analyst = ThreatAnalyst(
-                query_interval   = 200,   # scan graph every 30 seconds
+                query_interval   = 30,   # scan graph every 30 seconds
                 threat_threshold = 4,    # investigate nodes with score >= 5
                 max_subgraph_nodes = 120,
             )
