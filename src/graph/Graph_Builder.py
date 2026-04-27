@@ -244,6 +244,11 @@ class GraphBuilder:
         """
         t_hash = self._template_hash(image, parent_image, cmdline, user)
         ts     = timestamp or self._now()
+        cmdline=re.sub(
+        r'(?i)(-encodedcommand|-enc)\s+[A-Za-z0-9+/=]{20,}',
+        r'\1 [BASE64-ENCODED-PAYLOAD]',
+        cmdline
+    )
         self._run(
             """
             MERGE (t:ProcessTemplate {template_hash: $t_hash})
