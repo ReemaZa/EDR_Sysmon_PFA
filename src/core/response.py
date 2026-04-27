@@ -21,6 +21,8 @@ Response functions:
     file_deletion
     patching
     identity_revocation
+    ip_block
+    dns_block
 
 """
 import datetime
@@ -558,6 +560,161 @@ def patching(
                  f"Patch {target} via {package_manager} (pkgs: {packages})", _patch)
 
 
+def dns_block(
+        domain: str,
+        mode: Mode = "approval",
+        hosts_file: str = r"C:\Windows\System32\drivers\etc\hosts",
+        redirect_ip: str = "0.0.0.0",
+) -> Dict:
+    """
+    Block a domain by redirecting it to a null IP in the Windows hosts file.
+    Blocks both the apex domain and the www subdomain by default.
+
+    Parameters
+    ----------
+    domain      : The domain to block (e.g. "malicious.com").
+    hosts_file  : Path to the hosts file. Defaults to the Windows system hosts file.
+    redirect_ip : IP to redirect the domain to. Defaults to 0.0.0.0 (null route).
+    """
+    import re
+    DOMAIN_RE = re.compile(
+        r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+        r"(\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,}$"
+    )
+    if not DOMAIN_RE.match(domain):
+        return _result("error", "dns_block", domain,
+                       {"error": f"Invalid domain format: '{domain}'"})
+
+    # PROTECTION CHECK: Prevent blocking protected system files
+    is_protected, reason = _protection.is_protected_file(hosts_file)
+    if is_protected:
+        warning_msg = _protection.get_warning("file_quarantine")
+        log.error(f"{warning_msg} - {reason}")
+        return _result("blocked", "dns_block", domain,
+                       {"reason": reason, "warning": warning_msg})
+
+    # Build the entries to add: apex + www subdomain
+    www_domain = f"www.{domain}" if not domain.startswith("www.") else domain
+    entries = [domain] if domain.startswith("www.") else [domain, www_domain]
+
+    def _block():
+        hosts_path = Path(hosts_file)
+        if not hosts_path.exists():
+            raise FileNotFoundError(f"Hosts file not found: {hosts_file}")
+
+        existing = hosts_path.read_text(encoding="utf-8")
+        added = []
+        skipped = []
+
+        lines_to_add = []
+        for entry in entries:
+            rule = f"{redirect_ip}\t{entry}"
+            # Check if already blocked (any redirect of this domain)
+            already_present = any(
+                entry in line and not line.strip().startswith("#")
+                for line in existing.splitlines()
+            )
+            if already_present:
+                skipped.append(entry)
+            else:
+                lines_to_add.append(rule)
+                added.append(entry)
+
+        if lines_to_add:
+            block = (
+                    f"\n# EDR DNS block — {domain} — {_now()}\n"
+                    + "\n".join(lines_to_add)
+                    + "\n"
+            )
+            with hosts_path.open("a", encoding="utf-8") as f:
+                f.write(block)
+
+        # Flush DNS cache so the change takes effect immediately
+        flush_result = subprocess.run(
+            ["ipconfig", "/flushdns"],
+            capture_output=True, text=True
+        )
+
+        return {
+            "domain": domain,
+            "redirect_ip": redirect_ip,
+            "hosts_file": str(hosts_path),
+            "entries_added": added,
+            "entries_skipped_already_blocked": skipped,
+            "dns_cache_flushed": flush_result.returncode == 0,
+            "flush_stderr": flush_result.stderr.strip() or None,
+        }
+
+    return _gate(
+        mode, "dns_block", domain,
+        f"Block domain '{domain}' via hosts file (redirect → {redirect_ip})",
+        _block,
+    )
+
+def ip_block(
+    ip_address: str,
+    mode: Mode = "approval",
+    direction: Literal["inbound", "outbound", "both"] = "both",
+    rule_name: Optional[str] = None,
+) -> Dict:
+    """
+    Block network traffic to/from a specific IP address using Windows Firewall.
+
+    Parameters
+    ----------
+    ip_address : The IP address to block (IPv4 or IPv6).
+    direction  : "inbound" | "outbound" | "both" (default).
+    rule_name  : Optional custom rule name. Auto-generated if not provided.
+    """
+    import re
+    IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$")
+    IPV6_RE = re.compile(r"^[0-9a-fA-F:]+(/\d{1,3})?$")
+    if not (IPV4_RE.match(ip_address) or IPV6_RE.match(ip_address)):
+        return _result("error", "ip_block", ip_address,
+                       {"error": f"Invalid IP address format: '{ip_address}'"})
+
+    base_name = rule_name or f"EDR_BLOCK_{ip_address}_{_now()[:10]}"
+    directions = (
+        ["inbound", "outbound"] if direction == "both" else [direction]
+    )
+
+    def _block():
+        results = []
+        for dir_ in directions:
+            name = f"{base_name}_{dir_.upper()}"
+            cmd = [
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={name}",
+                f"dir={dir_}",
+                "action=block",
+                f"remoteip={ip_address}",
+                "enable=yes",
+                "profile=any",
+            ]
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                results.append({
+                    "cmd": " ".join(cmd),
+                    "direction": dir_,
+                    "rule_name": name,
+                    "ok": True,
+                    "stdout": result.stdout.strip(),
+                })
+            except subprocess.CalledProcessError as e:
+                results.append({
+                    "cmd": " ".join(cmd),
+                    "direction": dir_,
+                    "rule_name": name,
+                    "ok": False,
+                    "stderr": e.stderr.strip(),
+                })
+        return {"ip_address": ip_address, "direction": direction, "rules": results}
+
+    return _gate(
+        mode, "ip_block", ip_address,
+        f"Block {direction} traffic for IP '{ip_address}'",
+        _block,
+    )
 
 def identity_revocation(
     identity: str,
