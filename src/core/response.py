@@ -654,7 +654,7 @@ def dns_block(
 def ip_block(
     ip_address: str,
     mode: Mode = "approval",
-    direction: Literal["inbound", "outbound", "both"] = "both",
+    direction: Literal["in", "out", "both"] = "both",
     rule_name: Optional[str] = None,
 ) -> Dict:
     """
@@ -675,26 +675,26 @@ def ip_block(
 
     base_name = rule_name or f"EDR_BLOCK_{ip_address}_{_now()[:10]}"
     directions = (
-        ["inbound", "outbound"] if direction == "both" else [direction]
+        ["in", "out"] if direction == "both" else [direction]
     )
 
     def _block():
         results = []
         for dir_ in directions:
             name = f"{base_name}_{dir_.upper()}"
-            cmd = [
-                "netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={name}",
-                f"dir={dir_}",
-                "action=block",
-                f"remoteip={ip_address}",
-                "enable=yes",
-                "profile=any",
-            ]
+            cmd_str = (
+                f'netsh advfirewall firewall add rule '
+                f'name="{name}" '
+                f'dir={dir_} '
+                f'action=block '
+                f'remoteip={ip_address} '
+                f'enable=yes '
+                f'profile=any'
+            )
             try:
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                result = subprocess.run(cmd_str, check=True, capture_output=True, text=True, shell=True)
                 results.append({
-                    "cmd": " ".join(cmd),
+                    "cmd": cmd_str,
                     "direction": dir_,
                     "rule_name": name,
                     "ok": True,
@@ -702,7 +702,7 @@ def ip_block(
                 })
             except subprocess.CalledProcessError as e:
                 results.append({
-                    "cmd": " ".join(cmd),
+                    "cmd": cmd_str,
                     "direction": dir_,
                     "rule_name": name,
                     "ok": False,

@@ -35,11 +35,9 @@
   },
   
   "protected_directories": [
-    "C:\\Windows\\System32",
     "C:\\Windows\\SysWOW64",
     "C:\\Windows\\WinSxS",
     "C:\\Windows\\Boot",
-    "C:\\Windows\\System32\\drivers",
     "C:\\Windows\\System32\\config",
     "C:\\Program Files\\Windows Defender",
     "C:\\Program Files\\Windows Defender Advanced Threat Protection",
