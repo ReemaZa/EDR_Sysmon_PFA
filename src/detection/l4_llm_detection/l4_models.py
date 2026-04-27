@@ -107,6 +107,53 @@ class AnalystFinding:
         default_factory=lambda: datetime.utcnow().isoformat()
     )
 
+@dataclass
+class AttackSummary:
+    """
+    Output of LLM 1. Passed directly to ResponderAgent.
+    Contains everything the responder needs, nothing it doesn't.
+    """
+    case_id:          str
+    anchor_guid:      str
+    verdict:          str             # MALICIOUS | SUSPICIOUS | BENIGN
+    severity:         str             # CRITICAL | HIGH | MEDIUM | LOW
+    confidence:       str             # HIGH | MEDIUM | LOW
+    attack_name:      str
+    summary:          str             # 3-sentence max: what, why, key evidence
+    confidence_note:  Optional[str]   # missing telemetry, or null
+    mitre_techniques: List[str]       # ["T1059.001", …]
+    mitre_tactics:    List[str]       # ["execution", …]
+
+    # Attack chain — ordered steps, one per edge/spawn event
+    # [{ step, image, guid, action, target, technique, tactic, count }]
+    attack_chain: List[Dict] = field(default_factory=list)
+
+    # Processes and their roles
+    # [{ guid, image, pid, alive, score, role }]
+    # role: patient_zero | c2_beacon | injector | injected | dropper | lateral | suspicious
+    processes: List[Dict] = field(default_factory=list)
+
+    # Raw IOCs — responder decides the action
+    # [{ type: ip|domain|hash|process_name, value, context }]
+    iocs: List[Dict] = field(default_factory=list)
+
+    # Files touched — responder decides quarantine vs deletion
+    # [{ path, event: created|modified|deleted|timestomped|ads, context }]
+    files: List[Dict] = field(default_factory=list)
+
+    # Windows accounts used or created by attacker
+    identities: List[str] = field(default_factory=list)
+
+    # Ghost guids and what they hide
+    # [{ guid, implication }]
+    gaps: List[Dict] = field(default_factory=list)
+
+    # ── Handoff control ───────────────────────────────────────────────────────
+    should_respond:   bool = False
+    raw_llm_response: str  = ""
+    expected_but_missing: List[Dict[str, str]] = field(default_factory=list)
+    noise: List[Dict[str, str]] = field(default_factory=list)
+    execution_speed :str=""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INVESTIGATION CASE

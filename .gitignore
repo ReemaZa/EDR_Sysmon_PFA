@@ -23,7 +23,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
-*.log
+#*.log
 
 # Database
 *.db
