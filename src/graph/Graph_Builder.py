@@ -92,18 +92,17 @@ EDGE_WEIGHTS: dict[str, int] = {
     "ACCESSED_MEMORY": 3,
     "TAMPERED":        3,
     "TIMESTOMPED":     2,
-  
-  
+    "WROTE_ADS":       2,
+    "CREATED":         1,
+    "CONNECTED":       1,
 }
 
 ALWAYS_STORE: set[str] = {
-    #"INJECTED_THREAD",
-    #"ACCESSED_MEMORY",
-    #"TAMPERED",
-    #"TIMESTOMPED"
-    
-  
-    
+    "INJECTED_THREAD",
+    "ACCESSED_MEMORY",
+    "TAMPERED",
+    "TIMESTOMPED",
+    "WROTE_ADS",
 }
 
 PARENT_INHERITANCE = 0.4
@@ -354,7 +353,10 @@ class GraphBuilder:
             ON MATCH SET
                 p.score      = p.score + $score,
                 p.ghost      = false,
-                p.start_time = CASE WHEN $was_ghost = true THEN $ts ELSE p.start_time END
+                p.start_time = CASE WHEN $was_ghost = true THEN $ts ELSE p.start_time END,
+                p.pruned     = false,
+                p.llm_evaluated_at   = NULL,
+                p.llm_score_at_eval  = NULL
             """,
             {"guid": guid, "score": score, "ts": ts, "was_ghost": was_ghost},
         )
@@ -400,7 +402,13 @@ class GraphBuilder:
         if not guid or delta == 0:
             return
         self._run(
-            "MATCH (p:ProcessInstance {id: $guid}) SET p.score = p.score + $d",
+            """
+            MATCH (p:ProcessInstance {id: $guid})
+            SET p.score              = p.score + $d,
+                p.pruned             = false,
+                p.llm_evaluated_at   = NULL,
+                p.llm_score_at_eval  = NULL
+            """,
             {"guid": guid, "d": delta},
         )
 

@@ -4,9 +4,7 @@ analyst_agent.py  —  LLM 1: SubgraphContext → AttackSummary
 Analyses the raw process graph and produces a structured attack summary.
 Does NOT produce response actions — that is ResponderAgent's job.
 
-Handoff:
-    summary.should_respond = True  →  caller spawns ResponderAgent in new thread
-    Thresholds: MALICIOUS (any severity) | SUSPICIOUS + CRITICAL/HIGH
+Verdict options: MALICIOUS | SUSPICIOUS (no BENIGN — system prunes via sustained inactivity)
 
 WHAT WAS KEPT vs REMOVED on edges:
     KEPT    techniques  — from Sigma rules, ground truth ATT&CK mapping
@@ -22,7 +20,6 @@ WHAT WAS REMOVED from templates:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import re
@@ -30,60 +27,9 @@ from typing import Any, Dict, List, Optional
 
 from src.detection.l4_llm_detection.l4_models import (
     InvestigationCase,
-    SubgraphContext,
+    AttackSummary,
 )
-
-_ALWAYS_RESPOND  = {"MALICIOUS"}
-_RESPOND_IF_HIGH = {"SUSPICIOUS"}
-_HIGH_SEVERITIES = {"CRITICAL", "HIGH"}
-
-
-# ── Handoff dataclass ─────────────────────────────────────────────────────────
-
-@dataclass
-class AttackSummary:
-    """
-    Output of LLM 1. Passed directly to ResponderAgent.
-    Contains everything the responder needs, nothing it doesn't.
-    """
-    case_id:          str
-    anchor_guid:      str
-    verdict:          str             # MALICIOUS | SUSPICIOUS | BENIGN
-    severity:         str             # CRITICAL | HIGH | MEDIUM | LOW
-    confidence:       str             # HIGH | MEDIUM | LOW
-    attack_name:      str
-    summary:          str             # 3-sentence max: what, why, key evidence
-    confidence_note:  Optional[str]   # missing telemetry, or null
-    mitre_techniques: List[str]       # ["T1059.001", …]
-    mitre_tactics:    List[str]       # ["execution", …]
-
-    # Attack chain — ordered steps, one per edge/spawn event
-    # [{ step, image, guid, action, target, technique, tactic, count }]
-    attack_chain: List[Dict] = field(default_factory=list)
-
-    # Processes and their roles
-    # [{ guid, image, pid, alive, score, role }]
-    # role: patient_zero | c2_beacon | injector | injected | dropper | lateral | suspicious
-    processes: List[Dict] = field(default_factory=list)
-
-    # Raw IOCs — responder decides the action
-    # [{ type: ip|domain|hash|process_name, value, context }]
-    iocs: List[Dict] = field(default_factory=list)
-
-    # Files touched — responder decides quarantine vs deletion
-    # [{ path, event: created|modified|deleted|timestomped|ads, context }]
-    files: List[Dict] = field(default_factory=list)
-
-    # Windows accounts used or created by attacker
-    identities: List[str] = field(default_factory=list)
-
-    # Ghost guids and what they hide
-    # [{ guid, implication }]
-    gaps: List[Dict] = field(default_factory=list)
-
-    # ── Handoff control ───────────────────────────────────────────────────────
-    should_respond:   bool = False
-    raw_llm_response: str  = ""
+from src.detection.l4_llm_detection.graph_extractor import SubgraphContext
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -113,7 +59,6 @@ class AnalystAgent:
             self._s_identities(subgraph),
             self._s_behaviours(subgraph),
             self._s_gaps(subgraph),
-            self._s_previous(case),
             self._s_task(),
         ]
         return "\n\n".join(s for s in sections if s)
@@ -146,6 +91,7 @@ class AnalystAgent:
             if inst.guid == sg.anchor_guid: tags.append("ANCHOR")
             if inst.ghost:                  tags.append("GHOST")
             if not inst.alive:              tags.append("dead")
+            if inst.llm_verdict:            tags.append(f"prev:{inst.llm_verdict}")
             tag_str = f"  [{','.join(tags)}]" if tags else ""
             t_short = (inst.template_hash or "")[:12] or "no-tmpl"
             lines.append(
@@ -242,29 +188,12 @@ class AnalystAgent:
             lines.append(f"  guid={g}")
         return "\n".join(lines)
 
-    # ── SECTION 6: PREVIOUS ───────────────────────────────────────────────────
-
-    def _s_previous(self, case: InvestigationCase) -> str:
-        if not case.previous_finding:
-            return ""
-        pf = case.previous_finding
-        lines = [
-            "PREVIOUS FINDING (graph has new edges — re-evaluate):",
-            f"  verdict={pf.verdict}  severity={pf.severity}",
-        ]
-        if pf.mitre_techniques:
-            lines.append(f"  techniques: {', '.join(pf.mitre_techniques)}")
-        if pf.narrative:
-            lines.append(f"  summary: {pf.narrative[:250]}")
-        return "\n".join(lines)
-
-    # ── SECTION 7: TASK ───────────────────────────────────────────────────────
+    # ── SECTION 6: TASK ───────────────────────────────────────────────────────
 
     def _s_task(self) -> str:
         return """TASK:
 You are a senior threat analyst. Analyse this scored Windows Sysmon process graph.
-Produce a structured attack summary. Your output goes directly to a responder LLM
-that will generate containment actions — give it everything it needs, nothing extra.
+Produce a structured attack summary. Your output goes directly to logging/response systems.
 
 SCORING:
   ≥10 = malicious   5-9 = highly suspicious   1-5 = investigate   0 = context only
@@ -276,12 +205,13 @@ HOW TO READ:
   - count on an edge = how many times that action occurred (high count = beaconing,
     spray, or enumeration — always call this out in attack_chain).
   - [MISSING:…] = process appeared in an edge but could not be fetched — note as gap.
+  - [prev:SUSPICIOUS] or [prev:MALICIOUS] = node was previously evaluated with that verdict.
 
 Return ONLY a JSON object inside <analyst> tags. Nothing outside.
 
 <analyst>
 {
-  "verdict":    "MALICIOUS | SUSPICIOUS | BENIGN",
+  "verdict":    "MALICIOUS | SUSPICIOUS",
   "severity":   "CRITICAL | HIGH | MEDIUM | LOW",
   "confidence": "HIGH | MEDIUM | LOW",
   "attack_name": "<threat family + key technique, specific — e.g. 'Cobalt Strike beacon via PowerShell IEX cradle'>",
@@ -351,18 +281,42 @@ RULES:
 - High-count edges (×N) must appear in attack_chain with the count in the note.
 - summary must reference actual image names and short guids — not generic descriptions.
 - Empty [] is valid. Never null for arrays.
+- Never return BENIGN. If evidence is insufficient, return SUSPICIOUS with confidence LOW
+  and explain what's missing in confidence_note. BENIGN is determined by the system
+  through sustained inactivity, not by you.
 - No text, markdown, or comments outside <analyst></analyst>."""
 
     # ── LLM CALL ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str) -> str:
-        filename = f"logs/analyst_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
-        #with open(filename, "w", encoding="utf-8") as f:
-        #    f.write(prompt)
-        print(f"[Analyst] prompt → {filename}  ({len(prompt)} chars)")
+        """
+        Call Claude API or return stub. Currently commented out — using placeholder.
+        """
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        prompt_file = f"logs/analyst_prompt_{timestamp}.txt"
+        
+        # Save prompt to file for inspection
+        try:
+            with open(prompt_file, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            print(f"\n[Analyst][PROMPT] Saved to {prompt_file} ({len(prompt)} chars)")
+            print(f"[Analyst][PROMPT] First 1000 chars:")
+            print("─" * 80)
+            print(prompt[:1000])
+            print("─" * 80)
+        except Exception as exc:
+            print(f"[Analyst][WARN] Could not save prompt: {exc}")
 
-        # response = _client.messages.create(
-        #     model      = MODEL,
+        # ────────────────────────────────────────────────────────────────────
+        # ANTHROPIC API CALL (currently disabled — no API key)
+        # ────────────────────────────────────────────────────────────────────
+        # Uncomment when API key available:
+        #
+        # from anthropic import Anthropic
+        # client = Anthropic()
+        #
+        # response = client.messages.create(
+        #     model      = "claude-sonnet-4-20250514",
         #     max_tokens = 2000,
         #     system     = (
         #         "You are an expert EDR threat analyst. You analyse Sysmon telemetry "
@@ -373,13 +327,14 @@ RULES:
         # )
         # return response.content[0].text
 
+        print(f"[Analyst][STUB] API disabled — returning placeholder verdict")
         return (
             '<analyst>\n'
             '{\n'
             '  "verdict": "SUSPICIOUS", "severity": "MEDIUM", "confidence": "LOW",\n'
-            '  "attack_name": "API disabled — placeholder",\n'
-            '  "summary": "API disabled.",\n'
-            '  "confidence_note": "API disabled.",\n'
+            '  "attack_name": "API disabled — placeholder response",\n'
+            '  "summary": "Cannot evaluate without API. This is a placeholder response while API is disabled.",\n'
+            '  "confidence_note": "API disabled — no actual analysis performed",\n'
             '  "mitre_techniques": [], "mitre_tactics": [],\n'
             '  "attack_chain": [], "processes": [], "iocs": [],\n'
             '  "files": [], "identities": [], "gaps": []\n'
@@ -395,10 +350,13 @@ RULES:
         case:     InvestigationCase,
         subgraph: SubgraphContext,
     ) -> AttackSummary:
-
+        """
+        Parse LLM JSON response. Coerce invalid verdicts to SUSPICIOUS.
+        """
         match = re.search(r"<analyst>(.*?)</analyst>", raw, re.DOTALL)
         if not match:
             return self._error_summary(case, subgraph, "No <analyst> tags", raw)
+        
         try:
             d: Dict[str, Any] = json.loads(match.group(1).strip())
         except json.JSONDecodeError as exc:
@@ -408,14 +366,13 @@ RULES:
         severity   = d.get("severity",   "MEDIUM")
         confidence = d.get("confidence", "LOW")
 
-        if verdict    not in ("MALICIOUS", "SUSPICIOUS", "BENIGN"): verdict    = "SUSPICIOUS"
-        if severity   not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"): severity   = "MEDIUM"
-        if confidence not in ("HIGH", "MEDIUM", "LOW"):             confidence = "LOW"
-
-        should_respond = (
-            verdict in _ALWAYS_RESPOND
-            or (verdict in _RESPOND_IF_HIGH and severity in _HIGH_SEVERITIES)
-        )
+        # Coerce invalid verdicts to SUSPICIOUS
+        if verdict not in ("MALICIOUS", "SUSPICIOUS"):
+            verdict = "SUSPICIOUS"
+        if severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            severity = "MEDIUM"
+        if confidence not in ("HIGH", "MEDIUM", "LOW"):
+            confidence = "LOW"
 
         summary = AttackSummary(
             case_id          = case.case_id,
@@ -434,18 +391,16 @@ RULES:
             files            = d.get("files",            []),
             identities       = d.get("identities",       []),
             gaps             = d.get("gaps",             []),
-            should_respond   = should_respond,
             raw_llm_response = raw,
         )
 
         print(
-            f"[Analyst] {summary.attack_name}\n"
-            f"  verdict={verdict}  severity={severity}  confidence={confidence}"
-            f"  should_respond={should_respond}\n"
-            f"  chain={len(summary.attack_chain)} steps  "
-            f"procs={len(summary.processes)}  "
-            f"iocs={len(summary.iocs)}  "
-            f"files={len(summary.files)}"
+            f"\n[Analyst] PARSED OUTPUT:\n"
+            f"  verdict={verdict}  severity={severity}  confidence={confidence}\n"
+            f"  attack_name={summary.attack_name}\n"
+            f"  chain steps={len(summary.attack_chain)}  "
+            f"processes={len(summary.processes)}  "
+            f"iocs={len(summary.iocs)}  files={len(summary.files)}"
         )
         return summary
 

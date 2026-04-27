@@ -12,7 +12,7 @@ from src.detection.notes import NotesStore
 from src.detection.watch_rules import WatchRulesStore, WATCH_RULE_SCORE_BOOST
 
 CYCLE_SECONDS   = 30
-SCORE_THRESHOLD = 5
+SCORE_THRESHOLD = 4
 MAX_PARALLEL    = 5      # max concurrent LLM calls per cycle
 
 gb    = GraphBuilder()

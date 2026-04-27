@@ -75,7 +75,8 @@ READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_dataset', 'windows-sysmon-T1003.001.txt'
+    #'..', 'tests', 'logs_dataset', 'sysmon-credential_dumping-t1003.001.txt'
+    '..', 'tests', 'logs_dataset', 'sysmon-process_injection-t1055.txt'
 )
 
 # ============================================================================
@@ -90,6 +91,10 @@ _self_pid = os.getpid()
 _self_guid = None
 _self_guid_lock = threading.Lock()
 EDR_IMAGE_MARKER = "EDR_Sysmon_PFA"
+
+# Locks for thread-safe operations
+_results_lock = threading.Lock()      # Protects results.json concurrent writes
+_pipeline_lock = threading.Lock()    # Protects detection_pipeline initialization
 
 
 # ============================================================================
@@ -186,8 +191,11 @@ def process_event(evt: dict) -> None:
     """
     global detection_pipeline
 
-    if detection_pipeline is None:
-        return
+    # Check pipeline with lock (live mode callback may fire before main() finishes init)
+    with _pipeline_lock:
+        if detection_pipeline is None:
+            return
+        pipeline_ref = detection_pipeline
 
     # Self-exclusion
     _try_discover_self_guid(evt)
@@ -219,7 +227,7 @@ def process_event(evt: dict) -> None:
 
     # ── Detection pipeline ────────────────────────────────────────────────
     print(f"\n[PROCESSING] Running through detection layers...\n")
-    verdict = detection_pipeline.process_event(evt)
+    verdict = pipeline_ref.process_event(evt)
     output  = []
 
     # ── Graph builder ─────────────────────────────────────────────────────
@@ -263,8 +271,14 @@ def process_event(evt: dict) -> None:
         }.get(verdict.threat_level.name, '[?]')
         print(f"  [VERDICT] FINAL VERDICT: {symbol} {verdict.threat_level.name}")
 
-    with open("results.json", "a") as f:
-        json.dump(output, f, indent=4)
+    # Write results.json with lock to prevent concurrent access
+    with _results_lock:
+        try:
+            with open("results.json", "a", encoding="utf-8") as f:
+                json.dump(output, f, indent=4)
+                f.write("\n")
+        except Exception as e:
+            print(f"[ERROR] Could not write results.json: {e}")
 
     # TODO: response actions for CRITICAL/HIGH threats
     # TODO: persistent event storage

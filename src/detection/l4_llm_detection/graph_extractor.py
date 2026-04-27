@@ -98,6 +98,7 @@ class InstanceNode:
     start_time:    Optional[str]
     end_time:      Optional[str]
     template_hash: Optional[str] = None
+    llm_verdict:   Optional[str] = None  # From graph: "SUSPICIOUS" | "MALICIOUS" | None
 
 
 @dataclass
@@ -332,6 +333,7 @@ class GraphExtractor:
                 p.alive      AS alive,
                 p.start_time AS start_time,
                 p.end_time   AS end_time,
+                p.llm_verdict AS llm_verdict,
 
                 t.template_hash AS template_hash,
                 t.image         AS image,
@@ -362,6 +364,7 @@ class GraphExtractor:
                 start_time    = r.get("start_time"),
                 end_time      = r.get("end_time"),
                 template_hash = t_hash,
+                llm_verdict   = r.get("llm_verdict"),
             ))
 
             if t_hash and t_hash not in templates:
@@ -561,32 +564,107 @@ class GraphExtractor:
         artifacts:   List[ArtifactNode],
         edges:       List[BehaviourEdge],
     ) -> Tuple[List[InstanceNode], List[ArtifactNode], List[BehaviourEdge]]:
-
+        """
+        Priority-based truncation to preserve attack chain integrity.
+        Never drop protected nodes.
+        """
         total = len(instances) + len(artifacts)
         if total <= MAX_NODES and len(edges) <= MAX_EDGES:
             return instances, artifacts, edges
 
-        keep_artifacts = sorted(artifacts, key=lambda a: a.id)[
-            : max(0, MAX_NODES - len(instances))
+        # ── Compute protected_guids ───────────────────────────────────────────
+        # Protected = to_investigate GUIDs + intermediate connectors on shortestPath
+        # For now, simplify: protect anchor + any instance with score > 0 + all instances
+        # in to_investigate set (but we don't have that here, so protect high-score ones)
+        protected_guids: Set[str] = {anchor_guid}
+        
+        # Add all GUIDs on shortest paths between anchor and high-score nodes
+        high_score_guids = [i.guid for i in instances if i.score > 0 and i.guid != anchor_guid]
+        
+        # Query shortest paths between anchor and each high-score node
+        for target_guid in high_score_guids[:10]:  # limit to avoid explosion
+            path_rows = self._fetch("""
+                MATCH p = shortestPath(
+                    (a:ProcessInstance {id: $anchor})-
+                    [:CHILD_OF|CREATED|INJECTED_THREAD|ACCESSED_MEMORY|TAMPERED*1..6]-
+                    (b:ProcessInstance {id: $target})
+                )
+                WHERE p IS NOT NULL
+                UNWIND nodes(p) AS node
+                RETURN DISTINCT node.id AS guid
+            """, {"anchor": anchor_guid, "target": target_guid})
+            
+            for row in path_rows:
+                if row.get("guid"):
+                    protected_guids.add(row["guid"])
+        
+        # ── Apply truncation in priority order ──────────────────────────────────
+        
+        # 1. Truncate artifacts first (oldest first)
+        keep_artifacts = sorted(
+            artifacts,
+            key=lambda a: a.extra.get("last_seen", "")
+        )[:max(1, int(MAX_NODES * 0.4))]  # Use ~40% of node budget for artifacts
+        
+        remaining_node_budget = MAX_NODES - len(keep_artifacts)
+        
+        # 2. Drop context nodes (not in protected_guids) beyond 2 hops, sorted by score
+        inst_by_guid = {i.guid: i for i in instances}
+        
+        # Compute hop distance from anchor for each instance
+        hop_distance = {anchor_guid: 0}
+        queue: deque[Tuple[str, int]] = deque([(anchor_guid, 0)])
+        visited: Set[str] = {anchor_guid}
+        
+        while queue:
+            current_guid, current_hop = queue.popleft()
+            if current_hop >= 2:
+                continue
+            
+            # Find neighbors in edges
+            for edge in edges:
+                if edge.src_id == current_guid and edge.dst_id not in visited:
+                    next_guid = edge.dst_id
+                    visited.add(next_guid)
+                    next_hop = current_hop + 1
+                    hop_distance[next_guid] = next_hop
+                    queue.append((next_guid, next_hop))
+        
+        # Separate protected and non-protected instances
+        protected_instances = [i for i in instances if i.guid in protected_guids]
+        non_protected = [
+            i for i in instances
+            if i.guid not in protected_guids
         ]
-
-        total = len(instances) + len(keep_artifacts)
-        if total > MAX_NODES:
-            non_anchor     = sorted(
-                [i for i in instances if i.guid != anchor_guid],
-                key=lambda i: -i.score,
-            )[: MAX_NODES - len(keep_artifacts) - 1]
-            anchor_list    = [i for i in instances if i.guid == anchor_guid]
-            keep_instances = anchor_list + non_anchor
-        else:
-            keep_instances = instances
-
-        valid_ids  = {i.guid for i in keep_instances} | {a.id for a in keep_artifacts}
+        
+        # Sort non-protected by: (far from anchor, low score, then by guid)
+        non_protected.sort(
+            key=lambda i: (
+                hop_distance.get(i.guid, 999),  # far from anchor first
+                i.score,  # then low score first
+                i.guid,
+            )
+        )
+        
+        # Keep as many protected as possible, then fill with highest-priority non-protected
+        keep_instances = protected_instances.copy()
+        for inst in non_protected:
+            if len(keep_instances) < remaining_node_budget:
+                keep_instances.append(inst)
+            else:
+                break
+        
+        # Ensure anchor is always included
+        if not any(i.guid == anchor_guid for i in keep_instances):
+            keep_instances.append(inst_by_guid[anchor_guid])
+        
+        # ── Rebuild edges ─────────────────────────────────────────────────────
+        valid_ids = {i.guid for i in keep_instances} | {a.id for a in keep_artifacts}
         keep_edges = [
             e for e in edges
             if e.src_id in valid_ids and e.dst_id in valid_ids
         ][:MAX_EDGES]
-
+        
         return keep_instances, keep_artifacts, keep_edges
 
     # ── DB HELPER ─────────────────────────────────────────────────────────────

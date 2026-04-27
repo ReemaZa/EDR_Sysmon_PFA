@@ -174,18 +174,18 @@ class SysmonEventWatcher(threading.Thread):
                     
         except pywintypes.error as e:
             print(f"[ERROR] Failed to initialize event subscription: {e}")
-        # finally:
-        #     # Always save bookmark on exit
-        #     try:
-        #         if self.bookmark_handle is not None:
-        #             save_bookmark_xml(self.bookmark_handle)
-        #             print("[INFO] Bookmark saved. Will resume from here on next start.")
-        #     except Exception as e:
-        #         print(f"[ERROR] Failed to save bookmark on exit: {e}")
+        finally:
+            # Always save bookmark on exit
+            try:
+                if self.bookmark_handle is not None:
+                    save_bookmark_xml(self.bookmark_handle)
+                    print("[INFO] Bookmark saved. Will resume from here on next start.")
+            except Exception as e:
+                print(f"[ERROR] Failed to save bookmark on exit: {e}")
             
-        #     try:
-        #         if self.h_subscription is not None:
-        #             print('hhhh')
-        #             win32evtlog.CloseEventLog(self.h_subscription)
-        #     except Exception:
-        #         pass
+            try:
+                if self.h_subscription is not None:
+                    print('Closing event subscription handle')
+                    win32evtlog.CloseEventLog(self.h_subscription)
+            except Exception as e:
+                print(f"[WARNING] Error closing subscription handle: {e}")

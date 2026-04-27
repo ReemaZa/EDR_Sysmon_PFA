@@ -54,6 +54,6 @@ results.json
 
 
 sysmon_bookmark.xml
-tests/logs_dataset/
+# tests/logs_dataset/    (test fixtures — should be committed for reproducible testing)
 tests/testN01/
 tests/results/
