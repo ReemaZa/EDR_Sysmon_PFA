@@ -22,22 +22,16 @@ WHAT WAS REMOVED from templates:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+
 from datetime import datetime
 import json
 from typing import Any, Dict, List, Optional
-
-from google.ai.generativelanguage import Schema, Type
-
 from src.detection.l4_llm_detection.l4_models import (
     InvestigationCase,
     SubgraphContext,
-    AttackSummary
+    ResponderOutput,       # ← your new output model (add this to l4_models too)
 )
 
-_ALWAYS_RESPOND  = {"MALICIOUS"}
-_RESPOND_IF_HIGH = {"SUSPICIOUS"}
-_HIGH_SEVERITIES = {"CRITICAL", "HIGH"}
 
 import google.generativeai as genai
 
@@ -49,156 +43,92 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 # ── STRUCTURED OUTPUT SCHEMA ──────────────────────────────────────────────────
 
-def get_response_schema() -> Schema:
+def get_response_schema() -> "Schema":
+    from google.ai.generativelanguage import Schema, Type
+
+    action_schema = Schema(
+        type=Type.OBJECT,
+        properties={
+            "id":           Schema(type=Type.STRING),
+            "priority":     Schema(type=Type.INTEGER),
+            "type":         Schema(type=Type.STRING, enum=[
+                                "process_termination", "blacklist",
+                                "file_quarantine", "file_deletion",
+                                "alert", "BLOCK_IP", "BLOCK_DOMAIN",
+                            ]),
+            "target_type":  Schema(type=Type.STRING, enum=[
+                                "guid", "tmpl", "file",
+                                "ip", "domain", "registry",
+                            ]),
+            "target_value": Schema(type=Type.STRING),
+            "scope":        Schema(type=Type.STRING, enum=[
+                                "instance", "all_children",
+                                "all_connected", "template",
+                            ]),
+            "reason":       Schema(type=Type.STRING),
+        },
+        required=["id", "priority", "type", "target_type", "target_value", "scope", "reason"],
+    )
+
+  
+    
+
     return Schema(
         type=Type.OBJECT,
         properties={
-            "verdict":         Schema(type=Type.STRING, enum=["MALICIOUS", "SUSPICIOUS", "BENIGN"]),
-            "severity":        Schema(type=Type.STRING, enum=["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
-            "confidence":      Schema(type=Type.STRING, enum=["HIGH", "MEDIUM", "LOW"]),
-            "attack_name":     Schema(type=Type.STRING),
-            "summary":         Schema(type=Type.STRING),
-            "confidence_note": Schema(type=Type.STRING, nullable=True),
-            "mitre_techniques": Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
-            "mitre_tactics":    Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
-            "execution_speed": Schema(
-                type=Type.OBJECT,
-                nullable=True,
-                properties={
-                    "total_duration_ms": Schema(type=Type.INTEGER),
-                    "first_event":       Schema(type=Type.STRING),
-                    "last_event":        Schema(type=Type.STRING),
-                    "assessment":        Schema(type=Type.STRING),
-                },
-                required=["total_duration_ms", "first_event", "last_event", "assessment"],
-            ),
-            "attack_chain": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "step":        Schema(type=Type.INTEGER),
-                        "image":       Schema(type=Type.STRING),
-                        "guid":        Schema(type=Type.STRING),
-                        "action":      Schema(type=Type.STRING),
-                        "target":      Schema(type=Type.STRING),
-                        "technique":   Schema(type=Type.STRING, nullable=True),
-                        "tactic":      Schema(type=Type.STRING, nullable=True),
-                        "count":       Schema(type=Type.INTEGER),
-                        "timestamp":   Schema(type=Type.STRING, nullable=True),
-                        "duration_ms": Schema(type=Type.INTEGER, nullable=True),
-                        "note":        Schema(type=Type.STRING),
-                    },
-                    required=["step", "image", "guid", "action", "target", "count", "note"],
-                )
-            ),
-            "processes": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "guid":  Schema(type=Type.STRING),
-                        "image": Schema(type=Type.STRING),
-                        "pid":   Schema(type=Type.INTEGER, nullable=True),
-                        "alive": Schema(type=Type.BOOLEAN, nullable=True),
-                        "score": Schema(type=Type.INTEGER),
-                        "role":  Schema(type=Type.STRING),
-                        "kill_priority": Schema(type=Type.INTEGER),
-                    },
-                    required=["guid", "image", "alive", "score", "role","kill_priority"],
-                )
-            ),
-            "iocs": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "type": Schema(type=Type.STRING, enum=[
-                            "ip", "domain", "hash",
-                            "process_name", "cmdline_pattern",
-                            "file_path", "registry_key",
-                            "driver", "dns_query", "user_account",
-                        ]),
-                        "value":   Schema(type=Type.STRING),
-                        "context": Schema(type=Type.STRING),
-                    },
-                    required=["type", "value", "context"],
-                )
-            ),
-            "files": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "path":    Schema(type=Type.STRING),
-                        "event":   Schema(type=Type.STRING, enum=[
-                            "created", "modified", "deleted", "timestomped", "ads"
-                        ]),
-                        "context": Schema(type=Type.STRING),
-                    },
-                    required=["path", "event", "context"],
-                )
-            ),
-            "identities": Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
-            "gaps": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "guid":        Schema(type=Type.STRING),
-                        "implication": Schema(type=Type.STRING),
-                    },
-                    required=["guid", "implication"],
-                )
-            ),
-            "expected_but_missing": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "artifact": Schema(type=Type.STRING),
-                        "reason":   Schema(type=Type.STRING),
-                    },
-                    required=["artifact", "reason"],
-                )
-            ),
-            "noise": Schema(
-                type=Type.ARRAY,
-                items=Schema(
-                    type=Type.OBJECT,
-                    properties={
-                        "artifact": Schema(type=Type.STRING),
-                        "reason":   Schema(type=Type.STRING),
-                    },
-                    required=["artifact", "reason"],
-                )
-            ),
+            "verdict":           Schema(type=Type.STRING, enum=["MALICIOUS", "SUSPICIOUS","BENIGN-CONTEXT"]),
+            "actions":           Schema(type=Type.ARRAY, items=action_schema),
+         
         },
-        required=[
-            "verdict", "severity", "confidence", "attack_name", "summary",
-            "mitre_techniques", "mitre_tactics", "execution_speed", "attack_chain",
-            "processes", "iocs", "files", "identities", "gaps",
-            "expected_but_missing", "noise",
-        ],
+        required=["verdict", "actions"],
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AnalystAgent:
+    # ── PARSER ────────────────────────────────────────────────────────────────
+
+    def _parse(
+        self,
+        raw:      Dict[str, Any],
+        case:     InvestigationCase,
+        subgraph: SubgraphContext,
+    ) -> ResponderOutput:
+
+        verdict = raw.get("verdict", "SUSPICIOUS")
+        if verdict not in ("MALICIOUS", "SUSPICIOUS","BENIGN-CONTEXT"):
+            verdict = "SUSPICIOUS"
+
+        result = ResponderOutput(
+            case_id           = case.case_id,
+            anchor_guid       = subgraph.anchor_guid,
+            analysis_id       = case.case_id,
+            verdict           = verdict,
+            actions           = raw.get("actions",           []),
+        
+            raw_llm_response  = json.dumps(raw),
+        )
+
+        print(
+            f"[Responder] verdict={verdict}  "
+            f"actions={len(result.actions)}  "
+         
+        )
+        return result
 
     def analyse(
         self,
         case:     InvestigationCase,
         subgraph: SubgraphContext,
-    ) -> AttackSummary:
+    ) -> ResponderOutput:
         try:
             prompt  = self._build_prompt(case, subgraph)
             raw     = self._call_llm(prompt)
             summary = self._parse(raw, case, subgraph)
             return summary
         except Exception as exc:
-            print(f"[Analyst][ERROR] case={case.case_id[:8]}: {exc}")
+            print(f"[Responder][ERROR] case={case.case_id[:8]}: {exc}")
             return self._error_summary(case, subgraph, str(exc))
 
     # ── PROMPT ────────────────────────────────────────────────────────────────
@@ -332,7 +262,7 @@ class AnalystAgent:
             parts = [f"  {e.first_seen} -> {e.last_seen.split()[1] if e.last_seen else '?'} {e.rel_type}  score={e.total_score}"]
             parts.append(f"    {_resolve(e.src_id)} → {_resolve(e.dst_id)}")
             if e.count > 1:
-                parts.append(f"    ×{e.count} occurrences  last={e.last_seen}")
+                parts.append(f"    ×{e.count} occurrences  ")
             if e.techniques:
                 parts.append(f"    techniques: {', '.join(e.techniques)}")
             if e.tactics:
@@ -351,7 +281,7 @@ class AnalystAgent:
         if not sg.has_ghost_parents:
             return ""
         ghost_guids = [i.guid for i in sg.instances if i.ghost]
-        lines = ["VISIBILITY GAPS (ghost — spawned children but never directly observed, score=0):"]
+        lines = ["VISIBILITY GAPS (ghost — parentimage from the lookuptable- score=0):"]
         for g in ghost_guids:
             lines.append(f"  guid={g}")
         return "\n".join(lines)
@@ -376,68 +306,31 @@ class AnalystAgent:
 
     def _s_task(self) -> str:
         return """TASK:
-You are a senior threat analyst. Analyse this scored Windows Sysmon process graph.
-Produce a structured attack summary. Your output goes directly to a responder LLM
-that will generate containment actions — give it everything it needs, nothing extra.
+You are a senior threat analyst and SOC responder. Analyse this scored Windows Sysmon
+process graph and produce machine-executable containment actions and graph annotations.
 
-SCORING (enforce strictly — do not override with pattern recognition):
-  ≥10 = MALICIOUS      → verdict must be MALICIOUS
-  5-9 = SUSPICIOUS     → verdict must be SUSPICIOUS
-  1-4 = investigate    → verdict must be SUSPICIOUS with LOW confidence
-    0 = context only   → benign unless part of a confirmed malicious chain
-  Use the highest score across all processes and edges to set verdict.
-  NEVER set verdict=MALICIOUS unless at least one score ≥ 10.
+SCORING:
+  ≥10 = fired on more than 3 Sigma rules
+  5-9 = fired on more than 1 Sigma rule
+  1-4 = fired on one or more low-confidence Sigma rules
+    0 = no Sigma rule fired — structural context only
 
-HOW TO READ:
-  - HASH LOOKUP TABLE is your reference dictionary. Every tmpl= hash and every guid=
-    that appears in PROCESS TREE and BEHAVIOURS is defined there. When you see
-    tmpl=abc123 or guid=xyz, look it up to get image, cmdline, user, parent, and
-    all instances of that process identity.
-  - PROCESS TREE shows spawn hierarchy. Resolve tmpl= and guid= via the table.
-  - BEHAVIOURS is the attack timeline — read it chronologically. Each edge shows
-    image_name (guid=...) so you can immediately see what acted, and look up full
-    context in the table if needed.
-  - techniques/tactics on edges come from Sigma rules — treat them as ground truth.
-  - count on an edge = how many times that action occurred (high count = beaconing,
-    spray, or enumeration — always call this out in attack_chain).
-  - [GHOST:guid] = process appeared in an edge or tree but was never observed directly.
-    Do NOT assert its image, alive status, or any property — state only that it is unknown.
-  - [MISSING:guid] = process appeared in an edge but could not be fetched — note as gap.
+HOW TO READ THE GRAPH:
+  - HASH LOOKUP TABLE: resolve every tmpl= and guid= here to get image/cmdline/user/parent.
+  - PROCESS TREE: spawn hierarchy. Resolve via table.
+  - BEHAVIOURS: attack timeline, read chronologically. techniques/tactics are Sigma ground truth.
+  - count > 1 on an edge = beaconing, spray, or enumeration — always flag in attack_chain.
+  - [GHOST:guid] = never directly observed. State unknown only — assert nothing.
+  - [MISSING:guid] = could not be fetched — note as gap.
+
+ACTION SCOPES (apply strictly):
+  scope=instance       → act on this guid only.
+  scope=all_children   → this guid + every CHILD_OF descendant recursively.
+  scope=all_connected  → terminate any process connected to this ip/domain + perimeter block.
+  scope=template       → kill all live instances of this tmpl hash + block future spawns.
 
 
-PROCESSES:
-  List every process in the graph including noise and ghosts.
- - role: be specific and distinct per process — "WinRM session host", "encoded-command stager",
-    "nested PowerShell second stage", "shutdown utility", "code-page init (noise)".
-  - kill_priority: deepest child in the attack chain = 1, walk up to root.
-    Dead processes, noise, and protected system processes (lsass, csrss, winlogon,
-    services, smss, wininit, System, PID < 1000) = 0.
-    
-IOCS — extract only SPECIFIC, HUNTABLE indicators:
-  - cmdline_pattern: suspicious flag combinations e.g. "-executionpolicy unrestricted -encodedcommand"
-    spawned from a specific parent — this IS a detection rule.
-  - user_account: a domain admin account running encoded PowerShell over WinRM is an IOC.
-  - ip / domain: any CONNECTED artifact destination.
-  - file_path: any CREATED_FILE or WROTE_ADS artifact path.
-  - registry_key: any MODIFIED_REGISTRY artifact path.
-  - driver: any LOADED_DRIVER artifact.
-  - dns_query: any QUERIED_DNS artifact value.
-  - hash: any file hash if available.
-  - process_name: ONLY when combined with specific parent + user + flag pattern — never alone.
-  If the graph has no artifact of a given type, do not invent values.
-  If there are no huntable IOCs, return an empty array.
-
-EXECUTION SPEED — compute from first to last BEHAVIOURS timestamp.
-  Sub-second = automated. State it plainly.
-
-NOISE — every process or artifact NOT part of the attack chain needs a reason here.
-  Don't leave it empty if unused processes exist in the graph.
-
-EXPECTED BUT MISSING — what should logically follow this attack pattern but wasn't observed?
-  C2 beacon after stager, persistence after dropper, cred dump after priv-esc, etc.
-  This tells the responder where to look next.
-
-Return ONLY a valid JSON object matching the schema. No extra text."""
+"""
 
     # ── CMDLINE SUMMARISER ────────────────────────────────────────────────────
 
@@ -465,10 +358,11 @@ Return ONLY a valid JSON object matching the schema. No extra text."""
             model = genai.GenerativeModel(
                 MODEL_NAME,
                 system_instruction=(
-                    "You are an expert EDR threat analyst. You analyse Sysmon telemetry "
-                    "as scored process graphs. Be precise — base every field strictly on "
-                    "evidence present in the prompt. Never invent values for unobserved "
-                    "processes. Return a valid JSON object matching the schema."
+                    "You are a senior threat analyst and SOC responder. You analyse Sysmon "
+                    "telemetry as scored process graphs and produce containment actions and "
+                    "graph annotations. Be precise — base every field strictly on evidence "
+                    "present in the prompt. Never invent targets or unobserved processes. "
+                    "Return a valid JSON object matching the schema."
                 )
             )
 
@@ -498,80 +392,10 @@ Return ONLY a valid JSON object matching the schema. No extra text."""
 
     def _get_fallback_dict(self) -> Dict[str, Any]:
         return {
-            "verdict":              "SUSPICIOUS",
-            "severity":             "MEDIUM",
-            "confidence":           "LOW",
-            "attack_name":          "Analysis Failed",
-            "summary":              "LLM analysis failed. Manual review required.",
-            "confidence_note":      "API error prevented analysis",
-            "mitre_techniques":     [],
-            "mitre_tactics":        [],
-            "execution_speed":      None,
-            "attack_chain":         [],
-            "processes":            [],
-            "iocs":                 [],
-            "files":                [],
-            "identities":           [],
-            "gaps":                 [],
-            "expected_but_missing": [],
-            "noise":                [],
+            "verdict":           "SUSPICIOUS",
+            "actions":           [],
+          
         }
-
-    # ── PARSER ────────────────────────────────────────────────────────────────
-
-    def _parse(
-        self,
-        raw:      Dict[str, Any],
-        case:     InvestigationCase,
-        subgraph: SubgraphContext,
-    ) -> AttackSummary:
-
-        verdict    = raw.get("verdict",    "SUSPICIOUS")
-        severity   = raw.get("severity",   "MEDIUM")
-        confidence = raw.get("confidence", "LOW")
-
-        if verdict    not in ("MALICIOUS", "SUSPICIOUS", "BENIGN"): verdict    = "SUSPICIOUS"
-        if severity   not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"): severity   = "MEDIUM"
-        if confidence not in ("HIGH", "MEDIUM", "LOW"):             confidence = "LOW"
-
-        should_respond = (
-            verdict in _ALWAYS_RESPOND
-            or (verdict in _RESPOND_IF_HIGH and severity in _HIGH_SEVERITIES)
-        )
-
-        summary = AttackSummary(
-            case_id              = case.case_id,
-            anchor_guid          = subgraph.anchor_guid,
-            verdict              = verdict,
-            severity             = severity,
-            confidence           = confidence,
-            attack_name          = raw.get("attack_name", "Unknown"),
-            summary              = raw.get("summary", ""),
-            confidence_note      = raw.get("confidence_note"),
-            mitre_techniques     = raw.get("mitre_techniques",     []),
-            mitre_tactics        = raw.get("mitre_tactics",        []),
-            attack_chain         = raw.get("attack_chain",         []),
-            processes            = raw.get("processes",            []),
-            iocs                 = raw.get("iocs",                 []),
-            files                = raw.get("files",                []),
-            identities           = raw.get("identities",           []),
-            gaps                 = raw.get("gaps",                 []),
-            expected_but_missing = raw.get("expected_but_missing", []),
-            noise                = raw.get("noise",                []),
-            should_respond       = should_respond,
-            raw_llm_response     = json.dumps(raw),
-        )
-
-        print(
-            f"[Analyst] {summary.attack_name}\n"
-            f"  verdict={verdict}  severity={severity}  confidence={confidence}"
-            f"  should_respond={should_respond}\n"
-            f"  chain={len(summary.attack_chain)} steps  "
-            f"procs={len(summary.processes)}  "
-            f"iocs={len(summary.iocs)}  "
-            f"files={len(summary.files)}"
-        )
-        return summary
 
     # ── ERROR ─────────────────────────────────────────────────────────────────
 
@@ -581,18 +405,13 @@ Return ONLY a valid JSON object matching the schema. No extra text."""
         subgraph: SubgraphContext,
         reason:   str,
         raw:      str = "",
-    ) -> AttackSummary:
-        return AttackSummary(
-            case_id          = case.case_id,
-            anchor_guid      = subgraph.anchor_guid,
-            verdict          = "SUSPICIOUS",
-            severity         = "MEDIUM",
-            confidence       = "LOW",
-            attack_name      = f"Analyst error: {reason}",
-            summary          = reason,
-            confidence_note  = None,
-            mitre_techniques = [],
-            mitre_tactics    = [],
-            should_respond   = False,
-            raw_llm_response = raw,
+    ) -> ResponderOutput:
+        return ResponderOutput(
+            case_id           = case.case_id,
+            anchor_guid       = subgraph.anchor_guid,
+            analysis_id       = case.case_id,
+            verdict           = "SUSPICIOUS",
+            actions           = [],
+        
+            raw_llm_response  = raw,
         )
