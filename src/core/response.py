@@ -21,6 +21,7 @@ Response functions:
     file_deletion
     patching
     identity_revocation
+    ip_block
 
 """
 import datetime
@@ -557,7 +558,70 @@ def patching(
     return _gate(mode, "patching", target,
                  f"Patch {target} via {package_manager} (pkgs: {packages})", _patch)
 
+def ip_block(
+    ip_address: str,
+    mode: Mode = "approval",
+    direction: Literal["inbound", "outbound", "both"] = "both",
+    rule_name: Optional[str] = None,
+) -> Dict:
+    """
+    Block network traffic to/from a specific IP address using Windows Firewall.
 
+    Parameters
+    ----------
+    ip_address : The IP address to block (IPv4 or IPv6).
+    direction  : "inbound" | "outbound" | "both" (default).
+    rule_name  : Optional custom rule name. Auto-generated if not provided.
+    """
+    import re
+    IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$")
+    IPV6_RE = re.compile(r"^[0-9a-fA-F:]+(/\d{1,3})?$")
+    if not (IPV4_RE.match(ip_address) or IPV6_RE.match(ip_address)):
+        return _result("error", "ip_block", ip_address,
+                       {"error": f"Invalid IP address format: '{ip_address}'"})
+
+    base_name = rule_name or f"EDR_BLOCK_{ip_address}_{_now()[:10]}"
+    directions = (
+        ["inbound", "outbound"] if direction == "both" else [direction]
+    )
+
+    def _block():
+        results = []
+        for dir_ in directions:
+            name = f"{base_name}_{dir_.upper()}"
+            cmd = [
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={name}",
+                f"dir={dir_}",
+                "action=block",
+                f"remoteip={ip_address}",
+                "enable=yes",
+                "profile=any",
+            ]
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                results.append({
+                    "cmd": " ".join(cmd),
+                    "direction": dir_,
+                    "rule_name": name,
+                    "ok": True,
+                    "stdout": result.stdout.strip(),
+                })
+            except subprocess.CalledProcessError as e:
+                results.append({
+                    "cmd": " ".join(cmd),
+                    "direction": dir_,
+                    "rule_name": name,
+                    "ok": False,
+                    "stderr": e.stderr.strip(),
+                })
+        return {"ip_address": ip_address, "direction": direction, "rules": results}
+
+    return _gate(
+        mode, "ip_block", ip_address,
+        f"Block {direction} traffic for IP '{ip_address}'",
+        _block,
+    )
 
 def identity_revocation(
     identity: str,
