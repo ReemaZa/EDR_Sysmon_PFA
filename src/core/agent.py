@@ -25,6 +25,7 @@ from src.graph.Graph_Builder import GraphBuilder
 # LOGGING SETUP: Log all console output to both console and file
 # ============================================================================
 LOG_DIR = "logs"
+
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"edr_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
@@ -71,11 +72,11 @@ sys.stdout = PrintLogger(LOG_FILE)
 
 # When True  → replay events from LOG_REPLAY_FILE (testing / offline analysis)
 # When False → subscribe to live Sysmon events via EvtSubscribe
-READ_FROM_FILE =False
+READ_FROM_FILE =True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_dataset', 'windows-sysmon-T1003.001.txt'
+    '..', 'tests', 'attack_steps', 'steps.txt'
 )
 
 # ============================================================================
@@ -230,6 +231,7 @@ def process_event(evt: dict) -> None:
             for result in verdict.layer_results:
                 if result.layer_name == "L2-Sigma":
                     graph_detection = result.metadata.get("graph_detection")
+                    print("wssel lahne")
                     break
         graph_builder.process_event(evt, graph_detection)
     except Exception as e:
@@ -312,7 +314,7 @@ def main():
             detection_pipeline.print_stats()
 
             print("[INFO] Log replay completed. Exiting.\n")
-            sys.exit(0)
+            #return 
 
         except Exception as e:
             print(f"[ERROR] Failed to run log replay engine: {e}")
@@ -338,7 +340,7 @@ def main():
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    watcher.start()
+    #watcher.start()
     print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
 
     while not stop_event.is_set():

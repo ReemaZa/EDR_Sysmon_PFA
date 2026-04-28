@@ -50,7 +50,7 @@ from gqlalchemy import Memgraph
 
 MAX_NODES   = 120
 MAX_EDGES   = 200
-HOP_INITIAL = 5
+HOP_INITIAL = 10
 HOP_RESET   = 10
 
 BEHAVIOUR_REL_TYPES = {

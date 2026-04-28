@@ -353,15 +353,13 @@ class GraphBuilder:
             MERGE (p:ProcessInstance {id: $guid})
             ON CREATE SET
                 p.score      = $score,
-                p.ghost      = false,
                 p.alive      = true,
                 p.start_time = $ts
             ON MATCH SET
-                p.score      = p.score + $score,
-                p.ghost      = false,
-                p.start_time = CASE WHEN $was_ghost = true THEN $ts ELSE p.start_time END
+                p.score      = p.score + $score
+            
             """,
-            {"guid": guid, "score": score, "ts": ts, "was_ghost": was_ghost},
+            {"guid": guid, "score": score, "ts": ts},
         )
 
         self._run(
@@ -428,9 +426,7 @@ class GraphBuilder:
         if not parent_guid or not child_guid:
             return
 
-        if not self._instance_exists(parent_guid):
-            # parent never scored — create minimal ghost
-            self._create_ghost(parent_guid)
+   
 
         # wire CHILD_OF (idempotent)
         self._run(
@@ -537,26 +533,34 @@ class GraphBuilder:
         eff = ep["total_score"]
 
         # parent gets its own user, not the child's
-        t_hash=self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
+        p_hash=self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
         t_hash=self._upsert_template(child_image, parent_image, child_cmd, user,
                               description, ts, eff)
+        if parent_guid:
+            self._create_or_promote_instance(
+                guid=parent_guid, image=parent_image,
+                parent_image="", cmdline=parent_cmd,
+                user=parent_user, description="",
+                score=0, timestamp=ts, t_hash=p_hash
+            )
         parent_score = self._get_score(parent_guid)
         delta = int(parent_score * PARENT_INHERITANCE)
 
         eff=eff+delta
-        if eff > 0:
+        #if eff > 0:
+        if child_guid:
             self._create_or_promote_instance(
                 guid=child_guid, image=child_image,
                 parent_image=parent_image, cmdline=child_cmd,
                 user=user, description=description,
                 score=eff, timestamp=ts,t_hash=t_hash
             )
-
-            if child_guid and self._instance_exists(child_guid):
-                self._ensure_parent_and_link(child_guid, parent_guid, ts)
-    
         
-                self._merge_edge(
+
+       
+    
+        self._ensure_parent_and_link(child_guid=child_guid,parent_guid=parent_guid,timestamp=ts)
+        self._merge_edge(
                     src_id=parent_guid, src_label="ProcessInstance",
                     rel_type="CREATED",
                     dst_id=child_guid,  dst_label="ProcessInstance",
@@ -582,9 +586,9 @@ class GraphBuilder:
         eff=ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
             
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -618,9 +622,9 @@ class GraphBuilder:
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
            
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -658,9 +662,9 @@ class GraphBuilder:
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
           
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -697,9 +701,9 @@ class GraphBuilder:
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", "", user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
             
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -730,8 +734,8 @@ class GraphBuilder:
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
-        src_guid  = d.get("SourceProcessGuid") or ""
-        tgt_guid  = d.get("TargetProcessGuid") or ""
+        src_guid  = d.get("SourceProcessGuid")  or d.get("SourceProcessGuid") or ""
+        tgt_guid  = d.get("TargetProcessGuid")  or d.get("TargetProcessGUID") or ""
         src_image = (d.get("SourceImage") or "").lower()
         tgt_image = (d.get("TargetImage") or "").lower()
         src_user  = (d.get("SourceUser")  or "").lower()
@@ -747,9 +751,9 @@ class GraphBuilder:
         src_should_store =  (eff+src_cur_score)> 0  or  (eff+tgt_cur_score)> 0
         src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
         tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
-        if src_should_store:
+        #if src_should_store:
             
-            self._create_or_promote_instance(
+        self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
                 score=eff, timestamp=ts, t_hash=src_t_hash
@@ -759,14 +763,14 @@ class GraphBuilder:
         
             
         
-            self._create_or_promote_instance(
-                guid=tgt_guid, image=tgt_image, parent_image="",
+        self._create_or_promote_instance(
+            guid=tgt_guid, image=tgt_image, parent_image="",
                 cmdline="", user=tgt_user, description="",
                 score=eff, timestamp=ts, t_hash=tgt_t_hash
             )
 
             # Edge only if BOTH instances exist
-            if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
+        if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
                 self._merge_edge(
                     src_id=src_guid, src_label="ProcessInstance",
                     rel_type="INJECTED_THREAD",
@@ -784,8 +788,8 @@ class GraphBuilder:
         ep = self._edge_params(detection)
         ts = d.get("UtcTime") or self._now()
 
-        src_guid  = d.get("SourceProcessGUID") or ""
-        tgt_guid  = d.get("TargetProcessGUID") or ""
+        src_guid  = d.get("SourceProcessGuid")  or d.get("SourceProcessGUID") or ""
+        tgt_guid  = d.get("TargetProcessGuid")  or d.get("TargetProcessGUID")or ""
         src_image = (d.get("SourceImage") or "").lower()
         tgt_image = (d.get("TargetImage") or "").lower()
         src_user  = (d.get("SourceUser")  or "").lower()
@@ -801,9 +805,9 @@ class GraphBuilder:
         # Source - with gate check
         src_should_store =  (eff+src_cur_score)> 0 or (eff+tgt_cur_score)> 0
         
-        if src_should_store:
+        #if src_should_store:
             
-            self._create_or_promote_instance(
+        self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
                 score=eff, timestamp=ts, t_hash=src_t_hash
@@ -813,14 +817,14 @@ class GraphBuilder:
             
             
             
-            self._create_or_promote_instance(
+        self._create_or_promote_instance(
                     guid=tgt_guid, image=tgt_image, parent_image="",
                     cmdline="", user=tgt_user, description="",
                     score=eff, timestamp=ts, t_hash=tgt_t_hash
                 )
 
             # Edge only if BOTH instances exist
-            if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
+        if self._instance_exists(src_guid) and self._instance_exists(tgt_guid):
                 self._merge_edge(
                     src_id=src_guid, src_label="ProcessInstance",
                     rel_type="ACCESSED_MEMORY",
@@ -846,9 +850,9 @@ class GraphBuilder:
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
             
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -884,9 +888,9 @@ class GraphBuilder:
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         cur_score = self._get_score(guid)
 
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
             
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -926,8 +930,8 @@ class GraphBuilder:
         cur_score = self._get_score(guid)
         t_hash = self._upsert_template(image, "", cmd, user, "", ts, eff)
         # Gate check FIRST
-        if not (eff+cur_score)> 0:
-            return
+        #if not (eff+cur_score)> 0:
+        #    return
 
         
         self._create_or_promote_instance(
@@ -962,8 +966,8 @@ class GraphBuilder:
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
         cur_score = self._get_score(guid)
 
-        if not (eff+cur_score)> 0:
-            return
+        #if not (eff+cur_score)> 0:
+        #    return
 
         
         self._create_or_promote_instance(
@@ -997,9 +1001,9 @@ class GraphBuilder:
         eff       = ep["total_score"]
         cur_score = self._get_score(guid)
         t_hash=self._upsert_template(image, "", cmd, user, "", ts, eff)
-        if not (eff+cur_score)> 0:
+        #if not (eff+cur_score)> 0:
            
-            return
+        #    return
 
         
         self._create_or_promote_instance(
@@ -1027,7 +1031,7 @@ class GraphBuilder:
        ts = d.get("UtcTime") or self._now()
 
        atk_guid  = d.get("ProcessGuid")       or ""
-       vic_guid  = d.get("TargetProcessGuid") or ""
+       vic_guid  = d.get("TargetProcessGuid")  or d.get("TargetProcessGUID")or ""
        atk_image = (d.get("Image")        or "").lower()
        vic_image = (d.get("TargetImage")  or "").lower()
        atk_user  = (d.get("User")         or "").lower()
@@ -1042,9 +1046,9 @@ class GraphBuilder:
        # Attacker - with gate check
        atk_should_store =(eff+atk_cur_score)> 0 or (eff+vic_cur_score)> 0
        vic_t_hash = self._upsert_template(vic_image, "", "", vic_user, "", ts, eff )
-       if atk_should_store:
+       #if atk_should_store:
            
-           self._create_or_promote_instance(
+       self._create_or_promote_instance(
                guid=atk_guid, image=atk_image, parent_image="",
                cmdline="", user=atk_user, description="",
                score=eff, timestamp=ts, t_hash=atk_t_hash
@@ -1053,15 +1057,15 @@ class GraphBuilder:
        # Victim - with gate check
            
         
-           self._create_or_promote_instance(
+       self._create_or_promote_instance(
                     guid=vic_guid, image=vic_image, parent_image="",
                     cmdline="", user=vic_user, description="",
                     score=eff, timestamp=ts, t_hash=vic_t_hash
                 )
 
        # Edge only if BOTH instances exist
-           if self._instance_exists(atk_guid) and self._instance_exists(vic_guid):
-               self._merge_edge(
+       if self._instance_exists(atk_guid) and self._instance_exists(vic_guid):
+            self._merge_edge(
                    src_id=atk_guid, src_label="ProcessInstance",
                    rel_type="TAMPERED",
                    dst_id=vic_guid, dst_label="ProcessInstance",

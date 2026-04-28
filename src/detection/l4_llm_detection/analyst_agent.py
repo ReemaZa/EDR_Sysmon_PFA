@@ -54,7 +54,7 @@ def get_response_schema() -> "Schema":
             "type":         Schema(type=Type.STRING, enum=[
                                 "process_termination", "blacklist",
                                 "file_quarantine", "file_deletion",
-                                "alert", "BLOCK_IP", "BLOCK_DOMAIN",
+                             "BLOCK_IP", "BLOCK_DOMAIN","nothing","alert"
                             ]),
             "target_type":  Schema(type=Type.STRING, enum=[
                                 "guid", "tmpl", "file",
@@ -63,7 +63,7 @@ def get_response_schema() -> "Schema":
             "target_value": Schema(type=Type.STRING),
             "scope":        Schema(type=Type.STRING, enum=[
                                 "instance", "all_children",
-                                "all_connected", "template",
+                                "all_connected", "template"
                             ]),
             "reason":       Schema(type=Type.STRING),
         },
@@ -139,8 +139,8 @@ class AnalystAgent:
             self._s_lookup_table(subgraph),
             self._s_process_tree(subgraph),
             self._s_behaviours(subgraph),
-            self._s_gaps(subgraph),
-            self._s_previous(case),
+            #self._s_gaps(subgraph),
+            #self._s_previous(case),
             self._s_task(),
         ]
         return "\n\n".join(s for s in sections if s)
@@ -178,7 +178,7 @@ class AnalystAgent:
             parts = [f"  tmpl={t_short}", f"image={tmpl.image or '?'}"]
             if tmpl.parent_image: parts.append(f"spawned-by={tmpl.parent_image}")
             if tmpl.user:         parts.append(f"user={tmpl.user}")
-            if tmpl.cmdline:      parts.append(f"cmdline={self._summarise_cmdline(tmpl.cmdline)}")
+            if tmpl.cmdline:      parts.append(f"cmdline={tmpl.cmdline}")
             lines.append("  |  ".join(parts))
 
             for g in guids:
@@ -213,7 +213,7 @@ class AnalystAgent:
 
             if inst.ghost or not t:
                 lines.append(
-                    f"{prefix}[GHOST — not in lookup table]"
+                    f"{prefix}"
                     f"  score={inst.score}  guid={inst.guid}{tag_str}"
                 )
             else:
@@ -260,7 +260,13 @@ class AnalystAgent:
         lines = ["BEHAVIOURS (chronological):"]
         for e in sorted_edges:
             parts = [f"  {e.first_seen} -> {e.last_seen.split()[1] if e.last_seen else '?'} {e.rel_type}  score={e.total_score}"]
-            parts.append(f"    {_resolve(e.src_id)} → {_resolve(e.dst_id)}")
+            src=_resolve(e.src_id)
+            if "GHOST" in src:
+                inst = inst_map.get(e.dst_id)
+                t = (sg.templates.get(inst.template_hash)).parent_image
+                src=f"{t}  (guid={src})"
+                
+            parts.append(f"    {src} → {_resolve(e.dst_id)}")
             if e.count > 1:
                 parts.append(f"    ×{e.count} occurrences  ")
             if e.techniques:
@@ -320,14 +326,15 @@ HOW TO READ THE GRAPH:
   - PROCESS TREE: spawn hierarchy. Resolve via table.
   - BEHAVIOURS: attack timeline, read chronologically. techniques/tactics are Sigma ground truth.
   - count > 1 on an edge = beaconing, spray, or enumeration — always flag in attack_chain.
-  - [GHOST:guid] = never directly observed. State unknown only — assert nothing.
   - [MISSING:guid] = could not be fetched — note as gap.
 
 ACTION SCOPES (apply strictly):
   scope=instance       → act on this guid only.
-  scope=all_children   → this guid + every CHILD_OF descendant recursively.
+  scope=all_children   → this guid + every CHILD_OF descendant or future coming CHILD_OF recursively.
   scope=all_connected  → terminate any process connected to this ip/domain + perimeter block.
   scope=template       → kill all live instances of this tmpl hash + block future spawns.
+REASON:
+ explain every choice you made : for the action -scope and priority 
 
 
 """
