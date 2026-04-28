@@ -22,21 +22,27 @@ WHAT WAS REMOVED from templates:
 """
 from __future__ import annotations
 
-
+import os
 from datetime import datetime
 import json
 from typing import Any, Dict, List, Optional
-from src.detection.l4_llm_detection.l4_models import (
-    InvestigationCase,
-    SubgraphContext,
-    ResponderOutput,       # ← your new output model (add this to l4_models too)
-)
 
+from dotenv import load_dotenv
+
+from src.detection.l4_llm_detection.l4_models import ResponderOutput
+from src.detection.l4_llm_detection.graph_extractor import SubgraphContext
 
 import google.generativeai as genai
 
-GEMINI_API_KEY = "AIzaSyBROiWkb-q3P7op_Lxjyk6Nmda1CFoen48"
-MODEL_NAME     = "gemini-3.1-flash-lite-preview"
+# Load environment variables from .env file
+load_dotenv()
+
+# Retrieve API key from environment
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY:
+    raise EnvironmentError("[AnalystAgent] GEMINI_API_KEY environment variable is not set.")
+
+MODEL_NAME = "gemini-3.1-flash-lite-preview"
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -92,50 +98,39 @@ class AnalystAgent:
     def _parse(
         self,
         raw:      Dict[str, Any],
-        case:     InvestigationCase,
         subgraph: SubgraphContext,
     ) -> ResponderOutput:
 
         verdict = raw.get("verdict", "SUSPICIOUS")
-        if verdict not in ("MALICIOUS", "SUSPICIOUS","BENIGN-CONTEXT"):
+        if verdict not in ("MALICIOUS", "SUSPICIOUS", "BENIGN-CONTEXT"):
             verdict = "SUSPICIOUS"
-
         result = ResponderOutput(
-            case_id           = case.case_id,
-            anchor_guid       = subgraph.anchor_guid,
-            analysis_id       = case.case_id,
-            verdict           = verdict,
-            actions           = raw.get("actions",           []),
-        
-            raw_llm_response  = json.dumps(raw),
+            anchor_guid      = subgraph.anchor_guid,
+            verdict          = verdict,
+            actions          = raw.get("actions", []),
+            raw_llm_response = json.dumps(raw),
         )
-
-        print(
-            f"[Responder] verdict={verdict}  "
-            f"actions={len(result.actions)}  "
-         
-        )
+        print(f"[AnalystAgent] verdict={verdict}  actions={len(result.actions)}")
         return result
+    
 
     def analyse(
         self,
-        case:     InvestigationCase,
         subgraph: SubgraphContext,
     ) -> ResponderOutput:
         try:
-            prompt  = self._build_prompt(case, subgraph)
-            raw     = self._call_llm(prompt)
-            summary = self._parse(raw, case, subgraph)
-            return summary
+            prompt = self._build_prompt(subgraph)
+            raw    = self._call_llm(prompt)
+            return self._parse(raw, subgraph)
         except Exception as exc:
-            print(f"[Responder][ERROR] case={case.case_id[:8]}: {exc}")
-            return self._error_summary(case, subgraph, str(exc))
+            print(f"[AnalystAgent][ERROR] anchor={subgraph.anchor_guid[:20]}: {exc}")
+            return self._error_output(subgraph, str(exc))
 
     # ── PROMPT ────────────────────────────────────────────────────────────────
 
-    def _build_prompt(self, case: InvestigationCase, subgraph: SubgraphContext) -> str:
+    def _build_prompt(self, subgraph: SubgraphContext) -> str:
         sections = [
-            self._s_header(case, subgraph),
+            self._s_header(subgraph),
             self._s_lookup_table(subgraph),
             self._s_process_tree(subgraph),
             self._s_behaviours(subgraph),
@@ -147,7 +142,7 @@ class AnalystAgent:
 
     # ── SECTION 1: HEADER ─────────────────────────────────────────────────────
 
-    def _s_header(self, case: InvestigationCase, sg: SubgraphContext) -> str:
+    def _s_header(self,  sg: SubgraphContext) -> str:
         return (
             f"GRAPH: {len(sg.instances)} processes  "
             f"{len(sg.artifacts)} artifacts  {sg.total_edges} edges"
@@ -294,7 +289,7 @@ class AnalystAgent:
 
     # ── SECTION 6: PREVIOUS ───────────────────────────────────────────────────
 
-    def _s_previous(self, case: InvestigationCase) -> str:
+    '''def _s_previous(self, case: InvestigationCase) -> str:
         if not case.previous_finding:
             return ""
         pf = case.previous_finding
@@ -306,7 +301,7 @@ class AnalystAgent:
             lines.append(f"  techniques: {', '.join(pf.mitre_techniques)}")
         if pf.narrative:
             lines.append(f"  summary: {pf.narrative[:250]}")
-        return "\n".join(lines)
+        return "\n".join(lines)'''
 
     # ── SECTION 7: TASK ───────────────────────────────────────────────────────
 
@@ -356,10 +351,17 @@ REASON:
     # ── LLM CALL ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str) -> Dict[str, Any]:
-        filename = f"prompts/prompt_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(prompt)
-        print(f"[Analyst] prompt → {filename}  ({len(prompt)} chars)")
+        import os
+        
+        # Save prompt
+        try:
+            os.makedirs("prompts", exist_ok=True)
+            filename = f"prompts/prompt_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            print(f"[Analyst] prompt saved → {filename}  ({len(prompt)} chars)")
+        except Exception as exc:
+            print(f"[Analyst][ERROR] Failed to save prompt: {exc}")
 
         try:
             model = genai.GenerativeModel(
@@ -386,10 +388,14 @@ REASON:
 
             result = json.loads(response.text)
 
-            response_file = f"prompts/response_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(response_file, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2)
-            print(f"[Analyst] structured response → {response_file}")
+            # Save response
+            try:
+                response_file = f"prompts/response_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(response_file, "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=2)
+                print(f"[Analyst] response saved → {response_file}")
+            except Exception as exc:
+                print(f"[Analyst][ERROR] Failed to save response: {exc}")
 
             return result
 
@@ -407,18 +413,10 @@ REASON:
     # ── ERROR ─────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _error_summary(
-        case:     InvestigationCase,
-        subgraph: SubgraphContext,
-        reason:   str,
-        raw:      str = "",
-    ) -> ResponderOutput:
+    def _error_output(subgraph: SubgraphContext, reason: str) -> ResponderOutput:
         return ResponderOutput(
-            case_id           = case.case_id,
-            anchor_guid       = subgraph.anchor_guid,
-            analysis_id       = case.case_id,
-            verdict           = "SUSPICIOUS",
-            actions           = [],
-        
-            raw_llm_response  = raw,
+            anchor_guid      = subgraph.anchor_guid,
+            verdict          = "SUSPICIOUS",
+            actions          = [],
+            raw_llm_response = reason,
         )

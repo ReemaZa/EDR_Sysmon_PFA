@@ -6,178 +6,26 @@ Every other L4 module imports from here.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INVESTIGATION STATE MACHINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-class InvestigationStatus(Enum):
-    PENDING       = "PENDING"        # queued, not yet picked up
-    INVESTIGATING = "INVESTIGATING"  # analyst is running
-    WATCHING      = "WATCHING"       # concluded, monitoring for re-trigger
-    CLOSED        = "CLOSED"         # no new activity for WATCH_HOURS
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SUBGRAPH CONTEXT  (GraphExtractor → AnalystAgent)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class InstanceNode:
-    """ProcessInstance with its template fields resolved."""
-    guid:         str
-    score:        int
-    ghost:        bool
-    alive:        bool
-    start_time:   Optional[str]
-    end_time:     Optional[str]
-    image:        Optional[str]
-    parent_image: Optional[str]
-    cmdline:      Optional[str]
-    user:         Optional[str]
-    description:  Optional[str]
-
-
-@dataclass
-class ArtifactNode:
-    """Non-process node: File | Network | Registry | DNS | Driver."""
-    id:    str
-    label: str
-    extra: Dict[str, Any] = field(default_factory=dict)
 @dataclass
 class ResponderOutput:
-    case_id:           str
     anchor_guid:       str
-    analysis_id:       str
     verdict:           str                  # "MALICIOUS" | "SUSPICIOUS"
     actions:           List[Dict[str, Any]] # executor reads this
     raw_llm_response:  str
+    analysis_id:       str = field(default_factory=lambda: str(uuid.uuid4()))
 
+
+
+# analysis_id and case_id are kept for logging/file output only
 @dataclass
-class BehaviourEdge:
-    """Scored behaviour edge between two graph nodes."""
-    src_id:      str
-    dst_id:      str
-    rel_type:    str
-    total_score: int
-    count:       int
-    first_seen:  str
-    last_seen:   str
-    techniques:  List[str]
-    tactics:     List[str]
-    finding_ids: List[str]
-    extra:       Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class SubgraphContext:
-    """
-    Complete context package for one investigation case.
-    Built by GraphExtractor, consumed by AnalystAgent.
-    """
-    anchor_guid:       str
-    anchor_score:      int
-    instances:         List[InstanceNode]   = field(default_factory=list)
-    artifacts:         List[ArtifactNode]   = field(default_factory=list)
-    edges:             List[BehaviourEdge]  = field(default_factory=list)
-    timeline:          List[Dict[str, str]] = field(default_factory=list)
-    has_ghost_parents: bool = False
-    total_nodes:       int  = 0
-    total_edges:       int  = 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANALYST FINDING  (output of AnalystAgent)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class AnalystFinding:
-    """Structured output from the Analyst agent."""
-    case_id:               str
-    anchor_guid:           str
-    severity:              str   # CRITICAL | HIGH | MEDIUM | LOW
-    confidence:            str   # HIGH | MEDIUM | LOW
-    verdict:               str   # MALICIOUS | SUSPICIOUS | BENIGN
-    narrative:             str
-    mitre_techniques:      List[str]
-    mitre_tactics:         List[str]
-    patient_zero_guid:     Optional[str]
-    active_guid:           Optional[str]
-    false_positive_reason: Optional[str]
-    raw_llm_response:      str
-    produced_at:           str = field(
-        default_factory=lambda: datetime.utcnow().isoformat()
-    )
-
-@dataclass
-class AttackSummary:
-    """
-    Output of LLM 1. Passed directly to ResponderAgent.
-    Contains everything the responder needs, nothing it doesn't.
-    """
-    case_id:          str
+class AnalysisRecord:
+    analysis_id:      str
     anchor_guid:      str
-    verdict:          str             # MALICIOUS | SUSPICIOUS | BENIGN
-    severity:         str             # CRITICAL | HIGH | MEDIUM | LOW
-    confidence:       str             # HIGH | MEDIUM | LOW
-    attack_name:      str
-    summary:          str             # 3-sentence max: what, why, key evidence
-    confidence_note:  Optional[str]   # missing telemetry, or null
-    mitre_techniques: List[str]       # ["T1059.001", …]
-    mitre_tactics:    List[str]       # ["execution", …]
-
-    # Attack chain — ordered steps, one per edge/spawn event
-    # [{ step, image, guid, action, target, technique, tactic, count }]
-    attack_chain: List[Dict] = field(default_factory=list)
-
-    # Processes and their roles
-    # [{ guid, image, pid, alive, score, role }]
-    # role: patient_zero | c2_beacon | injector | injected | dropper | lateral | suspicious
-    processes: List[Dict] = field(default_factory=list)
-
-    # Raw IOCs — responder decides the action
-    # [{ type: ip|domain|hash|process_name, value, context }]
-    iocs: List[Dict] = field(default_factory=list)
-
-    # Files touched — responder decides quarantine vs deletion
-    # [{ path, event: created|modified|deleted|timestomped|ads, context }]
-    files: List[Dict] = field(default_factory=list)
-
-    # Windows accounts used or created by attacker
-    identities: List[str] = field(default_factory=list)
-
-    # Ghost guids and what they hide
-    # [{ guid, implication }]
-    gaps: List[Dict] = field(default_factory=list)
-
-    # ── Handoff control ───────────────────────────────────────────────────────
-    should_respond:   bool = False
-    raw_llm_response: str  = ""
-    expected_but_missing: List[Dict[str, str]] = field(default_factory=list)
-    noise: List[Dict[str, str]] = field(default_factory=list)
-    execution_speed :str=""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INVESTIGATION CASE
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class InvestigationCase:
-    """One unit of work in the investigation queue."""
-    case_id:          str
-    anchor_guid:      str
-    trigger_score:    int
-    trigger_time:     str
-    status:           InvestigationStatus = InvestigationStatus.PENDING
-
-    graph_updated:    bool = False   # set by push() while INVESTIGATING
-    update_count:     int  = 0
-
-    finding:          Optional[AnalystFinding] = None
-    watching_since:   Optional[str]            = None
-    previous_finding: Optional[AnalystFinding] = None
+    verdict:          str
+    actions:          List[Dict[str, Any]]
+    raw_llm_response: str

@@ -2,42 +2,46 @@
 threat_analyst.py  —  Graph-based threat analyst (L4 detection layer).
 
 RESPONSIBILITY:
-    - Start a background daemon thread on construction (no separate start() call needed)
-    - Every QUERY_INTERVAL seconds (tick):
-        1. Query Memgraph for ProcessInstance nodes with score >= THREAT_THRESHOLD
-        2. Push each qualifying node to the InvestigationQueue
-        3. Drain all PENDING cases: extract subgraph → run AnalystAgent
-        4. Age WATCHING cases (WATCHING → CLOSED after WATCH_HOURS)
-        5. Save AnalystFindings to l4_findings.json
+    - Start a background daemon thread on construction
+    - Every query_interval seconds (tick):
+        1. Query Memgraph for ProcessInstance nodes with:
+               score >= threshold
+           AND (last_analysed_score IS NULL OR score > last_analysed_score)
+        2. Extract one subgraph covering all qualifying nodes
+        3. Split the subgraph into connected components
+        4. For each component run one sequential LLM call
+        5. Write verdict + last_analysed_score back to every node
+           in the component
+        6. Save findings to l4_findings.json
 
-DESIGN NOTES:
-    - This engine has NO per-event interface. It is not called for each Sysmon
-      event. It works purely on the accumulated state of the graph.
-    - The pipeline's process_event() does NOT call into this engine at all —
-      the engine runs independently on its own timer.
-    - shutdown() must be called on program exit (DetectionPipeline.shutdown()
-      already does this when enable_l4=True).
-
-CONFIGURATION:
-    All parameters are set in the constructor and cannot be changed after start.
-    query_interval   : seconds between graph scans          (default 30)
-    threat_threshold : minimum ProcessInstance.score        (default 5)
-    max_subgraph_nodes: hard cap on nodes sent to analyst   (default 120)
+DESIGN:
+    - No investigation queue, no state machine.
+    - "Should this be re-analysed?" is answered entirely by comparing
+      p.score vs p.last_analysed_score on the node itself.
+    - Sequential LLM calls per component (no concurrency for now).
+    - shutdown() must be called on program exit.
 """
 from __future__ import annotations
-import sys 
+
 import json
+import sys
 import threading
 import time
+import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from gqlalchemy import Memgraph
 
 from src.detection.l4_llm_detection.analyst_agent import AnalystAgent
-from src.detection.l4_llm_detection.graph_extractor import GraphExtractor
-from src.detection.l4_llm_detection.investigation_queue import InvestigationQueue
-from src.detection.l4_llm_detection.l4_models import AttackSummary, ResponderOutput
+from src.detection.l4_llm_detection.graph_extractor import (
+    GraphExtractor,
+    SubgraphContext,
+    InstanceNode,
+    ArtifactNode,
+    BehaviourEdge,
+)
+from src.detection.l4_llm_detection.l4_models import ResponderOutput
 from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
 
 FINDINGS_FILE = "l4_findings.json"
@@ -48,40 +52,39 @@ class ThreatAnalyst:
     Graph-based threat analyst — starts automatically on construction.
 
     Lifecycle:
-        analyst = ThreatAnalyst(query_interval=30, threat_threshold=5)
+        analyst = ThreatAnalyst(query_interval=30, threat_threshold=4)
         # background thread is already running
         ...
-        analyst.shutdown()   # call on exit
+        analyst.shutdown()
     """
 
     def __init__(
         self,
-        query_interval:    int = 30,
-        threat_threshold:  int = 4,
+        query_interval:     int = 30,
+        threat_threshold:   int = 4,
         max_subgraph_nodes: int = 120,
     ):
-        self.query_interval    = query_interval
-        self.threat_threshold  = threat_threshold
+        self.query_interval     = query_interval
+        self.threat_threshold   = threat_threshold
         self.max_subgraph_nodes = max_subgraph_nodes
 
-        # ── NEW LOGGING SETUP ───────────────────────────────────────────
+        # Logging
+        import os
+        os.makedirs("logs", exist_ok=True)
         self.log_file_path = f"logs/l4_analyst_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        # Open the file in append mode
-        self._log_handle = open(self.log_file_path, "a", encoding="utf-8")
-        self._log_lock = threading.Lock()
-        # ────────────────────────────────────────────────────────────────
+        self._log_handle   = open(self.log_file_path, "a", encoding="utf-8")
+        self._log_lock     = threading.Lock()
+
         # Components
         self._db        = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
-        self._queue     = InvestigationQueue()
         self._extractor = GraphExtractor(self._db)
         self._analyst   = AnalystAgent()
 
         # Stats
         self._stats = {
-            "ticks":           0,
-            "triggers_pushed": 0,
-            "cases_analysed":  0,
-            "findings":        0,
+            "ticks":          0,
+            "components_analysed": 0,
+            "findings":       0,
         }
 
         # Thread
@@ -91,8 +94,6 @@ class ThreatAnalyst:
             name="ThreatAnalyst",
             daemon=True,
         )
-
-        # Start immediately — caller does not need to call start()
         self._thread.start()
         self._log(
             f"[ThreatAnalyst] Started — "
@@ -100,30 +101,25 @@ class ThreatAnalyst:
             f"threshold={self.threat_threshold}"
         )
 
+    # ── LOGGING ───────────────────────────────────────────────────────────────
+
     def _log(self, message: str):
-        """Custom logging method that bypasses the global sys.stdout."""
         timestamp = datetime.utcnow().isoformat()
-        formatted_message = f"[{timestamp}] {message}\n"
-        
+        formatted = f"[{timestamp}] {message}\n"
         with self._log_lock:
-            # 1. Write to L4-specific file
-            self._log_handle.write(formatted_message)
+            self._log_handle.write(formatted)
             self._log_handle.flush()
-            
-            # 2. Write to the ORIGINAL terminal (bypasses agent.py's PrintLogger)
-            # This ensures it shows on screen but NOT in the main agent log file.
-            sys.__stdout__.write(formatted_message)
+            sys.__stdout__.write(formatted)
             sys.__stdout__.flush()
+
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
-        self._log("Shutting down...")
+        self._log("[ThreatAnalyst] Shutting down...")
         self._stop_event.set()
         self._thread.join(timeout=self.query_interval + 5)
-        # Close the log handle safely
         with self._log_lock:
             self._log_handle.close()
-        self._log("Stopped.")
 
     # ── BACKGROUND LOOP ───────────────────────────────────────────────────────
 
@@ -149,90 +145,57 @@ class ThreatAnalyst:
         n = self._stats["ticks"]
         self._log(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
 
-        # 1. Scan graph for qualifying nodes
-        triggered = self._scan_graph()
-        self._log(f"[ThreatAnalyst] {len(triggered)} node(s) above "
-                  f"threshold={self.threat_threshold}")
+        # 1. Find all nodes that qualify and have changed since last analysis
+        candidates = self._scan_graph()
+        self._log(f"[ThreatAnalyst] {len(candidates)} candidate(s) above threshold "
+                  f"with score change since last analysis")
+        if not candidates:
+            return
 
-        # 2. Push all triggers to the queue
-        for guid, score in triggered:
-            self._queue.push(guid, score)
-            self._stats["triggers_pushed"] += 1
+        # 2. Extract one big subgraph covering all candidates
+        anchor_guid    = candidates[0][0]
+        to_investigate = {guid for guid, _ in candidates[1:]}
 
-        # 3. Process batches until no PENDING cases remain
-        while True:
-            pending = self._queue.pop_all_pending()
-            if not pending:
-                break
+        subgraph = self._extractor.extract(
+            anchor_guid=anchor_guid,
+            to_investigate=to_investigate,
+        )
+        if subgraph is None:
+            self._log("[ThreatAnalyst] Subgraph extraction returned None — skipping tick")
+            return
 
-            anchor_item    = pending[0]
-            rest           = pending[1:]
-            to_investigate = {item.anchor_guid for item in rest}
+        # 3. Split into connected components
+        components = self._split_components(subgraph)
+        self._log(f"[ThreatAnalyst] {len(components)} connected component(s) found")
 
-            self._queue.mark_investigating(anchor_item)
-            self._stats["cases_analysed"] += 1
-
-            self._log(f"[ThreatAnalyst] Extracting subgraph  "
-                      f"case={anchor_item.case_id[:8]}  "
-                      f"anchor={anchor_item.anchor_guid[:20]}  "
-                      f"to_investigate={len(to_investigate)}")
-
-            subgraph = self._extractor.extract(
-                anchor_guid    = anchor_item.anchor_guid,
-                to_investigate = to_investigate,
+        # 4. One sequential LLM call per component
+        for idx, component in enumerate(components, 1):
+            self._log(
+                f"[ThreatAnalyst] Analysing component {idx}/{len(components)} — "
+                f"nodes={component.total_nodes}  edges={component.total_edges}  "
+                f"anchor={component.anchor_guid[:20]}"
             )
-
-            if subgraph is None:
-                self._log(f"[ThreatAnalyst][WARN] No subgraph returned — concluding empty")
-               
-             
-                for item in rest:
-                    self._queue.push(item.anchor_guid, item.trigger_score)
-                continue
-
-            self._log(f"[ThreatAnalyst] Running analyst  "
-                      f"case={anchor_item.case_id[:8]}  "
-                      f"nodes={subgraph.total_nodes}  edges={subgraph.total_edges}")
-
-            finding = self._analyst.analyse(anchor_item, subgraph)
+            finding = self._analyst.analyse(component)
+            self._stats["components_analysed"] += 1
             self._stats["findings"] += 1
 
-            # 4. Conclude anchor
-            self._queue.conclude(anchor_item, finding)
+            # 5. Write verdict back to every instance node in this component
+            self._apply_verdict(component, finding)
 
-            # 5. Conclude absorbed items under the same finding
-            for item in rest:
-                if item.anchor_guid not in subgraph.unvisited_guids:
-                    self._queue.conclude(item, finding)
-
+            # 6. Persist finding
             self._save_finding(finding)
             self._print_finding(finding)
 
-            # 6. Re-push unvisited items — they become anchors next iteration
-            for item in rest:
-                if item.anchor_guid in subgraph.unvisited_guids:
-                    self._queue.push(item.anchor_guid, item.trigger_score)
-            self._log(
-            f"[SUBGRAPH GUIDS]\n"
-            
-            f"  visited   ({len(subgraph.instances)}): "
-            f"{[i.guid for i in subgraph.instances]}\n"
-            f"  unvisited ({len(subgraph.unvisited_guids)}): "
-            f"{list(subgraph.unvisited_guids)}"
-        )
-        # 7. Age WATCHING cases
-        closed = self._queue.tick_watching()
-        if closed:
-            self._log(f"[ThreatAnalyst] Closed {len(closed)} watched case(s)")
-
-        self._log(f"[ThreatAnalyst] Queue state: {self._queue.get_stats()}")
-       
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
 
-    def _scan_graph(self) -> List[tuple[str, int]]:
+    def _scan_graph(self) -> List[Tuple[str, int]]:
         """
-        Find ProcessInstance nodes with score >= threshold.
-        Excludes ghosts and nodes already under active investigation.
+        Find ProcessInstance nodes that:
+          - have score >= threshold
+          - are not ghosts
+          - have a score that changed since the last LLM analysis
+            (last_analysed_score IS NULL  OR  score > last_analysed_score)
+
         Returns list of (guid, score) sorted by score descending.
         """
         try:
@@ -241,6 +204,10 @@ class ThreatAnalyst:
                 MATCH (p:ProcessInstance)
                 WHERE p.score >= $threshold
                   AND (p.ghost IS NULL OR p.ghost = false)
+                  AND (
+                    p.last_analysed_score IS NULL
+                    OR p.score > p.last_analysed_score
+                  )
                 RETURN p.id AS guid, p.score AS score
                 ORDER BY p.score DESC
                 """,
@@ -250,89 +217,158 @@ class ThreatAnalyst:
             self._log(f"[ThreatAnalyst][SCAN FAIL] {exc}")
             return []
 
-        # Exclude GUIDs already under active investigation
-        active = {
-            c.anchor_guid
-            for c in self._queue.all_cases()
-            if c.status.value in ("INVESTIGATING", "WATCHING")
-        }
-
         return [
             (row["guid"], int(row["score"] or 0))
             for row in rows
-            if row.get("guid") and row["guid"] not in active
+            if row.get("guid")
         ]
+
+    # ── CONNECTED COMPONENTS ──────────────────────────────────────────────────
+
+    def _split_components(self, subgraph: SubgraphContext) -> List[SubgraphContext]:
+        """
+        Split a SubgraphContext into independent connected components
+        using union-find on the edge list.
+        Each component becomes its own SubgraphContext for a separate LLM call.
+        """
+        all_ids = (
+            {i.guid for i in subgraph.instances} |
+            {a.id   for a in subgraph.artifacts}
+        )
+
+        # Union-Find
+        parent = {n: n for n in all_ids}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]   # path compression
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str):
+            parent[find(a)] = find(b)
+
+        for edge in subgraph.edges:
+            if edge.src_id in parent and edge.dst_id in parent:
+                union(edge.src_id, edge.dst_id)
+
+        # Group node IDs by their root
+        groups: Dict[str, Set[str]] = {}
+        for node_id in all_ids:
+            root = find(node_id)
+            groups.setdefault(root, set()).add(node_id)
+
+        # Build one SubgraphContext per group
+        components: List[SubgraphContext] = []
+        for node_ids in groups.values():
+            instances = [i for i in subgraph.instances if i.guid  in node_ids]
+            artifacts = [a for a in subgraph.artifacts  if a.id   in node_ids]
+            edges     = [e for e in subgraph.edges
+                         if e.src_id in node_ids and e.dst_id in node_ids]
+            templates = {
+                h: t for h, t in subgraph.templates.items()
+                if any(i.template_hash == h for i in instances)
+            }
+
+            # Pick anchor = highest scoring instance in this component
+            anchor_inst = max(instances, key=lambda i: i.score)
+
+            # Rebuild process tree for this component only
+            process_tree = {
+                guid: children
+                for guid, children in subgraph.process_tree.items()
+                if guid in node_ids
+            }
+            tree_roots = [
+                guid for guid in subgraph.tree_roots
+                if guid in node_ids
+            ]
+
+            components.append(SubgraphContext(
+                anchor_guid       = anchor_inst.guid,
+                anchor_score      = anchor_inst.score,
+                instances         = instances,
+                templates         = templates,
+                artifacts         = artifacts,
+                edges             = edges,
+                timeline          = [
+                    e for e in subgraph.timeline
+                    if e.get("src") in node_ids or e.get("dst") in node_ids
+                ],
+                has_ghost_parents = any(i.ghost for i in instances),
+                total_nodes       = len(instances) + len(artifacts),
+                total_edges       = len(edges),
+                unvisited_guids   = set(),
+                process_tree      = process_tree,
+                tree_roots        = tree_roots,
+            ))
+
+        # Sort components by anchor score descending so highest-risk runs first
+        components.sort(key=lambda c: -c.anchor_score)
+        return components
+
+    # ── APPLY VERDICT ─────────────────────────────────────────────────────────
+
+    def _apply_verdict(self, component: SubgraphContext, result: ResponderOutput) -> None:
+        """
+        Write last_analysed_score, last_verdict, last_analysed_at
+        back onto every ProcessInstance node in this component.
+        """
+        ts = datetime.utcnow().isoformat()
+        for inst in component.instances:
+            try:
+                self._db.execute(
+                    """
+                    MATCH (p:ProcessInstance {id: $guid})
+                    SET p.last_analysed_score = p.score,
+                        p.last_verdict        = $verdict,
+                        p.last_analysed_at    = $ts
+                    """,
+                    {"guid": inst.guid, "verdict": result.verdict, "ts": ts},
+                )
+            except Exception as exc:
+                self._log(f"[ThreatAnalyst][WARN] Could not apply verdict to {inst.guid}: {exc}")
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 
     def _save_finding(self, finding: ResponderOutput) -> None:
-        """Save responder decision to JSONL file.
-
-        Note: This saves the RESPONDER's actions, not the analyst's raw findings.
-        The analyst now produces ResponderOutput directly (actions + minimal verdict).
-        Heavy attack metadata (techniques, tactics, attack_chain, processes, iocs, files,
-        identities, gaps) is NO LONGER stored here because:
-
-        1. LLM now produces actions, not attack narratives
-        2. Our prompt explicitly removed techniques/tactics from LLM output
-        3. Attack details are ephemeral — only actions and verdict matter for response
-        """
         record = {
-            "case_id":             finding.case_id,
-            "anchor_guid":         finding.anchor_guid,
-            "produced_at":         datetime.utcnow().isoformat(),
-            "verdict":             finding.verdict,
-            "actions":             finding.actions,           # ← new: machine-executable responses
-            "analysis_id":         finding.analysis_id,
-            "raw_llm_response":    finding.raw_llm_response,  # ← for debugging only
+            "analysis_id":      str(uuid.uuid4()),
+            "anchor_guid":      finding.anchor_guid,
+            "produced_at":      datetime.utcnow().isoformat(),
+            "verdict":          finding.verdict,
+            "actions":          finding.actions,
+            "raw_llm_response": finding.raw_llm_response,
         }
         try:
             with open(FINDINGS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as exc:
-            self._log(f"[ThreatAnalyst][WARN] Could not save responder decision: {exc}")
-
+            self._log(f"[ThreatAnalyst][WARN] Could not save finding: {exc}")
 
     def _print_finding(self, finding: ResponderOutput) -> None:
-        """Print responder decision to console with formatting."""
-        # Severity is gone — verdict alone drives response severity
-        verdict_symbol = {
-            "MALICIOUS": "🔴", 
-            "SUSPICIOUS": "🟠"
-        }.get(finding.verdict, "⚪")
-    
+        verdict_symbol = {"MALICIOUS": "🔴", "SUSPICIOUS": "🟠"}.get(finding.verdict, "⚪")
         self._log(
             f"\n{'=' * 70}\n"
-            f"[RESPONDER DECISION]\n"
-            f"  Case:       {finding.case_id}\n"
-            f"  Anchor:     {finding.anchor_guid}\n"
-            f"  Analysis:   {finding.analysis_id}\n"
-            f"  Verdict:    {finding.verdict} {verdict_symbol}\n"
-            f"  Actions:    {len(finding.actions)} response(s)\n"
+            f"[ANALYST FINDING]\n"
+            f"  Anchor:   {finding.anchor_guid}\n"
+            f"  Verdict:  {finding.verdict} {verdict_symbol}\n"
+            f"  Actions:  {len(finding.actions)} response(s)\n"
         )
-    
-        # Print actions with full details
         if finding.actions:
-            self._log(f"\n  EXECUTABLE ACTIONS:")
+            self._log("  EXECUTABLE ACTIONS:")
             for idx, action in enumerate(finding.actions, 1):
                 self._log(
                     f"\n    [{idx}] PRIORITY {action.get('priority', 0)}: {action.get('type')}\n"
                     f"        target: {action.get('target_type')}={action.get('target_value')}\n"
                     f"        scope:  {action.get('scope')}\n"
-                    f"        reason: {action.get('reason', 'No reason provided')}"
+                    f"        reason: {action.get('reason', '')}"
                 )
         else:
-            self._log(f"\n  ⚪ NO ACTIONS — monitoring only")
-    
-        # Show raw LLM response preview for debugging (optional)
-        if finding.raw_llm_response and len(finding.raw_llm_response) <= 500:
-            self._log(f"\n  RAW LLM (preview): {finding.raw_llm_response[:200]}...")
-        elif finding.raw_llm_response:
-            self._log(f"\n  RAW LLM: {len(finding.raw_llm_response)} chars (see JSONL)")
-    
+            self._log("  ⚪ NO ACTIONS — monitoring only")
         self._log(f"{'=' * 70}\n")
-    
-            # ── STATS ─────────────────────────────────────────────────────────────────
-    
+
+    # ── STATS ─────────────────────────────────────────────────────────────────
+
     def get_stats(self) -> Dict[str, Any]:
-            return {**self._stats, "queue": self._queue.get_stats()}
+        return {**self._stats}

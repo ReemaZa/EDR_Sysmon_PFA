@@ -76,7 +76,10 @@ READ_FROM_FILE =True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'attack_steps', 'steps.txt'
+    '..', 'tests', 'logs_datasets', 'sysmon_credential_dumping.txt'
+    #'..', 'tests', 'logs_datasets', 'sysmon_process_injection.txt'
+    #'..', 'tests', 'attack_steps', 'steps.txt'
+
 )
 
 # ============================================================================
@@ -294,60 +297,54 @@ def main():
         enable_l4=True,
     )
 
-    # ── REPLAY MODE ───────────────────────────────────────────────────────
     if READ_FROM_FILE:
+        # ── REPLAY MODE ──────────────────────────────────────────────────
         try:
             from tests.log_replay import LogReplayEngine
 
             print(f"[INFO] Log-replay mode — reading from: {LOG_REPLAY_FILE}\n")
-
             engine = LogReplayEngine(
                 log_file=LOG_REPLAY_FILE,
-                event_callback=process_event,   # ← same function as live mode
+                event_callback=process_event,
             )
             engine.replay(verbose=True)
-
-            # Simple end-of-replay stats
             engine.print_stats()
-
-            # Full pipeline stats
             detection_pipeline.print_stats()
-
             print("[INFO] Log replay completed. Exiting.\n")
-            #return 
-
         except Exception as e:
             print(f"[ERROR] Failed to run log replay engine: {e}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
+        return   # <-- explicit return: replay mode never falls into live mode
 
-    # ── LIVE MODE ─────────────────────────────────────────────────────────
-    stop_event = threading.Event()
-    watcher    = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
+    else:
+        # ── LIVE MODE ────────────────────────────────────────────────────
+        stop_event = threading.Event()
+        watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
 
-    def _stop(signum, frame):
-        print("\n" + "=" * 70)
-        print("Stopping watcher...")
-        stop_event.set()
-        watcher.stop()
-        watcher.join(timeout=5)
+        def _stop(signum, frame):
+            print("\n" + "=" * 70)
+            print("Stopping watcher...")
+            stop_event.set()
+            watcher.stop()
+            watcher.join(timeout=5)
+            if detection_pipeline:
+                detection_pipeline.print_stats()
+            print("=" * 70)
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT,  _stop)
+        signal.signal(signal.SIGTERM, _stop)
+
+        watcher.start()   # <-- actually start the watcher
+        print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
+
+        while not stop_event.is_set():
+            time.sleep(0.2)
+
         if detection_pipeline:
             detection_pipeline.print_stats()
-        print("=" * 70)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT,  _stop)
-    signal.signal(signal.SIGTERM, _stop)
-
-    #watcher.start()
-    print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
-
-    while not stop_event.is_set():
-        time.sleep(0.2)
-
-    if detection_pipeline:
-        detection_pipeline.print_stats()
 
 
 if __name__ == "__main__":

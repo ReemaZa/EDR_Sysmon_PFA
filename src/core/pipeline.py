@@ -197,11 +197,9 @@ class DetectionPipeline:
         if "l4_stats" in stats:
             l4 = stats["l4_stats"]
             print(f"\n[L4 Analyst Details]")
-            print(f"  Ticks:          {l4.get('ticks', 0)}")
-            print(f"  Triggers:       {l4.get('triggers_pushed', 0)}")
-            print(f"  Cases Analysed: {l4.get('cases_analysed', 0)}")
-            print(f"  Findings:       {l4.get('findings', 0)}")
-            print(f"  Queue:          {l4.get('queue', {})}")
+            print(f"  Ticks:              {l4.get('ticks', 0)}")
+            print(f"  Components Analysed: {l4.get('components_analysed', 0)}")
+            print(f"  Findings:           {l4.get('findings', 0)}")
 
         print("=" * 80 + "\n")
 
