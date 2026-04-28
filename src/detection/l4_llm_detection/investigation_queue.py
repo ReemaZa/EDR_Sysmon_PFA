@@ -134,7 +134,7 @@ class InvestigationQueue:
                 case.status         = InvestigationStatus.WATCHING
                 case.watching_since = datetime.utcnow().isoformat()
                 print(f"[Queue] WATCHING  case={case.case_id[:8]}  "
-                      f"verdict={finding.verdict}  severity={finding.severity}")
+                      f"verdict={finding.verdict}  ")
 
     def tick_watching(self) -> List[InvestigationCase]:
         """Transition WATCHING cases older than WATCH_HOURS to CLOSED."""
