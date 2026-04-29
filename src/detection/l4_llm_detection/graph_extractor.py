@@ -67,6 +67,7 @@ BEHAVIOUR_REL_TYPES = {
     "TIMESTOMPED",
     "WROTE_ADS",
     "TAMPERED",
+    
 }
 
 LATERAL_REL_TYPES = {"INJECTED_THREAD", "ACCESSED_MEMORY", "TAMPERED"}
@@ -81,7 +82,7 @@ class TemplateNode:
     image:         Optional[str] = None
     parent_image:  Optional[str] = None
     cmdline:       Optional[str] = None
-    user:          Optional[str] = None
+    #user:          Optional[str] = None
     description:   Optional[str] = None
     seen_count:    int           = 0
     total_score:   int           = 0
@@ -98,6 +99,8 @@ class InstanceNode:
     start_time:    Optional[str]
     end_time:      Optional[str]
     template_hash: Optional[str] = None
+    user:          Optional[str] = None
+    pending_action: Optional[str] = None
 
 
 @dataclass
@@ -122,6 +125,8 @@ class ArtifactNode:
     extra: Dict[str, Any] = field(default_factory=dict)
     sha256: Optional[str] = None
     path:   Optional[str] = None
+    pending_action: Optional[str] = None
+
 
 @dataclass
 class SubgraphContext:
@@ -326,6 +331,7 @@ class GraphExtractor:
             UNWIND $guids AS guid
             MATCH (p:ProcessInstance {id: guid})
             OPTIONAL MATCH (p)-[:INSTANCE_OF]->(t:ProcessTemplate)
+            OPTIONAL MATCH (p)-[:RAN_AS]->(u:User)
             RETURN
                 p.id         AS guid,
                 p.score      AS score,
@@ -333,17 +339,22 @@ class GraphExtractor:
                 p.alive      AS alive,
                 p.start_time AS start_time,
                 p.end_time   AS end_time,
-
+                p.pending_action AS pending_action,
                 t.template_hash AS template_hash,
                 t.image         AS image,
                 t.parent_image  AS parent_image,
                 t.cmdline       AS cmdline,
-                t.user          AS user,
                 t.description   AS description,
                 t.seen_count    AS seen_count,
                 t.total_score   AS total_score,
                 t.first_seen    AS first_seen,
-                t.last_seen     AS last_seen
+                t.last_seen     AS last_seen,
+
+                CASE
+                    WHEN u.pending_action IS NOT NULL AND u.pending_action <> "alert"
+                    THEN u.id + ' [' + u.pending_action + ']'
+                    ELSE u.id
+                END AS user
         """, {"guids": list(guids)})
 
         instances: List[InstanceNode]      = []
@@ -363,6 +374,9 @@ class GraphExtractor:
                 start_time    = r.get("start_time"),
                 end_time      = r.get("end_time"),
                 template_hash = t_hash,
+                user          = r.get("user"),
+                pending_action = r.get("pending_action"),
+                
             ))
 
             if t_hash and t_hash not in templates:
@@ -371,7 +385,6 @@ class GraphExtractor:
                     image         = r.get("image"),
                     parent_image  = r.get("parent_image"),
                     cmdline       = r.get("cmdline"),
-                    user          = r.get("user"),
                     description   = r.get("description"),
                     seen_count    = int(r.get("seen_count") or 0),
                     total_score   = int(r.get("total_score") or 0),
@@ -474,7 +487,9 @@ class GraphExtractor:
                 labels(n)[0] AS label,
                 n.image      AS image,
                 n.sha256     AS sha256,
-                n.path       AS path
+                n.path       AS path,
+                n.pending_action AS pending_action
+
         """, {"ids": list(artifact_ids)})
 
         result = []
@@ -488,6 +503,7 @@ class GraphExtractor:
                 extra = extra,
                 sha256 = r.get("sha256"),
                 path   = r.get("path"),
+                pending_action=r.get("pending_action")
             ))
         return result
 

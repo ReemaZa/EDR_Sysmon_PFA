@@ -173,8 +173,10 @@ class ThreatAnalyst:
     
             finding = self._analyst.analyse(subgraph)
             self._stats["findings"] += 1
-    
-            self._apply_verdict(subgraph, finding)
+            investigated_guids=remaining
+            self._apply_verdict(subgraph, finding,investigated_guids)
+            
+            self._apply_graph_actions(finding)
             self._save_finding(finding)
             self._print_finding(finding)
     
@@ -188,6 +190,9 @@ class ThreatAnalyst:
             visited = {i.guid for i in subgraph.instances}
             remaining = [g for g in remaining if g not in visited]
             # unvisited_guids stay in remaining naturally since they weren't visited
+            # ── NEW: execute containment actions in a parallel thread ──
+            #if finding.verdict in ("MALICIOUS", "SUSPICIOUS") and finding.actions:
+            #    self._executor.execute_async(finding.actions, finding.anchor_guid)
 
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
 
@@ -226,111 +231,204 @@ class ThreatAnalyst:
             if row.get("guid")
         ]
 
-    # ── CONNECTED COMPONENTS ──────────────────────────────────────────────────
 
-    def _split_components(self, subgraph: SubgraphContext) -> List[SubgraphContext]:
-        """
-        Split a SubgraphContext into independent connected components
-        using union-find on the edge list.
-        Each component becomes its own SubgraphContext for a separate LLM call.
-        """
-        all_ids = (
-            {i.guid for i in subgraph.instances} |
-            {a.id   for a in subgraph.artifacts}
-        )
-
-        # Union-Find
-        parent = {n: n for n in all_ids}
-
-        def find(x: str) -> str:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]   # path compression
-                x = parent[x]
-            return x
-
-        def union(a: str, b: str):
-            parent[find(a)] = find(b)
-
-        for edge in subgraph.edges:
-            if edge.src_id in parent and edge.dst_id in parent:
-                union(edge.src_id, edge.dst_id)
-
-        # Group node IDs by their root
-        groups: Dict[str, Set[str]] = {}
-        for node_id in all_ids:
-            root = find(node_id)
-            groups.setdefault(root, set()).add(node_id)
-
-        # Build one SubgraphContext per group
-        components: List[SubgraphContext] = []
-        for node_ids in groups.values():
-            instances = [i for i in subgraph.instances if i.guid  in node_ids]
-            artifacts = [a for a in subgraph.artifacts  if a.id   in node_ids]
-            edges     = [e for e in subgraph.edges
-                         if e.src_id in node_ids and e.dst_id in node_ids]
-            templates = {
-                h: t for h, t in subgraph.templates.items()
-                if any(i.template_hash == h for i in instances)
-            }
-
-            # Pick anchor = highest scoring instance in this component
-            anchor_inst = max(instances, key=lambda i: i.score)
-
-            # Rebuild process tree for this component only
-            process_tree = {
-                guid: children
-                for guid, children in subgraph.process_tree.items()
-                if guid in node_ids
-            }
-            tree_roots = [
-                guid for guid in subgraph.tree_roots
-                if guid in node_ids
-            ]
-
-            components.append(SubgraphContext(
-                anchor_guid       = anchor_inst.guid,
-                anchor_score      = anchor_inst.score,
-                instances         = instances,
-                templates         = templates,
-                artifacts         = artifacts,
-                edges             = edges,
-                timeline          = [
-                    e for e in subgraph.timeline
-                    if e.get("src") in node_ids or e.get("dst") in node_ids
-                ],
-                has_ghost_parents = any(i.ghost for i in instances),
-                total_nodes       = len(instances) + len(artifacts),
-                total_edges       = len(edges),
-                unvisited_guids   = set(),
-                process_tree      = process_tree,
-                tree_roots        = tree_roots,
-            ))
-
-        # Sort components by anchor score descending so highest-risk runs first
-        components.sort(key=lambda c: -c.anchor_score)
-        return components
 
     # ── APPLY VERDICT ─────────────────────────────────────────────────────────
+# ── APPLY VERDICT ─────────────────────────────────────────────────────────────
 
-    def _apply_verdict(self, component: SubgraphContext, result: ResponderOutput) -> None:
+    def _apply_verdict(
+        self,
+        component: SubgraphContext,
+        result: ResponderOutput,
+        investigated_guids: Set[str],
+    ) -> None:
         """
         Write last_analysed_score, last_verdict, last_analysed_at
-        back onto every ProcessInstance node in this component.
+        ONLY onto ProcessInstance nodes that were in the original
+        investigated set (i.e. triggered this analysis cycle).
+        Context-only nodes pulled in for graph structure are NOT updated.
         """
         ts = datetime.utcnow().isoformat()
         for inst in component.instances:
+            if inst.guid not in investigated_guids:
+                self._log(
+                    f"[ThreatAnalyst] Skipping verdict stamp for context-only node {inst.guid[:20]}"
+                )
+                continue
             try:
                 self._db.execute(
                     """
                     MATCH (p:ProcessInstance {id: $guid})
                     SET p.last_analysed_score = p.score,
-                        p.last_verdict        = $verdict,
+                       
                         p.last_analysed_at    = $ts
                     """,
                     {"guid": inst.guid, "verdict": result.verdict, "ts": ts},
                 )
             except Exception as exc:
-                self._log(f"[ThreatAnalyst][WARN] Could not apply verdict to {inst.guid}: {exc}")
+                self._log(
+                    f"[ThreatAnalyst][WARN] Could not apply verdict to {inst.guid}: {exc}"
+                )
+
+    # ── APPLY GRAPH ACTIONS ───────────────────────────────────────────────────────
+
+    def _apply_graph_actions(self, result: ResponderOutput) -> None:
+        """
+        Write action tags back to their target nodes in the graph.
+    
+        Mapping:
+            target_type=guid       → ProcessInstance  → tag + action_type label
+            target_type=file       → File artifact    → tag
+            target_type=ip         → Network artifact → tag
+            target_type=domain     → DNS artifact     → tag
+            target_type=registry   → Registry artifact→ tag
+    
+        Each action stamps:
+            pending_action   = action["type"]   (e.g. "process_termination")
+            action_priority  = action["priority"]
+            action_reason    = action["reason"]
+            action_stamped_at = <utcnow>
+        """
+        if not result.actions:
+            return
+    
+        ts = datetime.utcnow().isoformat()
+    
+        for action in result.actions:
+            target_type  = action.get("target_type", "")
+            target_value = action.get("target_value", "")
+            action_type  = action.get("type", "unknown")
+            priority     = action.get("priority", 0)
+            reason       = action.get("reason", "")
+    
+            if not target_value:
+                continue
+            
+            try:
+                if target_type == "guid":
+                    # ProcessInstance node — stamp pending_action directly
+                    self._db.execute(
+                        """
+                        MATCH (p:ProcessInstance {id: $val})
+                        SET p.pending_action    = $action_type,
+                            p.action_reason     = $reason,
+                            p.action_stamped_at = $ts
+                        """,
+                        {
+                            "val":         target_value,
+                            "action_type": action_type,
+                            "reason":      reason,
+                            "ts":          ts,
+                        },
+                    )
+                    self._log(
+                        f"[ThreatAnalyst][ACTION] [{action_type}] → ProcessInstance {target_value[:20]}"
+                    )
+    
+                elif target_type == "file":
+                    # File artifact — match by id (which is the path in your schema)
+                    #Todo: standarize fileName
+                    self._db.execute(
+                        """
+                        MATCH (f:File {id: $val})
+                        SET f.pending_action    = $action_type,
+                            f.action_reason     = $reason,
+                            f.action_stamped_at = $ts
+                        """,
+                        {
+                            "val":         target_value,
+                            "action_type": action_type,
+                            "priority":    priority,
+                            "reason":      reason,
+                            "ts":          ts,
+                        },
+                    )
+                elif target_type == "user":
+                    self._db.execute(
+                        """
+                        MATCH (u:User {id: $val})
+                        SET u.pending_action    = $action_type,
+                            u.action_reason     = $reason,
+                            u.action_stamped_at = $ts
+                        """,
+                        {"val": target_value, "action_type": action_type,
+                         "priority": priority, "reason": reason, "ts": ts},
+                    )
+                    self._log(
+                        f"[ThreatAnalyst][ACTION] [{action_type}] → User {target_value}"
+                    )
+    
+                elif target_type == "ip":
+                    self._db.execute(
+                        """
+                        MATCH (n:Network {id: $val})
+                        SET n.pending_action    = $action_type,
+                            n.action_reason     = $reason,
+                            n.action_stamped_at = $ts
+                        """,
+                        {
+                            "val":         target_value,
+                            "action_type": action_type,
+                            "priority":    priority,
+                            "reason":      reason,
+                            "ts":          ts,
+                        },
+                    )
+                    self._log(
+                        f"[ThreatAnalyst][ACTION] [{action_type}] → Network {target_value}"
+                    )
+    
+                elif target_type == "domain":
+                    self._db.execute(
+                        """
+                        MATCH (d:DNS {id: $val})
+                        SET d.pending_action    = $action_type,
+                            d.action_reason     = $reason,
+                            d.action_stamped_at = $ts
+                        """,
+                        {
+                            "val":         target_value,
+                            "action_type": action_type,
+                        
+                            "reason":      reason,
+                            "ts":          ts,
+                        },
+                    )
+                    self._log(
+                        f"[ThreatAnalyst][ACTION] [{action_type}] → DNS {target_value}"
+                    )
+    
+                elif target_type == "registry":
+                    self._db.execute(
+                        """
+                        MATCH (r:Registry {id: $val})
+                        SET r.pending_action    = $action_type,
+                            r.action_reason     = $reason,
+                            r.action_stamped_at = $ts
+                        """,
+                        {
+                            "val":         target_value,
+                            "action_type": action_type,
+                            "priority":    priority,
+                            "reason":      reason,
+                            "ts":          ts,
+                        },
+                    )
+                    self._log(
+                        f"[ThreatAnalyst][ACTION] [{action_type}] → Registry {target_value}"
+                    )
+                
+                else:
+                    self._log(
+                        f"[ThreatAnalyst][WARN] Unknown target_type={target_type!r} "
+                        f"for action {action.get('id')} — skipping graph write"
+                    )
+    
+            except Exception as exc:
+                self._log(
+                    f"[ThreatAnalyst][WARN] Could not stamp action {action.get('id')} "
+                    f"on {target_type}={target_value}: {exc}"
+                )
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 

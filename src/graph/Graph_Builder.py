@@ -155,6 +155,7 @@ class GraphBuilder:
             "CREATE CONSTRAINT ON (n:Registry)        ASSERT n.id             IS UNIQUE",
             "CREATE CONSTRAINT ON (n:DNS)             ASSERT n.id             IS UNIQUE",
             "CREATE CONSTRAINT ON (n:Driver)          ASSERT n.id             IS UNIQUE",
+            "CREATE CONSTRAINT ON (n:User) ASSERT n.id IS UNIQUE",
         ]:
             try:
                 self._run(c)
@@ -187,7 +188,7 @@ class GraphBuilder:
             "image":        (image        or "").lower(),
             "parent_image": (parent_image or "").lower(),
             "cmdline":      norm(cmdline  or ""),
-            "user":         (user         or "").lower(),
+            
         })
 
     @classmethod
@@ -350,7 +351,19 @@ class GraphBuilder:
             t_hash    = self._template_hash(image, parent_image, cmdline, user)
         ts        = timestamp or self._now()
         was_ghost = self._is_ghost(guid)  # read ghost state BEFORE any write
-
+        if user:
+            self._run(
+                "MERGE (u:User {id: $user})",
+                {"user": user},
+            )
+            self._run(
+                """
+                MATCH (p:ProcessInstance {id: $guid})
+                MATCH (u:User {id: $user})
+                MERGE (p)-[:RAN_AS]->(u)
+                """,
+                {"guid": guid, "user": user},
+            )
         self._run(
             """
             MERGE (p:ProcessInstance {id: $guid})

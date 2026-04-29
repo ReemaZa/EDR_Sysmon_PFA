@@ -78,12 +78,13 @@ ACTION TYPES → FUNCTION MAPPING:
 
 from __future__ import annotations
 
+import json
 import threading
 from typing import Any, Dict, List
 
 # Import all response functions from the companion module.
 # Adjust the import path to match your project layout.
-from src.detection.l4_llm_detection import response_functions as rf
+from src.core import response as rf
 
 
 class ActionExecutor:
@@ -172,6 +173,9 @@ class ActionExecutor:
                 }
                 results.append(err)
                 print(f"[ActionExecutor][ERROR] {action_id}: {exc}")
+            # Persist execution record
+        with open("action_log.jsonl", "a") as f:
+            f.write(json.dumps({"anchor": anchor_guid, "actions": results}) + "\n")
         return results
 
     # ── DISPATCHER ────────────────────────────────────────────────────────────
