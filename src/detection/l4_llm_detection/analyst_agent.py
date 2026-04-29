@@ -57,23 +57,28 @@ def get_response_schema() -> "Schema":
         properties={
             "id":           Schema(type=Type.STRING),
             "priority":     Schema(type=Type.INTEGER),
-            "type":         Schema(type=Type.STRING, enum=[
-                                "process_termination", "blacklist",
-                                "file_quarantine", "file_deletion",
-                             "BLOCK_IP", "BLOCK_DOMAIN","nothing","alert"
-                            ]),
+            "type": Schema(type=Type.STRING, enum=[
+    "process_termination",   # maps to → process_termination()
+    "file_quarantine",       # maps to → file_quarantine()
+    "file_deletion",         # maps to → file_deletion()
+    "ip_block",              # maps to → ip_block()
+    "dns_block",             # maps to → dns_block()
+    "host_isolation",        # maps to → host_isolation()
+    "identity_revocation",   # maps to → identity_revocation()
+    "patching",              # maps to → patching()
+    "shutdown",              # maps to → shutdown()
+    "alert",                 # maps to → alert()
+   
+]),
             "target_type":  Schema(type=Type.STRING, enum=[
-                                "guid", "tmpl", "file",
-                                "ip", "domain", "registry",
+                                "guid",  
+                                "ip", "domain", "registry","file","user","host"
                             ]),
             "target_value": Schema(type=Type.STRING),
-            "scope":        Schema(type=Type.STRING, enum=[
-                                "instance", "all_children",
-                                "all_connected", "template"
-                            ]),
+          
             "reason":       Schema(type=Type.STRING),
         },
-        required=["id", "priority", "type", "target_type", "target_value", "scope", "reason"],
+        required=["id", "priority", "type", "target_type", "target_value", "reason"],
     )
 
   
@@ -170,17 +175,28 @@ class AnalystAgent:
             t_short = tmpl.template_hash[:12]
             guids   = tmpl_to_guids.get(tmpl.template_hash, [])
 
+            # collect users across all instances of this template
+            users = {
+                inst.user
+                for g in guids
+                if (inst := next((i for i in sg.instances if i.guid == g), None))
+                and inst.user
+            }
+
             parts = [f"  tmpl={t_short}", f"image={tmpl.image or '?'}"]
             if tmpl.parent_image: parts.append(f"spawned-by={tmpl.parent_image}")
-            if tmpl.user:         parts.append(f"user={tmpl.user}")
             if tmpl.cmdline:      parts.append(f"cmdline={tmpl.cmdline}")
+            if len(users) == 1:   parts.append(f"user={next(iter(users))}")  # same for all → template level
             lines.append("  |  ".join(parts))
 
             for g in guids:
                 inst      = next((i for i in sg.instances if i.guid == g), None)
                 alive_tag = "alive" if (inst and inst.alive) else "dead"
+                
                 score_val = inst.score if inst else "?"
-                lines.append(f"      guid={g}  score={score_val}  [{alive_tag}]")
+                # only show user per-instance when instances differ
+                user_str  = f"  user={inst.user}" if (inst and inst.user and len(users) > 1) else ""
+                lines.append(f"      guid={g}  score={score_val}    [{alive_tag}]{user_str}")
 
         return "\n".join(lines)
 
@@ -201,8 +217,10 @@ class AnalystAgent:
             tags   = []
             if inst.ghost:      tags.append("GHOST")
             if not inst.alive:  tags.append("dead")
+            if hasattr(inst, "pending_action") and inst.pending_action and not inst.pending_action=="alert":
+                tags.append(f" ACTION={inst.pending_action}")
             tag_str = f"  [{','.join(tags)}]" if tags else ""
-
+            
             t       = sg.templates.get(inst.template_hash or "")
             t_short = (inst.template_hash or "")[:12] or "no-tmpl"
 
@@ -243,8 +261,19 @@ class AnalystAgent:
                 return f"{image} (guid={node_id})"
             art = art_map.get(node_id)
             if art:
-                label = art.extra.get("image") or node_id
-                return f"{art.label}:{label}"
+                attr=""
+                if art.label in ("Driver", "Image"):
+                    # id IS the sha256
+                    path_str = f"  path={art.path}" if art.path else ""
+                    #return f"{art.label}:sha256={art.id}{path_str}"
+                    attr=path_str
+                else:
+                    attr=art.id
+             
+                if art.pending_action:
+                    return f"{art.label}:{attr}  Action:[{art.pending_action}]"
+                else:
+                    return f"{art.label}:{attr}"
             return f"[MISSING:{node_id}]"
 
         sorted_edges = sorted(
@@ -321,15 +350,45 @@ HOW TO READ THE GRAPH:
   - PROCESS TREE: spawn hierarchy. Resolve via table.
   - BEHAVIOURS: attack timeline, read chronologically. techniques/tactics are Sigma ground truth.
   - count > 1 on an edge = beaconing, spray, or enumeration — always flag in attack_chain.
+  - ACTION TAGS: If a process shows ACTION=<type>, it means a containment action has already been decided and stamped on that node by the system (not yet necessarily executed). Use this as context to avoid redundant or conflicting actions and to reason about escalation or follow-up steps.
   - [MISSING:guid] = could not be fetched — note as gap.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ACTION TYPES — what each action does and when to use it:
 
-ACTION SCOPES (apply strictly):
-  scope=instance       → act on this guid only.
-  scope=all_children   → this guid + every CHILD_OF descendant or future coming CHILD_OF recursively.
-  scope=all_connected  → terminate any process connected to this ip/domain + perimeter block.
-  scope=template       → kill all live instances of this tmpl hash + block future spawns.
+  process_termination
+      Kill a live process immediately by guid.
+ file_quarantine
+      Move a file to isolated quarantine.target_value MUST be the exact path from a CREATED_FILE or DELETED edge.
+ file_deletion
+      Permanently wipe a file (multi-pass). Use only when quarantine is not possible
+      or the file is actively re-executing from quarantine. Never use as first choice.
+ ip_block
+      Block an IP at Windows Firewall (inbound + outbound).
+      Use when a process connected to an external C2 or exfiltration endpoint.
+      Always pair with a blacklist action on the same IP.
+dns_block
+      Block a domain via hosts file redirect + DNS cache flush.
+      Prefer over ip_block when domain may resolve to multiple IPs (CDN, DGA, fast-flux).
+      Always pair with a blacklist action on the same domain.
+host_isolation
+      Cut ALL network traffic on this host. DRASTIC and hard to reverse.
+      Use ONLY when active exfiltration or ransomware spreading is confirmed.
+identity_revocation
+      Disable a Windows user account.
+    
+shutdown
+      Shut down the host. Use only when isolation is insufficient and the threat is
+      actively destroying data or spreading laterally beyond containment.
+
+alert
+      Raise a structured alert for human review. No automated containment.
+      Use when: confidence is low, evidence is ambiguous, or a protected process
+      shows elevated score .
+
+
+      
 REASON:
- explain every choice you made : for the action -scope and priority 
+ explain every choice you made 
 
 
 """
