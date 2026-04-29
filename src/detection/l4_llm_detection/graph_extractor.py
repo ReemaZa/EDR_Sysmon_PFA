@@ -70,7 +70,7 @@ BEHAVIOUR_REL_TYPES = {
 }
 
 LATERAL_REL_TYPES = {"INJECTED_THREAD", "ACCESSED_MEMORY", "TAMPERED"}
-ARTIFACT_LABELS   = {"File", "Network", "Registry", "DNS", "Driver"}
+ARTIFACT_LABELS   = {"File", "Network", "Registry", "DNS", "Driver","Image"}
 
 
 # ── data models ───────────────────────────────────────────────────────────────
@@ -120,7 +120,8 @@ class ArtifactNode:
     id:    str
     label: str
     extra: Dict[str, Any] = field(default_factory=dict)
-
+    sha256: Optional[str] = None
+    path:   Optional[str] = None
 
 @dataclass
 class SubgraphContext:
@@ -471,7 +472,9 @@ class GraphExtractor:
             RETURN
                 n.id         AS id,
                 labels(n)[0] AS label,
-                n.image      AS image
+                n.image      AS image,
+                n.sha256     AS sha256,
+                n.path       AS path
         """, {"ids": list(artifact_ids)})
 
         result = []
@@ -483,6 +486,8 @@ class GraphExtractor:
                 id    = r["id"],
                 label = r.get("label") or "Unknown",
                 extra = extra,
+                sha256 = r.get("sha256"),
+                path   = r.get("path"),
             ))
         return result
 

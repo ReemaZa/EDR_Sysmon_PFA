@@ -146,6 +146,8 @@ class GraphBuilder:
 
     def _init_schema(self):
         for c in [
+            # ADD alongside existing constraints
+            "CREATE CONSTRAINT ON (n:Image) ASSERT n.id IS UNIQUE",
             "CREATE CONSTRAINT ON (n:ProcessTemplate) ASSERT n.template_hash IS UNIQUE",
             "CREATE CONSTRAINT ON (n:ProcessInstance) ASSERT n.id             IS UNIQUE",
             "CREATE CONSTRAINT ON (n:File)            ASSERT n.id             IS UNIQUE",
@@ -339,7 +341,8 @@ class GraphBuilder:
         description:  str,
         score:        int,
         timestamp:    str,
-        t_hash: str
+        t_hash: str,
+        pid: str
     ) -> str:
         if not guid:
             return ""
@@ -354,12 +357,13 @@ class GraphBuilder:
             ON CREATE SET
                 p.score      = $score,
                 p.alive      = true,
+                p.pid        = $pid,
                 p.start_time = $ts
             ON MATCH SET
                 p.score      = p.score + $score
-            
+                
             """,
-            {"guid": guid, "score": score, "ts": ts},
+            {"guid": guid, "score": score, "ts": ts,"pid": pid},
         )
 
         self._run(
@@ -536,12 +540,16 @@ class GraphBuilder:
         p_hash=self._upsert_template(parent_image, "", parent_cmd, parent_user, "", ts, 0)
         t_hash=self._upsert_template(child_image, parent_image, child_cmd, user,
                               description, ts, eff)
+        child_pid  = int(d.get("ProcessId") or 0)  or None
+        parent_pid = int(d.get("ParentProcessId") or 0)  or None
+        
         if parent_guid:
             self._create_or_promote_instance(
                 guid=parent_guid, image=parent_image,
                 parent_image="", cmdline=parent_cmd,
                 user=parent_user, description="",
-                score=0, timestamp=ts, t_hash=p_hash
+                score=0, timestamp=ts, t_hash=p_hash,
+                pid=parent_pid  # 👈 ADD
             )
         parent_score = self._get_score(parent_guid)
         delta = int(parent_score * PARENT_INHERITANCE)
@@ -553,7 +561,8 @@ class GraphBuilder:
                 guid=child_guid, image=child_image,
                 parent_image=parent_image, cmdline=child_cmd,
                 user=user, description=description,
-                score=eff, timestamp=ts,t_hash=t_hash
+                score=eff, timestamp=ts,t_hash=t_hash,
+                pid=child_pid   # 👈 ADD
             )
         
 
@@ -589,14 +598,20 @@ class GraphBuilder:
         #if not (eff+cur_score)> 0:
             
         #    return
-
+        pid  = int(d.get("ProcessId") or 0) or None
+        
         
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
-        self._run("MERGE (f:File {id: $id})", {"id": file_id})
+        sha256 = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower() if "SHA256=" in (d.get("Hashes") or "") else ""
+        self._run("""
+            MERGE (f:File {id: $id})
+            ON CREATE SET f.sha256 = $sha256
+            ON MATCH SET  f.sha256 = $sha256
+        """, {"id": file_id, "sha256": sha256})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="TIMESTOMPED",
@@ -626,11 +641,13 @@ class GraphBuilder:
            
         #    return
 
+        pid  = int(d.get("ProcessId") or 0) or None
+        pid  = int(d.get("ProcessId") or 0) or None
         
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
         self._run("MERGE (n:Network {id: $ip})", {"ip": dst_ip})
         self._merge_edge(
@@ -666,16 +683,16 @@ class GraphBuilder:
           
         #    return
 
-        
+        pid  = int(d.get("ProcessId") or 0) or None
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
         self._run(
-            "MERGE (drv:Driver {id: $s}) ON CREATE SET drv.image = $img",
-            {"s": sha256, "img": img_loaded},
-        )
+    "MERGE (drv:Driver {id: $s}) ON CREATE SET drv.path = $img",
+    {"s": sha256, "img": img_loaded},
+)
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="LOADED_DRIVER",
@@ -705,20 +722,20 @@ class GraphBuilder:
             
         #    return
 
-        
+        pid  = int(d.get("ProcessId") or 0) or None
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline="", user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
         self._run(
-            "MERGE (img:Driver {id: $s}) ON CREATE SET img.image = $i",
-            {"s": sha256, "i": img_loaded},
-        )
+    "MERGE (img:Image {id: $s}) ON CREATE SET img.path = $i",
+    {"s": sha256, "i": img_loaded},
+)
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="LOADED_IMAGE",
-            dst_id=sha256, dst_label="Driver",
+            dst_id=sha256, dst_label="Image",
             ep=ep, eff_score=eff, timestamp=ts,
         )
         #self._add_score(guid, eff)
@@ -752,11 +769,12 @@ class GraphBuilder:
         src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
         tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
         #if src_should_store:
-            
+        src_pid = int(d.get("SourceProcessId") or 0) or None
+        tgt_pid = int(d.get("TargetProcessId") or 0)   or None
         self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
-                score=eff, timestamp=ts, t_hash=src_t_hash
+                score=eff, timestamp=ts, t_hash=src_t_hash,pid=src_pid
             )
           
         # Target - with gate check
@@ -766,7 +784,7 @@ class GraphBuilder:
         self._create_or_promote_instance(
             guid=tgt_guid, image=tgt_image, parent_image="",
                 cmdline="", user=tgt_user, description="",
-                score=eff, timestamp=ts, t_hash=tgt_t_hash
+                score=eff, timestamp=ts, t_hash=tgt_t_hash,pid=tgt_pid
             )
 
             # Edge only if BOTH instances exist
@@ -803,14 +821,15 @@ class GraphBuilder:
         src_t_hash = self._upsert_template(src_image, "", "", src_user, "", ts, eff )
         tgt_t_hash = self._upsert_template(tgt_image, "", "", tgt_user, "", ts, eff )
         # Source - with gate check
-        src_should_store =  (eff+src_cur_score)> 0 or (eff+tgt_cur_score)> 0
+        #src_should_store =  (eff+src_cur_score)> 0 or (eff+tgt_cur_score)> 0
         
         #if src_should_store:
-            
+        src_pid = int(d.get("SourceProcessId") or 0) or None
+        tgt_pid = int(d.get("TargetProcessId") or 0)   or None
         self._create_or_promote_instance(
                 guid=src_guid, image=src_image, parent_image="",
                 cmdline="", user=src_user, description="",
-                score=eff, timestamp=ts, t_hash=src_t_hash
+                score=eff, timestamp=ts, t_hash=src_t_hash,pid=src_pid
             )
 
         # Target - with gate check
@@ -820,7 +839,7 @@ class GraphBuilder:
         self._create_or_promote_instance(
                     guid=tgt_guid, image=tgt_image, parent_image="",
                     cmdline="", user=tgt_user, description="",
-                    score=eff, timestamp=ts, t_hash=tgt_t_hash
+                    score=eff, timestamp=ts, t_hash=tgt_t_hash,pid=tgt_pid
                 )
 
             # Edge only if BOTH instances exist
@@ -841,6 +860,7 @@ class GraphBuilder:
 
         guid    = d.get("ProcessGuid") or ""
         file_id = (d.get("TargetFilename") or "").lower()
+        sha256    = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower() if "SHA256=" in (d.get("Hashes") or "") else ""
         image   = (d.get("Image")          or "").lower()
         cmd     = d.get("CommandLine")     or ""
         user    = (d.get("User")           or "").lower()
@@ -853,14 +873,18 @@ class GraphBuilder:
         #if not (eff+cur_score)> 0:
             
         #    return
-
-        
+        pid = int(d.get("ProcessId") or 0) or None
+      
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
-        self._run("MERGE (f:File {id: $id})", {"id": file_id})
+        self._run("""
+    MERGE (f:File {id: $id})
+    ON CREATE SET f.sha256 = $sha256
+    ON MATCH SET  f.sha256 = $sha256
+""", {"id": file_id, "sha256": sha256})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="CREATED_FILE",
@@ -892,11 +916,11 @@ class GraphBuilder:
             
         #    return
 
-        
+        pid = int(d.get("ProcessId") or 0) or None
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
         self._run("MERGE (reg:Registry {id: $id})", {"id": reg_id})
         self._merge_edge(
@@ -933,13 +957,19 @@ class GraphBuilder:
         #if not (eff+cur_score)> 0:
         #    return
 
-        
+        pid = int(d.get("ProcessId") or 0) or None
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts, t_hash=t_hash
+            score=eff, timestamp=ts, t_hash=t_hash,pid=pid
         )
-        self._run("MERGE (f:File {id: $id})", {"id": file_id})
+       # TO
+        sha256 = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower() if "SHA256=" in (d.get("Hashes") or "") else ""
+        self._run("""
+    MERGE (f:File {id: $id})
+    ON CREATE SET f.sha256 = $sha256
+    ON MATCH SET  f.sha256 = $sha256
+""", {"id": file_id, "sha256": sha256})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="WROTE_ADS",
@@ -968,12 +998,12 @@ class GraphBuilder:
 
         #if not (eff+cur_score)> 0:
         #    return
-
+        pid = int(d.get("ProcessId") or 0) or None
         
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
         self._run("MERGE (dns:DNS {id: $q})", {"q": query})
         self._merge_edge(
@@ -1005,13 +1035,18 @@ class GraphBuilder:
            
         #    return
 
-        
+        pid = int(d.get("ProcessId") or 0) or None
         self._create_or_promote_instance(
             guid=guid, image=image, parent_image="",
             cmdline=cmd, user=user, description="",
-            score=eff, timestamp=ts,t_hash=t_hash
+            score=eff, timestamp=ts,t_hash=t_hash,pid=pid
         )
-        self._run("MERGE (f:File {id: $id})", {"id": file_id})
+        sha256 = (d.get("Hashes") or "").split("SHA256=")[-1].split(",")[0].lower() if "SHA256=" in (d.get("Hashes") or "") else ""
+        self._run("""
+            MERGE (f:File {id: $id})
+            ON CREATE SET f.sha256 = $sha256
+            ON MATCH SET  f.sha256 = $sha256
+        """, {"id": file_id, "sha256": sha256})
         self._merge_edge(
             src_id=guid, src_label="ProcessInstance",
             rel_type="DELETED",
@@ -1047,20 +1082,21 @@ class GraphBuilder:
        atk_should_store =(eff+atk_cur_score)> 0 or (eff+vic_cur_score)> 0
        vic_t_hash = self._upsert_template(vic_image, "", "", vic_user, "", ts, eff )
        #if atk_should_store:
-           
+       src_pid = int(d.get("SourceProcessId") or 0) or None
+       tgt_pid = int(d.get("TargetProcessId") or 0)   or None
        self._create_or_promote_instance(
                guid=atk_guid, image=atk_image, parent_image="",
                cmdline="", user=atk_user, description="",
-               score=eff, timestamp=ts, t_hash=atk_t_hash
+               score=eff, timestamp=ts, t_hash=atk_t_hash,pid=src_pid
            )
-
+     
        # Victim - with gate check
            
         
        self._create_or_promote_instance(
                     guid=vic_guid, image=vic_image, parent_image="",
                     cmdline="", user=vic_user, description="",
-                    score=eff, timestamp=ts, t_hash=vic_t_hash
+                    score=eff, timestamp=ts, t_hash=vic_t_hash,pid=tgt_pid
                 )
 
        # Edge only if BOTH instances exist

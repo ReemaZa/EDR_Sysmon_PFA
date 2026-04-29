@@ -144,47 +144,50 @@ class ThreatAnalyst:
         self._stats["ticks"] += 1
         n = self._stats["ticks"]
         self._log(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
-
-        # 1. Find all nodes that qualify and have changed since last analysis
+    
         candidates = self._scan_graph()
-        self._log(f"[ThreatAnalyst] {len(candidates)} candidate(s) above threshold "
-                  f"with score change since last analysis")
+        self._log(f"[ThreatAnalyst] {len(candidates)} candidate(s) above threshold={self.threat_threshold}")
         if not candidates:
             return
-
-        # 2. Extract one big subgraph covering all candidates
-        anchor_guid    = candidates[0][0]
-        to_investigate = {guid for guid, _ in candidates[1:]}
-
-        subgraph = self._extractor.extract(
-            anchor_guid=anchor_guid,
-            to_investigate=to_investigate,
-        )
-        if subgraph is None:
-            self._log("[ThreatAnalyst] Subgraph extraction returned None — skipping tick")
-            return
-
-        # 3. Split into connected components
-        components = self._split_components(subgraph)
-        self._log(f"[ThreatAnalyst] {len(components)} connected component(s) found")
-
-        # 4. One sequential LLM call per component
-        for idx, component in enumerate(components, 1):
-            self._log(
-                f"[ThreatAnalyst] Analysing component {idx}/{len(components)} — "
-                f"nodes={component.total_nodes}  edges={component.total_edges}  "
-                f"anchor={component.anchor_guid[:20]}"
+    
+        # Remaining pool — shrinks as nodes get visited
+        remaining = [guid for guid, _ in candidates]
+    
+        while remaining:
+            anchor_guid    = remaining[0]
+            to_investigate = set(remaining[1:])
+    
+            self._log(f"[ThreatAnalyst] Extracting subgraph  anchor={anchor_guid[:20]}  to_investigate={len(to_investigate)}")
+    
+            subgraph = self._extractor.extract(
+                anchor_guid    = anchor_guid,
+                to_investigate = to_investigate,
             )
-            finding = self._analyst.analyse(component)
-            self._stats["components_analysed"] += 1
+    
+            if subgraph is None:
+                self._log(f"[ThreatAnalyst][WARN] No subgraph for {anchor_guid} — skipping")
+                remaining.pop(0)
+                continue
+            
+            self._log(f"[ThreatAnalyst] Running analyst  nodes={subgraph.total_nodes}  edges={subgraph.total_edges}")
+    
+            finding = self._analyst.analyse(subgraph)
             self._stats["findings"] += 1
-
-            # 5. Write verdict back to every instance node in this component
-            self._apply_verdict(component, finding)
-
-            # 6. Persist finding
+    
+            self._apply_verdict(subgraph, finding)
             self._save_finding(finding)
             self._print_finding(finding)
+    
+            self._log(
+                f"[SUBGRAPH GUIDS]\n"
+                f"  visited   ({len(subgraph.instances)}): {[i.guid for i in subgraph.instances]}\n"
+                f"  unvisited ({len(subgraph.unvisited_guids)}): {list(subgraph.unvisited_guids)}"
+            )
+    
+            # Remove visited from remaining, keep unvisited for next iteration
+            visited = {i.guid for i in subgraph.instances}
+            remaining = [g for g in remaining if g not in visited]
+            # unvisited_guids stay in remaining naturally since they weren't visited
 
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
 
@@ -203,7 +206,7 @@ class ThreatAnalyst:
                 """
                 MATCH (p:ProcessInstance)
                 WHERE p.score >= $threshold
-                  AND (p.ghost IS NULL OR p.ghost = false)
+                  
                   AND (
                     p.last_analysed_score IS NULL
                     OR p.score > p.last_analysed_score

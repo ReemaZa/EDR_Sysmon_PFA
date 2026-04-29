@@ -57,23 +57,29 @@ def get_response_schema() -> "Schema":
         properties={
             "id":           Schema(type=Type.STRING),
             "priority":     Schema(type=Type.INTEGER),
-            "type":         Schema(type=Type.STRING, enum=[
-                                "process_termination", "blacklist",
-                                "file_quarantine", "file_deletion",
-                             "BLOCK_IP", "BLOCK_DOMAIN","nothing","alert"
-                            ]),
+            "type": Schema(type=Type.STRING, enum=[
+    "process_termination",   # maps to → process_termination()
+    "file_quarantine",       # maps to → file_quarantine()
+    "file_deletion",         # maps to → file_deletion()
+    "ip_block",              # maps to → ip_block()
+    "dns_block",             # maps to → dns_block()
+    "host_isolation",        # maps to → host_isolation()
+    "blacklist",             # maps to → blacklist()
+    "identity_revocation",   # maps to → identity_revocation()
+    "patching",              # maps to → patching()
+    "shutdown",              # maps to → shutdown()
+    "alert",                 # maps to → alert()
+    "nothing",               # no-op
+]),
             "target_type":  Schema(type=Type.STRING, enum=[
-                                "guid", "tmpl", "file",
-                                "ip", "domain", "registry",
+                                "guid", "sha256", 
+                                "ip", "domain", "registry","file"
                             ]),
             "target_value": Schema(type=Type.STRING),
-            "scope":        Schema(type=Type.STRING, enum=[
-                                "instance", "all_children",
-                                "all_connected", "template"
-                            ]),
+          
             "reason":       Schema(type=Type.STRING),
         },
-        required=["id", "priority", "type", "target_type", "target_value", "scope", "reason"],
+        required=["id", "priority", "type", "target_type", "target_value", "reason"],
     )
 
   
@@ -243,8 +249,13 @@ class AnalystAgent:
                 return f"{image} (guid={node_id})"
             art = art_map.get(node_id)
             if art:
-                label = art.extra.get("image") or node_id
-                return f"{art.label}:{label}"
+                if art.label in ("Driver", "Image"):
+                    # id IS the sha256
+                    path_str = f"  path={art.path}" if art.path else ""
+                    return f"{art.label}:sha256={art.id}{path_str}"
+                if art.label == "File":
+                    sha256_str = f"  sha256={art.sha256}" if art.sha256 else ""
+                    return f"File:{art.id}{sha256_str}"
             return f"[MISSING:{node_id}]"
 
         sorted_edges = sorted(
@@ -322,14 +333,52 @@ HOW TO READ THE GRAPH:
   - BEHAVIOURS: attack timeline, read chronologically. techniques/tactics are Sigma ground truth.
   - count > 1 on an edge = beaconing, spray, or enumeration — always flag in attack_chain.
   - [MISSING:guid] = could not be fetched — note as gap.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ACTION TYPES — what each action does and when to use it:
 
-ACTION SCOPES (apply strictly):
-  scope=instance       → act on this guid only.
-  scope=all_children   → this guid + every CHILD_OF descendant or future coming CHILD_OF recursively.
-  scope=all_connected  → terminate any process connected to this ip/domain + perimeter block.
-  scope=template       → kill all live instances of this tmpl hash + block future spawns.
+  process_termination
+      Kill a live process immediately by guid.
+ file_quarantine
+      Move a file to isolated quarantine. Preserves forensic evidence.
+      ou cannot quarantine by hash — the executor needs a path to move the file.
+ file_deletion
+      Permanently wipe a file (multi-pass). Use only when quarantine is not possible
+      or the file is actively re-executing from quarantine. Never use as first choice.
+ ip_block
+      Block an IP at Windows Firewall (inbound + outbound).
+      Use when a process connected to an external C2 or exfiltration endpoint.
+      Always pair with a blacklist action on the same IP.
+dns_block
+      Block a domain via hosts file redirect + DNS cache flush.
+      Prefer over ip_block when domain may resolve to multiple IPs (CDN, DGA, fast-flux).
+      Always pair with a blacklist action on the same domain.
+host_isolation
+      Cut ALL network traffic on this host. DRASTIC and hard to reverse.
+      Use ONLY when active exfiltration or ransomware spreading is confirmed.
+blacklist
+      Add an IOC to the persistent local blacklist for future blocking.
+      Valid target_type values: "sha256", "ip", "domain"
+      if you choose this action: target_type MUST be "sha256" for binaries, "ip" for IPs, "domain" for domains.
+      Use for every malicious binary path and every external IP or domain observed.
+
+identity_revocation
+      Disable a Windows user account.
+    
+shutdown
+      Shut down the host. Use only when isolation is insufficient and the threat is
+      actively destroying data or spreading laterally beyond containment.
+
+alert
+      Raise a structured alert for human review. No automated containment.
+      Use when: confidence is low, evidence is ambiguous, or a protected process
+      shows elevated score .
+
+nothing
+      Explicitly declare no action needed. Use for benign-context nodes.
+      
+
 REASON:
- explain every choice you made : for the action -scope and priority 
+ explain every choice you made 
 
 
 """
