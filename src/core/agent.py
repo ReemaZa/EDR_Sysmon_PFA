@@ -20,6 +20,8 @@ from datetime import datetime
 from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
+from src.pat.pat_builder import PATBuilder
+
 
 # ============================================================================
 # LOGGING SETUP: Log all console output to both console and file
@@ -88,6 +90,8 @@ LOG_REPLAY_FILE = os.path.join(
 
 detection_pipeline: DetectionPipeline = None
 graph_builder = GraphBuilder()
+
+process_artifact_tree = PATBuilder()
 
 # Self-identification state
 _self_pid = os.getpid()
@@ -220,6 +224,12 @@ def process_event(evt: dict) -> None:
     print(f"  GUID:           {guid}")
     print(f"  User:           {user}")
     print("=" * 130)
+
+    # ── PAT — runs FIRST, on EVERY event, no sigma gate ──────────────────
+    try:
+        process_artifact_tree.process_event(evt)
+    except Exception as e:
+        print(f"  [ERROR] [PAT ERROR] {str(e)}")
 
     # ── Detection pipeline ────────────────────────────────────────────────
     print(f"\n[PROCESSING] Running through detection layers...\n")
