@@ -52,10 +52,16 @@ Mode = Literal["automatic", "approval"]
 class WindowsProtection:
     """Manages protection of critical Windows system resources"""
     
-    def __init__(self, config_path: str = "../../data/windows_protected_resources.json"):
-        self.config_path = config_path
-        self.config = self._load_config()
+    def __init__(self, config_path: Optional[str] = None):
+        base_dir = Path(__file__).resolve().parent
     
+        if config_path:
+            self.config_path = Path(config_path)
+        else:
+            self.config_path = base_dir / ".." / ".." / "data" / "windows_protected_resources.json"
+    
+        self.config_path = self.config_path.resolve()
+        
     def _load_config(self) -> Dict:
         """Load protected resources configuration"""
         try:

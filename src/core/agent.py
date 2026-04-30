@@ -3,7 +3,10 @@ Agent orchestrator: Coordinates event watcher and processes events through detec
 
 Responsibility: Manage the lifecycle, route events to pipeline, and handle alerts.
 
-Flow: event_watcher → ingestion → pipeline → response/storage
+Flow: event_watcher / log_replay → process_event() → pipeline → response/storage
+
+Both live (SysmonEventWatcher) and replay (LogReplayEngine) modes feed into the
+same process_event() function. The only difference is the event source.
 """
 import json
 import os
@@ -11,43 +14,99 @@ import signal
 import sys
 import threading
 import time
+import logging
+from datetime import datetime
 
 from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
+from src.graph.Graph_Builder import GraphBuilder
+
+# ============================================================================
+# LOGGING SETUP: Log all console output to both console and file
+# ============================================================================
+LOG_DIR = "logs"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"edr_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 
-# Global pipeline instance
-detection_pipeline = None
+class PrintLogger:
+    """Captures print() output and sends it to both console and file."""
 
-# Self-identification state (mirrors hookSelfGUID logic)
+    def __init__(self, log_file):
+        self.log_file = log_file
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'a', encoding='utf-8')
+
+    def write(self, message):
+        try:
+            self.terminal.write(message)
+        except UnicodeEncodeError:
+            safe_message = message.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+            self.terminal.write(safe_message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
+
+sys.stdout = PrintLogger(LOG_FILE)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# When True  → replay events from LOG_REPLAY_FILE (testing / offline analysis)
+# When False → subscribe to live Sysmon events via EvtSubscribe
+READ_FROM_FILE =True
+
+LOG_REPLAY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    '..', 'tests', 'logs_datasets', 'sysmon_credential_dumping.txt'
+    #'..', 'tests', 'logs_datasets', 'sysmon_process_injection.txt'
+    #'..', 'tests', 'attack_steps', 'steps.txt'
+
+)
+
+# ============================================================================
+# GLOBALS
+# ============================================================================
+
+detection_pipeline: DetectionPipeline = None
+graph_builder = GraphBuilder()
+
+# Self-identification state
 _self_pid = os.getpid()
-_self_guid = None          # Sysmon GUID of this EDR process, discovered at runtime
+_self_guid = None
 _self_guid_lock = threading.Lock()
-EDR_IMAGE_MARKER = "EDR_Sysmon_PFA"  # Substring that identifies our image path
+EDR_IMAGE_MARKER = "EDR_Sysmon_PFA"
 
 
+# ============================================================================
+# SELF-EXCLUSION HELPERS  (unchanged from original)
+# ============================================================================
 
 def _is_edr_image(image_path: str) -> bool:
-    """
-    Return True if the image belongs to this EDR's directory tree.
-
-    The executable may be python.exe, python3.exe, etc. — the reliable
-    identifier is that the path lives under the EDR project directory,
-    which always contains EDR_Sysmon_PFA as a path component.
-    """
     if not image_path:
         return False
-    # Normalize separators so both / and \ work
-    normalized = image_path.replace("\\", "/")
-    return EDR_IMAGE_MARKER in normalized
+    return EDR_IMAGE_MARKER in image_path.replace("\\", "/")
 
 
 def _get_field(evt: dict, *keys: str):
-    """
-    Look up a field checking both the top-level dict and evt['data'].
-    Accepts multiple key variants (e.g. 'image', 'Image').
-    Returns the first non-None value found, or None.
-    """
     data = evt.get("data", {}) or {}
     for key in keys:
         val = evt.get(key)
@@ -61,15 +120,12 @@ def _get_field(evt: dict, *keys: str):
 
 def _try_discover_self_guid(evt: dict) -> None:
     global _self_guid
-
     if _self_guid is not None:
         return
-
     with _self_guid_lock:
         if _self_guid is not None:
             return
 
-        # --- Path 1: parent fields ---
         parent_image = _get_field(evt, "parent_image", "ParentImage")
         parent_pid   = _get_field(evt, "parent_pid",   "ParentProcessId")
         parent_guid  = _get_field(evt, "parent_guid",  "ParentProcessGuid")
@@ -83,7 +139,6 @@ def _try_discover_self_guid(evt: dict) -> None:
             except (TypeError, ValueError):
                 pass
 
-        # --- Path 2: direct process fields ---
         image = _get_field(evt, "image", "Image")
         pid   = _get_field(evt, "pid",   "ProcessId")
         guid  = _get_field(evt, "guid",  "ProcessGuid")
@@ -99,14 +154,12 @@ def _try_discover_self_guid(evt: dict) -> None:
 
 
 def _is_own_event(evt: dict) -> bool:
-    # GUID-based check
     if _self_guid is not None:
         event_guid  = _get_field(evt, "guid",        "ProcessGuid")
         parent_guid = _get_field(evt, "parent_guid", "ParentProcessGuid")
         if event_guid == _self_guid or parent_guid == _self_guid:
             return True
 
-    # Image+PID fallback
     image = _get_field(evt, "image", "Image")
     pid   = _get_field(evt, "pid",   "ProcessId")
     if _is_edr_image(str(image or "")):
@@ -115,80 +168,116 @@ def _is_own_event(evt: dict) -> bool:
                 return True
         except (TypeError, ValueError):
             pass
-
     return False
 
-def process_event(evt):
+
+# ============================================================================
+# SINGLE EVENT-PROCESSING FUNCTION  ← used by BOTH live and replay paths
+# ============================================================================
+
+def process_event(evt: dict) -> None:
     """
-    Main event processing entry point.
+    Central event handler.  Called identically by:
+      - SysmonEventWatcher  (live mode)
+      - LogReplayEngine     (replay mode)
 
-    Routes events through the detection pipeline:
-    1. event_watcher delivers raw parsed events
-    2. Try to discover our own Sysmon GUID (no-op once found)
-    3. Drop events that originate from this EDR process
-    4. Pipeline runs all detection layers
-    5. High-risk events trigger response actions
-    6. All events logged to storage
-
-    Args:
-        evt: Normalized event dict from ingestion.parse_sysmon_event()
+    Steps:
+      1. Attempt GUID self-discovery (no-op once found)
+      2. Drop events originating from this EDR process
+      3. Run event through detection pipeline (L1 → L2 → L3 → L4)
+      4. Build / update threat graph
+      5. Display results and append to results.json
     """
     global detection_pipeline
 
     if detection_pipeline is None:
         return
 
-    # Always attempt GUID discovery (cheap once _self_guid is set)
+    # Self-exclusion
     _try_discover_self_guid(evt)
-
-    # Drop events generated by this EDR — avoids noise and false positives
     if _is_own_event(evt):
         return
 
-    # Run event through detection pipeline
+    # ── Event header ──────────────────────────────────────────────────────
+    event_id     = evt.get('event_id', 0)
+    event_type   = evt.get('event_type', 'Unknown')
+    timestamp    = evt.get('timestamp', '')
+    data         = evt.get('data', {})
+    image        = data.get('Image',        evt.get('image', 'N/A'))
+    guid         = data.get('ProcessGuid',  evt.get('guid',  'N/A'))
+    user         = data.get('User',         evt.get('user',  'N/A'))
+    parent_image = data.get('ParentImage', 'N/A')
+    command_line = data.get('CommandLine',  'N/A')
+
+    print("\n" + "*" * 130)
+    print(f"EVENT PROCESSING START: #{event_id}")
+    print("=" * 130)
+    print(f"  Event Type:     {event_type}")
+    print(f"  Timestamp:      {timestamp}")
+    print(f"  Image:          {image}")
+    print(f"  Parent Image:   {parent_image}")
+    print(f"  Command Line:   {command_line}")
+    print(f"  GUID:           {guid}")
+    print(f"  User:           {user}")
+    print("=" * 130)
+
+    # ── Detection pipeline ────────────────────────────────────────────────
+    print(f"\n[PROCESSING] Running through detection layers...\n")
     verdict = detection_pipeline.process_event(evt)
+    output  = []
 
-    # Print brief event info
-    event_type = evt.get('event_type', 'Unknown')
-    event_id   = evt.get('event_id', 0)
-    timestamp  = evt.get('timestamp', '')
+    # ── Graph builder ─────────────────────────────────────────────────────
+    print(f"\n[GRAPH] Building threat relationships in graph...\n")
+    try:
+        graph_detection = None
+        if verdict and verdict.layer_results:
+            for result in verdict.layer_results:
+                if result.layer_name == "L2-Sigma":
+                    graph_detection = result.metadata.get("graph_detection")
+                    print("wssel lahne")
+                    break
+        graph_builder.process_event(evt, graph_detection)
+    except Exception as e:
+        print(f"  [ERROR] [GRAPH ERROR] {str(e)}")
 
-    # Format based on threat level
-    if verdict.is_malicious():
-        alert_icon  = "🔴 ALERT"
-        threat_name = verdict.threat_level.name
-    else:
-        alert_icon  = "ℹ️ "
-        threat_name = "Clean"
+    # ── Display layer results ─────────────────────────────────────────────
+    print("\n" + "_" * 130)
+    print("DETECTION RESULTS FROM ALL LAYERS:")
+    print("_" * 130)
 
-    print(f"{alert_icon} [{event_id:2d}] {timestamp} | {event_type:30s} | Threat: {threat_name}")
-
-    output = []
-    if verdict.layer_results:
+    if verdict and verdict.layer_results:
+        print(f"  Total Layers with Detections: {len(verdict.layer_results)}\n")
         for result in verdict.layer_results:
-            matches = ', '.join(result.matches[:2])
-            print(f"       └─ {result.layer_name}: {result.threat_level.name} - {matches}")
-            print(f"   MetaData {result.metadata}")
+            print(result)
             output.append({
-            "threat_level": result.threat_level.name,
-                "event":      evt,
-                "layer_name": result.layer_name,
+                "event":       evt,
+                "layer_name":  result.layer_name,
                 "threat_level": result.threat_level.name,
-                "matches":    result.matches[:2],
-                "metadata":   result.metadata,
+                "matches":     result.matches,
+                "metadata":    result.metadata,
             })
+    else:
+        print("  [OK] No detections from any layer (L1, L2, L3, L4)\n")
 
-    # 👉 Save to file AFTER the loop
+    # ── Final verdict ─────────────────────────────────────────────────────
+    if verdict:
+        symbol = {
+            'CRITICAL': '[CRITICAL]', 'HIGH': '[HIGH]',
+            'MEDIUM':   '[MEDIUM]',   'LOW':  '[LOW]',
+            'UNKNOWN':  '[UNKNOWN]',
+        }.get(verdict.threat_level.name, '[?]')
+        print(f"  [VERDICT] FINAL VERDICT: {symbol} {verdict.threat_level.name}")
+
     with open("results.json", "a") as f:
         json.dump(output, f, indent=4)
-    
-    # TODO: Handle response actions for CRITICAL/HIGH threats
-    # if verdict.is_malicious():
-    #     trigger_response(evt, verdict)
-    #
-    # TODO: Log to storage
-    # event_logger.log(evt, verdict)
 
+    # TODO: response actions for CRITICAL/HIGH threats
+    # TODO: persistent event storage
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
     global detection_pipeline
@@ -196,46 +285,66 @@ def main():
     print("=" * 70)
     print("EDR SYSTEM - Sysmon Event Monitor")
     print("=" * 70)
-    print("Starting event watcher...")
+    print(f"Mode:             {'LOG REPLAY' if READ_FROM_FILE else 'LIVE SYSMON'}")
     print("Detection layers: L1 (Hash), L2 (Sigma), L3 (YARA), L4 (AI)")
-    print(f"Self-exclusion: PID={_self_pid}, image marker='{EDR_IMAGE_MARKER}'")
+    print(f"Self-exclusion:   PID={_self_pid}, image marker='{EDR_IMAGE_MARKER}'")
     print("Press Ctrl+C to stop.\n")
-
-    stop_event = threading.Event()
 
     detection_pipeline = DetectionPipeline(
         enable_l1=True,
         enable_l2=True,
         enable_l3=False,
-        enable_l4=False,
+        enable_l4=True,
     )
 
-    watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
+    if READ_FROM_FILE:
+        # ── REPLAY MODE ──────────────────────────────────────────────────
+        try:
+            from tests.log_replay import LogReplayEngine
 
-    # Define AFTER watcher and stop_event exist
-    def _stop(signum, frame):
-        print("\n" + "=" * 70)
-        print("Stopping watcher...")
-        stop_event.set()
-        watcher.stop()
-        watcher.join(timeout=5)
+            print(f"[INFO] Log-replay mode — reading from: {LOG_REPLAY_FILE}\n")
+            engine = LogReplayEngine(
+                log_file=LOG_REPLAY_FILE,
+                event_callback=process_event,
+            )
+            engine.replay(verbose=True)
+            engine.print_stats()
+            detection_pipeline.print_stats()
+            print("[INFO] Log replay completed. Exiting.\n")
+        except Exception as e:
+            print(f"[ERROR] Failed to run log replay engine: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        return   # <-- explicit return: replay mode never falls into live mode
+
+    else:
+        # ── LIVE MODE ────────────────────────────────────────────────────
+        stop_event = threading.Event()
+        watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
+
+        def _stop(signum, frame):
+            print("\n" + "=" * 70)
+            print("Stopping watcher...")
+            stop_event.set()
+            watcher.stop()
+            watcher.join(timeout=5)
+            if detection_pipeline:
+                detection_pipeline.print_stats()
+            print("=" * 70)
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT,  _stop)
+        signal.signal(signal.SIGTERM, _stop)
+
+        watcher.start()   # <-- actually start the watcher
+        print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
+
+        while not stop_event.is_set():
+            time.sleep(0.2)
+
         if detection_pipeline:
             detection_pipeline.print_stats()
-        print("=" * 70)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
-
-    watcher.start()
-
-    # Loop instead of a long blocking wait — allows signals to be processed
-     #stop_event.wait()
-    while not stop_event.is_set():
-        time.sleep(0.2)
-
-    if detection_pipeline:
-        detection_pipeline.print_stats()
 
 
 if __name__ == "__main__":

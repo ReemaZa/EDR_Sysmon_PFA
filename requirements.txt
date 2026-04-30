@@ -6,3 +6,4 @@ pysigma
 python-dotenv
 pysigma-pipeline-sysmon
 redis 
+gqlalchemy
