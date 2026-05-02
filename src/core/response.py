@@ -36,7 +36,7 @@ import signal
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
-
+_approval_callback = None  # module-level
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +61,8 @@ class WindowsProtection:
             self.config_path = base_dir / ".." / ".." / "data" / "windows_protected_resources.json"
     
         self.config_path = self.config_path.resolve()
+        self.config = self._load_config()
+
         
     def _load_config(self) -> Dict:
         """Load protected resources configuration"""
@@ -193,29 +195,26 @@ def _request_approval(action: str, target: str, details: str) -> bool:
     return answer == "yes"
 
 
-def _gate(mode: Mode, action: str, target: str, description: str,
-          execute_fn, *args, **kwargs) -> Dict:
-    """
-    Central dispatch: automatic executes immediately; approval blocks until
-    the operator responds, then executes or aborts.
-    """
+
+
+def _gate(mode, action, target, description, execute_fn, *args, **kwargs):
     if mode == "automatic":
         try:
-            details = execute_fn(*args, **kwargs)
-            return _result("executed", action, target, details)
+            return _result("executed", action, target, execute_fn(*args, **kwargs))
         except Exception as exc:
             return _result("error", action, target, {"error": str(exc)})
 
-    # approval mode
-    approved = _request_approval(action, target, description)
+    # approval mode — delegate to injected callback
+    if _approval_callback is None:
+        raise RuntimeError("approval mode requires a callback — call set_approval_callback() first")
+
+    approved = _approval_callback(action, target, description)
     if not approved:
         return _result("rejected", action, target, {"reason": "operator_rejected"})
     try:
-        details = execute_fn(*args, **kwargs)
-        return _result("approved", action, target, details)
+        return _result("approved", action, target, execute_fn(*args, **kwargs))
     except Exception as exc:
         return _result("error", action, target, {"error": str(exc)})
-
 
 def alert(
     identifier: str,
@@ -582,15 +581,6 @@ def dns_block(
     hosts_file  : Path to the hosts file. Defaults to the Windows system hosts file.
     redirect_ip : IP to redirect the domain to. Defaults to 0.0.0.0 (null route).
     """
-    import re
-    DOMAIN_RE = re.compile(
-        r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
-        r"(\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,}$"
-    )
-    if not DOMAIN_RE.match(domain):
-        return _result("error", "dns_block", domain,
-                       {"error": f"Invalid domain format: '{domain}'"})
-
     # PROTECTION CHECK: Prevent blocking protected system files
     is_protected, reason = _protection.is_protected_file(hosts_file)
     if is_protected:
@@ -640,7 +630,7 @@ def dns_block(
             ["ipconfig", "/flushdns"],
             capture_output=True, text=True
         )
-
+        blacklist(domain, "domain","automatic")
         return {
             "domain": domain,
             "redirect_ip": redirect_ip,
@@ -650,7 +640,6 @@ def dns_block(
             "dns_cache_flushed": flush_result.returncode == 0,
             "flush_stderr": flush_result.stderr.strip() or None,
         }
-
     return _gate(
         mode, "dns_block", domain,
         f"Block domain '{domain}' via hosts file (redirect → {redirect_ip})",
@@ -714,6 +703,7 @@ def ip_block(
                     "ok": False,
                     "stderr": e.stderr.strip(),
                 })
+        blacklist(ip_address,"ip","automatic")
         return {"ip_address": ip_address, "direction": direction, "rules": results}
 
     return _gate(

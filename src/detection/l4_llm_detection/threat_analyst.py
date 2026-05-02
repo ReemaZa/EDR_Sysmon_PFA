@@ -43,8 +43,12 @@ from src.detection.l4_llm_detection.graph_extractor import (
 )
 from src.detection.l4_llm_detection.l4_models import ResponderOutput
 from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
+from src.detection.l4_llm_detection.action_executor import ActionExecutor
+import src.core.response as rf
+from tests.test_response.test_response import actions
 
 FINDINGS_FILE = "l4_findings.json"
+PENDING_APPROVALS_FILE = "pending_approvals.jsonl"
 
 
 class ThreatAnalyst:
@@ -63,11 +67,12 @@ class ThreatAnalyst:
         query_interval:     int = 30,
         threat_threshold:   int = 4,
         max_subgraph_nodes: int = 120,
+        action_executor_mode: str = "approval",
     ):
         self.query_interval     = query_interval
         self.threat_threshold   = threat_threshold
         self.max_subgraph_nodes = max_subgraph_nodes
-
+        self.action_executor = ActionExecutor(mode=action_executor_mode)
         # Logging
         import os
         os.makedirs("logs", exist_ok=True)
@@ -191,8 +196,27 @@ class ThreatAnalyst:
             remaining = [g for g in remaining if g not in visited]
             # unvisited_guids stay in remaining naturally since they weren't visited
             # ── NEW: execute containment actions in a parallel thread ──
-            #if finding.verdict in ("MALICIOUS", "SUSPICIOUS") and finding.actions:
-            #    self._executor.execute_async(finding.actions, finding.anchor_guid)
+            if finding.verdict in ("MALICIOUS","SUSPICIOUS") and finding.actions:
+                if self.action_executor.mode == "automatic":
+                    self.action_executor.execute_async(finding.actions, finding.anchor_guid)
+                elif self.action_executor.mode == "approval":
+                    self._save_pending_approval(finding)
+
+    def _save_pending_approval(self, finding: ResponderOutput) -> None:
+        record = {
+            "analysis_id": finding.analysis_id,
+            "anchor_guid": finding.anchor_guid,
+            "verdict": finding.verdict,
+            "actions": finding.actions,
+            "produced_at": datetime.utcnow().isoformat(),
+            "executed": False,
+        }
+        try:
+            with open(PENDING_APPROVALS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            self._log(f"[ThreatAnalyst] Pending approval saved → analysis_id={finding.analysis_id}")
+        except Exception as exc:
+            self._log(f"[ThreatAnalyst][WARN] Could not save pending approval: {exc}")
 
     # ── GRAPH SCAN ────────────────────────────────────────────────────────────
 
