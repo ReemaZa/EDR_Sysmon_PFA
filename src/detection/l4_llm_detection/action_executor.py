@@ -149,6 +149,101 @@ class ActionExecutor:
         """
         return self._run(actions, anchor_guid)
 
+    def _update_graph_after_execution(self, action: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """
+        After a successful action execution, update the relevant Memgraph node:
+          - Clear pending_action (set to null)
+          - Set action_executed  = previous action type
+          - Set action_executed_at = utcnow
+          - Apply action-specific field updates (alive, status, etc.)
+        """
+        if result.get("status") not in ("executed", "approved", "ok"):
+            return
+
+        from gqlalchemy import Memgraph
+        from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
+        from datetime import datetime
+
+        db = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
+        ts = datetime.utcnow().isoformat()
+
+        action_type = action.get("type", "")
+        target_type = action.get("target_type", "")
+        target_value = action.get("target_value", "")
+
+        try:
+            match action_type:
+
+                case "process_termination":
+                    db.execute(
+                        """
+                        MATCH (p:ProcessInstance {id: $val})
+                        SET p.pending_action      = null,
+                            p.action_executed     = $action_type,
+                            p.action_executed_at  = $ts,
+                            p.alive               = false
+                        """,
+                        {"val": target_value, "action_type": action_type, "ts": ts},
+                    )
+
+                case "file_quarantine":
+                    db.execute(
+                        """
+                        MATCH (f:File {id: $val})
+                        SET f.pending_action      = null,
+                            f.action_executed     = $action_type,
+                            f.action_executed_at  = $ts,
+                            f.status              = 'quarantined'
+                        """,
+                        {"val": target_value, "action_type": action_type, "ts": ts},
+                    )
+
+                case "file_deletion":
+                    db.execute(
+                        """
+                        MATCH (f:File {id: $val})
+                        SET f.pending_action      = null,
+                            f.action_executed     = $action_type,
+                            f.action_executed_at  = $ts,
+                            f.status              = 'deleted'
+                        """,
+                        {"val": target_value, "action_type": action_type, "ts": ts},
+                    )
+
+                case "ip_block":
+                    db.execute(
+                        """
+                        MATCH (n:Network {id: $val})
+                        SET n.pending_action      = null,
+                            n.action_executed     = $action_type,
+                            n.action_executed_at  = $ts,
+                            n.status              = 'blocked'
+                        """,
+                        {"val": target_value, "action_type": action_type, "ts": ts},
+                    )
+
+                case "dns_block":
+                    # Strip leading www. if present
+                    domain = target_value.lstrip("www.") if target_value.startswith("www.") else target_value
+                    db.execute(
+                        """
+                        MATCH (d:DNS {id: $val})
+                        SET d.pending_action      = null,
+                            d.action_executed     = $action_type,
+                            d.action_executed_at  = $ts,
+                            d.status              = 'blocked'
+                        """,
+                        {"val": domain, "action_type": action_type, "ts": ts},
+                    )
+
+                case _:
+                    # alert, blacklist, host_isolation, shutdown, etc.
+                    # no specific node to update
+                    pass
+
+        except Exception as exc:
+            print(f"[ActionExecutor][WARN] Graph update failed for {action_type} on {target_value!r}: {exc}")
+
     # ── INTERNAL RUNNER ───────────────────────────────────────────────────────
 
     def _run(self, actions: List[Dict[str, Any]], anchor_guid: str) -> List[Dict[str, Any]]:
@@ -159,6 +254,7 @@ class ActionExecutor:
             action_id = action.get("id", "?")
             try:
                 result = self._dispatch(action)
+                self._update_graph_after_execution(action, result)
                 results.append(result)
                 print(
                     f"[ActionExecutor] {action_id} ({action.get('type')}) "
