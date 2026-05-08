@@ -11,6 +11,7 @@ never receives individual events.
 """
 import os
 import sys
+import time
 from typing import Dict, Any, Optional, List
 
 from src.core.utils import FinalVerdict, ThreatLevel
@@ -28,13 +29,16 @@ class DetectionPipeline:
         enable_l1: bool = True,
         enable_l2: bool = True,
         enable_l3: bool = False,
-        enable_l4: bool = False,
+        enable_l4: bool = True,
+        enable_l2_hash: bool = True,
+        
+        
     ):
         self.enable_l1 = enable_l1
         self.enable_l2 = enable_l2
         self.enable_l3 = enable_l3
         self.enable_l4 = enable_l4
-
+        self._l2_timing_records: list = []
         self.l1_engine = None
         self.l2_engine = None
         self.l3_engine = None
@@ -45,14 +49,14 @@ class DetectionPipeline:
             self.l1_engine = HashReputationEngine()
 
         if enable_l2:
-            self.l2_engine = SigmaEngine()
+            self.l2_engine = SigmaEngine(use_hash=enable_l2_hash)  
 
         # L4: ThreatAnalyst starts its background thread immediately on construction.
         # No separate start() call is needed or exists.
         if enable_l4:
             from src.detection.l4_llm_detection.threat_analyst import ThreatAnalyst
             self.l4_analyst = ThreatAnalyst(
-                query_interval   = 30,   # scan graph every 30 seconds
+                query_interval   =30,   # scan graph every 30 seconds
                 threat_threshold = 4,    # investigate nodes with score >= 5
                 max_subgraph_nodes = 120,
             )
@@ -62,6 +66,11 @@ class DetectionPipeline:
             "alerts":       0,
             "critical":     0,
             "layer_hits":   {"l1": 0, "l2": 0, "l3": 0},
+                    "l2_checks":         0,
+        "l2_total_time_ms":  0.0,
+        "l2_min_time_ms":    float("inf"),
+        "l2_max_time_ms":    0.0,
+
         }
 
     # ── PER-EVENT PROCESSING ─────────────────────────────────────────────────
@@ -83,6 +92,8 @@ class DetectionPipeline:
             or event_hashes.get("md5")
             or event_hashes.get("sha1")
         )
+
+# → updates all 4 counters + prints per-event timing line
         if self.enable_l1 and self.l1_engine and target_hash:
             print("[DEBUG] Running L1 Hash check")
             l1_result = self.l1_engine.check_event(event)
@@ -98,7 +109,19 @@ class DetectionPipeline:
         # ── L2: Sigma Rules ───────────────────────────────────────────────
         if self.enable_l2 and self.l2_engine:
             print("[DEBUG] Running L2 Sigma check")
+            _l2_t0 = time.perf_counter()
             l2_result = self.l2_engine.check_event(event)
+            _l2_elapsed_ms = (time.perf_counter() - _l2_t0) * 1000
+            self.stats["l2_total_time_ms"] += _l2_elapsed_ms   # ← missing
+            self.stats["l2_checks"]        += 1                 # ← missing
+            self.stats["l2_min_time_ms"]    = min(self.stats["l2_min_time_ms"], _l2_elapsed_ms)  # ← missing
+            self.stats["l2_max_time_ms"]    = max(self.stats["l2_max_time_ms"], _l2_elapsed_ms)  # ← missing
+            self._l2_timing_records.append({
+    "event_id":   event_id,
+    "elapsed_ms": round(_l2_elapsed_ms, 4),
+    "matched":    l2_result is not None,
+    "cache_hit":  l2_result.metadata.get("cache_hit", False) if l2_result else False,
+})
             if l2_result:
                 verdict.add_result(l2_result)
                 self.stats["layer_hits"]["l2"] += 1
@@ -202,9 +225,35 @@ class DetectionPipeline:
             print(f"  Findings:           {l4.get('findings', 0)}")
 
         print("=" * 80 + "\n")
+    def save_timing(self, output_dir: str = "timing_results", label: str = "") -> str:
+        import json
+        from datetime import datetime
 
+        os.makedirs(output_dir, exist_ok=True)
+        tag  = f"_{label}" if label else ""
+        path = os.path.join(output_dir, f"l2_timing{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+
+        n = self.stats["l2_checks"]
+        payload = {
+            "label": label,
+            "summary": {
+                "total_events_processed": self.stats["total_events"],
+                "l2_events_timed":        n,
+                "l2_total_time_ms":       round(self.stats["l2_total_time_ms"], 4),
+                "l2_avg_time_ms":         round(self.stats["l2_total_time_ms"] / n, 4) if n else 0.0,
+                "l2_min_time_ms":         round(self.stats["l2_min_time_ms"], 4) if n else 0.0,
+                "l2_max_time_ms":         round(self.stats["l2_max_time_ms"], 4),
+            },
+            "records": self._l2_timing_records,
+        }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        print(f"[TIMING] L2 timing saved → {path}")
+        return path
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
-
+    
     def shutdown(self):
         """Gracefully stop all background engines."""
         print("\n[PIPELINE] Shutting down...")

@@ -115,6 +115,9 @@ class ActionExecutor:
             (e.g. "alert" and "blacklist" always run in automatic mode).
         """
         self.mode = mode
+        
+        self._threads = []
+        self._lock = threading.Lock()
 
     # ── PUBLIC API ────────────────────────────────────────────────────────────
 
@@ -134,6 +137,9 @@ class ActionExecutor:
             daemon=True,
             name=f"ActionExecutor-{anchor_guid[:8]}",
         )
+        with self._lock:
+            self._threads.append(t)
+
         t.start()
 
     def execute_sync(self, actions: List[Dict[str, Any]], anchor_guid: str) -> List[Dict[str, Any]]:
@@ -519,3 +525,9 @@ class ActionExecutor:
         if priority <= 6:
             return "medium"
         return "low"
+    def wait_for_completion(self):
+        with self._lock:
+            threads = list(self._threads)
+
+        for t in threads:
+            t.join()

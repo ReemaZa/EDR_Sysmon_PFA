@@ -20,7 +20,11 @@ from src.core.ingestion import parse_sysmon_event
 
 # Bookmark file to persist progress
 BOOKMARK_FILE = "sysmon_bookmark.xml"
-
+def save_raw_events(events: list[str], output_path: str, append: bool = True) -> None:
+        mode = 'a' if append else 'w'
+        with open(output_path, mode, encoding='utf-8') as f:
+            for event in events:
+                f.write(event + '\n---\n')
 
 def load_bookmark_xml() -> str | None:
     """Load persisted bookmark XML from disk. Returns None if not found."""
@@ -108,6 +112,7 @@ class SysmonEventWatcher(threading.Thread):
             
             # Parse and normalize using ingestion module
             evt = parse_sysmon_event(xml_content)
+            #save_raw_events([xml_content], "tests/sysmon_events_raw.txt") 
             #print('**********************************')
             #from pprint import pprint
 

@@ -67,7 +67,7 @@ class ThreatAnalyst:
         query_interval:     int = 30,
         threat_threshold:   int = 4,
         max_subgraph_nodes: int = 120,
-        action_executor_mode: str = "approval",
+        action_executor_mode: str = "automatic",
     ):
         self.query_interval     = query_interval
         self.threat_threshold   = threat_threshold
@@ -119,12 +119,20 @@ class ThreatAnalyst:
 
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
 
-    def shutdown(self) -> None:
+    def shutdown(self):
         self._log("[ThreatAnalyst] Shutting down...")
+
         self._stop_event.set()
+
+        # stop loop first
         self._thread.join(timeout=self.query_interval + 5)
-        with self._log_lock:
-            self._log_handle.close()
+
+        # WAIT for all actions
+        if self.action_executor:
+            self._log("[ThreatAnalyst] Waiting for actions to finish...")
+            self.action_executor.wait_for_completion()
+
+        self._log_handle.close()
 
     # ── BACKGROUND LOOP ───────────────────────────────────────────────────────
 
@@ -200,6 +208,7 @@ class ThreatAnalyst:
                 if self.action_executor.mode == "automatic":
                     self.action_executor.execute_async(finding.actions, finding.anchor_guid)
                 elif self.action_executor.mode == "approval":
+                    
                     self._save_pending_approval(finding)
 
     def _save_pending_approval(self, finding: ResponderOutput) -> None:
@@ -260,199 +269,120 @@ class ThreatAnalyst:
     # ── APPLY VERDICT ─────────────────────────────────────────────────────────
 # ── APPLY VERDICT ─────────────────────────────────────────────────────────────
 
-    def _apply_verdict(
-        self,
-        component: SubgraphContext,
-        result: ResponderOutput,
-        investigated_guids: Set[str],
-    ) -> None:
-        """
-        Write last_analysed_score, last_verdict, last_analysed_at
-        ONLY onto ProcessInstance nodes that were in the original
-        investigated set (i.e. triggered this analysis cycle).
-        Context-only nodes pulled in for graph structure are NOT updated.
-        """
+    def _apply_verdict(self, component, result, investigated_guids):
         ts = datetime.utcnow().isoformat()
-        for inst in component.instances:
-            if inst.guid not in investigated_guids:
-                self._log(
-                    f"[ThreatAnalyst] Skipping verdict stamp for context-only node {inst.guid[:20]}"
-                )
-                continue
-            try:
-                self._db.execute(
-                    """
-                    MATCH (p:ProcessInstance {id: $guid})
-                    SET p.last_analysed_score = p.score,
-                       
-                        p.last_analysed_at    = $ts
-                    """,
-                    {"guid": inst.guid, "verdict": result.verdict, "ts": ts},
-                )
-            except Exception as exc:
-                self._log(
-                    f"[ThreatAnalyst][WARN] Could not apply verdict to {inst.guid}: {exc}"
-                )
+
+        guids_to_stamp = [
+            inst.guid for inst in component.instances
+            if inst.guid in investigated_guids
+        ]
+
+        if not guids_to_stamp:
+            return
+
+        # One query for all nodes instead of one per node
+        self._db.execute(
+            """
+            UNWIND $guids AS guid
+            MATCH (p:ProcessInstance {id: guid})
+            SET p.last_analysed_score = p.score,
+                p.last_analysed_at    = $ts
+            """,
+            {"guids": guids_to_stamp, "ts": ts},
+        )
 
     # ── APPLY GRAPH ACTIONS ───────────────────────────────────────────────────────
 
     def _apply_graph_actions(self, result: ResponderOutput) -> None:
         """
         Write action tags back to their target nodes in the graph.
-    
-        Mapping:
-            target_type=guid       → ProcessInstance  → tag + action_type label
-            target_type=file       → File artifact    → tag
-            target_type=ip         → Network artifact → tag
-            target_type=domain     → DNS artifact     → tag
-            target_type=registry   → Registry artifact→ tag
-    
-        Each action stamps:
-            pending_action   = action["type"]   (e.g. "process_termination")
-            action_priority  = action["priority"]
-            action_reason    = action["reason"]
-            action_stamped_at = <utcnow>
+        Uses UNWIND batching — one query per node type instead of one per action.
         """
         if not result.actions:
             return
-    
+
         ts = datetime.utcnow().isoformat()
-    
+
+        # Group actions by target_type
+        from collections import defaultdict
+        groups = defaultdict(list)
+
         for action in result.actions:
             target_type  = action.get("target_type", "")
             target_value = action.get("target_value", "")
-            action_type  = action.get("type", "unknown")
-            priority     = action.get("priority", 0)
-            reason       = action.get("reason", "")
-    
             if not target_value:
                 continue
-            
+            groups[target_type].append({
+                "val":         target_value,
+                "action_type": action.get("type", "unknown"),
+                "priority":    action.get("priority", 0),
+                "reason":      action.get("reason", ""),
+            })
+
+        # Map: target_type → (label, id_field)
+        TYPE_MAP = {
+            "guid":     ("ProcessInstance", "id"),
+            "file":     ("File",            "id"),
+            "ip":       ("Network",         "id"),
+            "domain":   ("DNS",             "id"),
+            "registry": ("Registry",        "id"),
+            "user":     ("User",            "id"),
+        }
+
+        for target_type, actions_list in groups.items():
+            if target_type not in TYPE_MAP:
+                self._log(
+                    f"[ThreatAnalyst][WARN] Unknown target_type={target_type!r} "
+                    f"— skipping {len(actions_list)} action(s)"
+                )
+                continue
+
+            label, id_field = TYPE_MAP[target_type]
+
             try:
-                if target_type == "guid":
-                    # ProcessInstance node — stamp pending_action directly
-                    self._db.execute(
-                        """
-                        MATCH (p:ProcessInstance {id: $val})
-                        SET p.pending_action    = $action_type,
-                            p.action_reason     = $reason,
-                            p.action_stamped_at = $ts
-                        """,
-                        {
-                            "val":         target_value,
-                            "action_type": action_type,
-                            "reason":      reason,
-                            "ts":          ts,
-                        },
-                    )
+                self._db.execute(
+                    f"""
+                    UNWIND $actions AS a
+                    MATCH (n:{label} {{{id_field}: a.val}})
+                    SET n.pending_action    = a.action_type,
+                        n.action_reason     = a.reason,
+                        n.action_stamped_at = $ts
+                    """,
+                    {"actions": actions_list, "ts": ts},
+                )
+                for a in actions_list:
                     self._log(
-                        f"[ThreatAnalyst][ACTION] [{action_type}] → ProcessInstance {target_value[:20]}"
+                        f"[ThreatAnalyst][ACTION] [{a['action_type']}] "
+                        f"→ {label} {a['val'][:20] if len(a['val']) > 20 else a['val']}"
                     )
-    
-                elif target_type == "file":
-                    # File artifact — match by id (which is the path in your schema)
-                    #Todo: standarize fileName
-                    self._db.execute(
-                        """
-                        MATCH (f:File {id: $val})
-                        SET f.pending_action    = $action_type,
-                            f.action_reason     = $reason,
-                            f.action_stamped_at = $ts
-                        """,
-                        {
-                            "val":         target_value,
-                            "action_type": action_type,
-                            "priority":    priority,
-                            "reason":      reason,
-                            "ts":          ts,
-                        },
-                    )
-                elif target_type == "user":
-                    self._db.execute(
-                        """
-                        MATCH (u:User {id: $val})
-                        SET u.pending_action    = $action_type,
-                            u.action_reason     = $reason,
-                            u.action_stamped_at = $ts
-                        """,
-                        {"val": target_value, "action_type": action_type,
-                         "priority": priority, "reason": reason, "ts": ts},
-                    )
-                    self._log(
-                        f"[ThreatAnalyst][ACTION] [{action_type}] → User {target_value}"
-                    )
-    
-                elif target_type == "ip":
-                    self._db.execute(
-                        """
-                        MATCH (n:Network {id: $val})
-                        SET n.pending_action    = $action_type,
-                            n.action_reason     = $reason,
-                            n.action_stamped_at = $ts
-                        """,
-                        {
-                            "val":         target_value,
-                            "action_type": action_type,
-                            "priority":    priority,
-                            "reason":      reason,
-                            "ts":          ts,
-                        },
-                    )
-                    self._log(
-                        f"[ThreatAnalyst][ACTION] [{action_type}] → Network {target_value}"
-                    )
-    
-                elif target_type == "domain":
-                    self._db.execute(
-                        """
-                        MATCH (d:DNS {id: $val})
-                        SET d.pending_action    = $action_type,
-                            d.action_reason     = $reason,
-                            d.action_stamped_at = $ts
-                        """,
-                        {
-                            "val":         target_value,
-                            "action_type": action_type,
-                        
-                            "reason":      reason,
-                            "ts":          ts,
-                        },
-                    )
-                    self._log(
-                        f"[ThreatAnalyst][ACTION] [{action_type}] → DNS {target_value}"
-                    )
-    
-                elif target_type == "registry":
-                    self._db.execute(
-                        """
-                        MATCH (r:Registry {id: $val})
-                        SET r.pending_action    = $action_type,
-                            r.action_reason     = $reason,
-                            r.action_stamped_at = $ts
-                        """,
-                        {
-                            "val":         target_value,
-                            "action_type": action_type,
-                            "priority":    priority,
-                            "reason":      reason,
-                            "ts":          ts,
-                        },
-                    )
-                    self._log(
-                        f"[ThreatAnalyst][ACTION] [{action_type}] → Registry {target_value}"
-                    )
-                
-                else:
-                    self._log(
-                        f"[ThreatAnalyst][WARN] Unknown target_type={target_type!r} "
-                        f"for action {action.get('id')} — skipping graph write"
-                    )
-    
+
             except Exception as exc:
                 self._log(
-                    f"[ThreatAnalyst][WARN] Could not stamp action {action.get('id')} "
-                    f"on {target_type}={target_value}: {exc}"
+                    f"[ThreatAnalyst][WARN] Batch stamp failed for "
+                    f"target_type={target_type}: {exc}"
                 )
+                # Fallback: retry one by one
+                for a in actions_list:
+                    try:
+                        self._db.execute(
+                            f"""
+                            MATCH (n:{label} {{{id_field}: $val}})
+                            SET n.pending_action    = $action_type,
+                                n.action_reason     = $reason,
+                                n.action_stamped_at = $ts
+                            """,
+                            {
+                                "val":         a["val"],
+                                "action_type": a["action_type"],
+                                "reason":      a["reason"],
+                                "ts":          ts,
+                            },
+                        )
+                    except Exception as inner_exc:
+                        self._log(
+                            f"[ThreatAnalyst][WARN] Single fallback also failed "
+                            f"for {label} {a['val']}: {inner_exc}"
+                        )
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 
