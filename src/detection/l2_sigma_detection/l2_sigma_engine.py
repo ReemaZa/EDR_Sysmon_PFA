@@ -45,7 +45,7 @@ event_id_to_folders = {
 
 class SigmaEngine:
 
-    def __init__(self, rules_dir: str = None):
+    def __init__(self, rules_dir: str = None, use_hash=True):
         # Resolve default rules directory relative to this file so loading
         # works regardless of current working directory when the app runs.
         if rules_dir is None:
@@ -71,7 +71,7 @@ class SigmaEngine:
 
         print("[INIT] Extracting fields...")
         self.fields_by_event = self._load_fields_from_json("fields.json")
-
+        self.use_hash = use_hash 
     # ================= LOAD RULES =================
     def _load_rules_from_path(self, folder_path, categories=None):
         rules = []
@@ -266,44 +266,47 @@ class SigmaEngine:
         try:
             event = {**event, **event["data"]}
 
-            event_hash = self.build_event_hash(event)
-            if not event_hash:
-                return None
-
-            # ================= DUPLICATE =================
-            if self.is_duplicate(event_hash):
-                data = self.get_event(event_hash)
-
-                if not data:
+            
+            if self.use_hash:
+                event_hash = self.build_event_hash(event)
+                if not event_hash:
                     return None
 
-                # Increment counter and persist
-                data["count"] = data.get("count", 1) + 1
-                self.store_event(event_hash, data)
+                # ================= DUPLICATE =================
+                if self.is_duplicate(event_hash):
+                    data = self.get_event(event_hash)
 
-                print(f"[DUPLICATE x{data['count']}] {event_hash}")
+                    if not data:
+                        return None
 
-                # Only emit a result if the original event actually matched rules
-                if data.get("matches"):
-                    return DetectionResult(
-                        layer_name="L2-Sigma",
-                        threat_level=SCORE_TO_THREAT.get(
-                            data.get("total_score", 0), ThreatLevel.LOW
-                        ),
-                        matches=data["matches"],
-                        metadata={
-                            "rules": data["matches"],
-                            #"techniques": data.get("techniques", []),
-                            #"tactics": data.get("tactics", []),
-                            #"finding_ids": data.get("finding_ids", []),
-                            #"total_score": data.get("total_score", 0),
-                            "count": data["count"],
-                            "source": "redis-cache",
-                            "graph_detection": self._build_graph_detection(data)  # ADD THIS
-                        },
-                    )
+                    # Increment counter and persist
+                    data["count"] = data.get("count", 1) + 1
+                    self.store_event(event_hash, data)
 
-                return None
+                    print(f"[DUPLICATE x{data['count']}] {event_hash}")
+
+                    # Only emit a result if the original event actually matched rules
+                    if data.get("matches"):
+                        return DetectionResult(
+                            layer_name="L2-Sigma",
+                            threat_level=SCORE_TO_THREAT.get(
+                                data.get("total_score", 0), ThreatLevel.LOW
+                            ),
+                            matches=data["matches"],
+                            metadata={
+                                "rules": data["matches"],
+                                #"techniques": data.get("techniques", []),
+                                #"tactics": data.get("tactics", []),
+                                #"finding_ids": data.get("finding_ids", []),
+                                #"total_score": data.get("total_score", 0),
+                                "count": data["count"],
+                                "source": "redis-cache",
+                                "cache_hit": True,
+                                "graph_detection": self._build_graph_detection(data)  # ADD THIS
+                            },
+                        )
+
+                    return None
 
             # ================= FIRST TIME — run ALL matchers first =================
             matched_rule_ids = []
@@ -343,10 +346,13 @@ class SigmaEngine:
                 count=1,
                 event=event,
             )
+        
 
-
-            self.store_event(event_hash, data)
-            print(f"[NEW] {event_hash}")
+            if self.use_hash and event_hash:
+                self.store_event(event_hash, data)
+                print(f"[NEW] {event_hash}")
+            else:
+                print(f"[NO-HASH MODE] skipping store")
 
             if not matched_rule_titles:
                 return None
@@ -365,6 +371,7 @@ class SigmaEngine:
                     #"total_score": data["total_score"],
                     "count": 1,
                     "source": "fresh-detection",
+                    "cache_hit": False,
                     "graph_detection": self._build_graph_detection(data)  # ADD THIS
                 },
             )
