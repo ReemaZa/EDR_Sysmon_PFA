@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>EDR · Sysmon Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet"/>
+<style>
+  /* ── Reset & Variables ───────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --border:    #21262d;
+    --text:      #c9d1d9;
+    --muted:     #8b949e;
+    --accent:    #58a6ff;
+    --critical:  #f85149;
+    --high:      #ff7b72;
+    --medium:    #e3b341;
+    --low:       #3fb950;
+    --executed:  #3fb950;
+    --error:     #f85149;
+    --skipped:   #8b949e;
+    --font-mono: 'IBM Plex Mono', monospace;
+    --font-sans: 'IBM Plex Sans', sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  /* ── Layout ──────────────────────────────────────────────── */
+  .shell {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    grid-template-rows: 48px 1fr;
+    min-height: 100vh;
+  }
+
+  /* ── Top bar ─────────────────────────────────────────────── */
+  .topbar {
+    grid-column: 1 / -1;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 12px;
+  }
+  .topbar-logo {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .topbar-sep { flex: 1; }
+  .topbar-health {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--low);
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: .4; }
+  }
+
+  /* ── Sidebar ─────────────────────────────────────────────── */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 16px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .nav-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    padding: 12px 16px 4px;
+  }
+  .nav-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: 13px var(--font-sans);
+    text-align: left;
+    padding: 8px 16px;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    transition: all .15s;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .nav-btn:hover  { color: var(--text); background: rgba(255,255,255,.03); }
+  .nav-btn.active { color: var(--accent); border-left-color: var(--accent); background: rgba(88,166,255,.06); }
+
+  /* ── Main ────────────────────────────────────────────────── */
+  .main {
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  /* ── Sections (panels) ───────────────────────────────────── */
+  .panel { display: none; flex-direction: column; gap: 20px; }
+  .panel.active { display: flex; }
+
+  /* ── Stat cards ──────────────────────────────────────────── */
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .stat-card .label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .stat-card .value {
+    font-family: var(--font-mono);
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .stat-card.critical .value { color: var(--critical); }
+  .stat-card.high     .value { color: var(--high); }
+  .stat-card.medium   .value { color: var(--medium); }
+  .stat-card.low      .value { color: var(--low); }
+  .stat-card.total    .value { color: var(--accent); }
+  .stat-card.recent   .value { color: var(--text); }
+
+  /* ── Section header ──────────────────────────────────────── */
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 2px;
+  }
+  .section-head h2 {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+  }
+  .section-head .line {
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── Filter bar ──────────────────────────────────────────── */
+  .filter-bar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .filter-bar select, .filter-bar input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font: 13px var(--font-mono);
+    padding: 6px 10px;
+    border-radius: 4px;
+    outline: none;
+    cursor: pointer;
+    appearance: none;
+  }
+  .filter-bar select:focus, .filter-bar input:focus {
+    border-color: var(--accent);
+  }
+  .btn {
+    background: var(--accent);
+    color: #0d1117;
+    border: none;
+    font: 600 12px var(--font-mono);
+    padding: 7px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: .06em;
+    transition: opacity .15s;
+  }
+  .btn:hover    { opacity: .85; }
+  .btn.ghost {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.danger {
+    background: var(--critical);
+    color: #fff;
+  }
+
+  /* ── Table ───────────────────────────────────────────────── */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0,0,0,.2);
+    white-space: nowrap;
+  }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.025); }
+  td {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 9px 14px;
+    vertical-align: top;
+    color: var(--text);
+    max-width: 340px;
+    word-break: break-word;
+  }
+  td.muted { color: var(--muted); }
+
+  /* ── Badges ──────────────────────────────────────────────── */
+  .badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .badge.CRITICAL { background: rgba(248,81,73,.15); color: var(--critical); border: 1px solid rgba(248,81,73,.3); }
+  .badge.HIGH     { background: rgba(255,123,114,.15); color: var(--high);     border: 1px solid rgba(255,123,114,.3); }
+  .badge.MEDIUM   { background: rgba(227,179,65,.15); color: var(--medium);   border: 1px solid rgba(227,179,65,.3); }
+  .badge.LOW      { background: rgba(63,185,80,.12); color: var(--low);      border: 1px solid rgba(63,185,80,.25); }
+  .badge.executed { background: rgba(63,185,80,.12); color: var(--executed);  border: 1px solid rgba(63,185,80,.25); }
+  .badge.error    { background: rgba(248,81,73,.12); color: var(--error);     border: 1px solid rgba(248,81,73,.25); }
+  .badge.skipped  { background: rgba(139,148,158,.12); color: var(--skipped); border: 1px solid rgba(139,148,158,.25); }
+
+  /* ── Pagination ──────────────────────────────────────────── */
+  .pagination {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .pagination .spacer { flex: 1; }
+
+  /* ── Layer cards ─────────────────────────────────────────── */
+  .layer-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .layer-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .layer-card .lname {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .layer-card .lcount {
+    font-family: var(--font-mono);
+    font-size: 28px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .layer-card .lbar-bg {
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .layer-card .lbar {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width .4s;
+  }
+
+  /* ── Blacklist ───────────────────────────────────────────── */
+  .hash-list {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .hash-item {
+    display: flex;
+    align-items: center;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    gap: 8px;
+  }
+  .hash-item:last-child { border-bottom: none; }
+  .hash-item .hval { flex: 1; color: var(--muted); word-break: break-all; }
+  .add-hash-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .add-hash-form input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font: 13px var(--font-mono);
+    padding: 8px 12px;
+    border-radius: 4px;
+    outline: none;
+  }
+  .add-hash-form input:focus { border-color: var(--accent); }
+  .add-hash-form input::placeholder { color: var(--muted); }
+
+  /* ── Approvals ──────────────────────────────────────────────── */
+  .approval-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .approval-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0,0,0,.15);
+  }
+  .approval-header .verdict {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+  .verdict.MALICIOUS  { background: rgba(248,81,73,.15); color: var(--critical); border: 1px solid rgba(248,81,73,.3); }
+  .verdict.SUSPICIOUS { background: rgba(227,179,65,.15); color: var(--medium);  border: 1px solid rgba(227,179,65,.3); }
+  .verdict.BENIGN     { background: rgba(63,185,80,.12);  color: var(--low);     border: 1px solid rgba(63,185,80,.25); }
+  .approval-header .anchor {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    flex: 1;
+  }
+  .approval-header .produced {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--muted);
+  }
+  .approval-action-row {
+    display: grid;
+    grid-template-columns: 36px 110px 90px 1fr auto;
+    align-items: start;
+    gap: 10px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    transition: background .1s;
+  }
+  .approval-action-row:last-child { border-bottom: none; }
+  .approval-action-row:hover { background: rgba(255,255,255,.025); }
+  .approval-action-row .prio {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    text-align: center;
+    padding-top: 2px;
+  }
+  .approval-action-row .atype {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    word-break: break-all;
+  }
+  .approval-action-row .atarget {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .approval-action-row .areason {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .approval-action-row .abtns {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+    align-items: center;
+  }
+  .btn.approve { background: var(--low); color: #0d1117; }
+  .btn.reject  { background: none; border: 1px solid var(--critical); color: var(--critical); }
+  .btn.approve:hover { opacity: .8; }
+  .btn.reject:hover  { background: rgba(248,81,73,.1); }
+  .decision-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    white-space: nowrap;
+  }
+  .decision-badge.approved { background: rgba(63,185,80,.12);  color: var(--low);      border: 1px solid rgba(63,185,80,.25); }
+  .decision-badge.rejected { background: rgba(248,81,73,.12);  color: var(--critical); border: 1px solid rgba(248,81,73,.25); }
+
+  /* ── Empty & loading states ──────────────────────────────── */
+  .empty {
+    text-align: center;
+    padding: 48px 20px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .loading { animation: blink .8s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* ── Toast ───────────────────────────────────────────────── */
+  #toast {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    display: none;
+    z-index: 9999;
+    max-width: 320px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  #toast.success { border-color: var(--low); color: var(--low); }
+  #toast.error   { border-color: var(--critical); color: var(--critical); }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <span class="topbar-logo">⬡ EDR Sysmon</span>
+    <span class="topbar-sep"></span>
+  </header>
+
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <span class="nav-label">Monitor</span>
+    <button class="nav-btn active" onclick="showPanel('alerts')" id="nav-alerts">
+      ▶ Alerts
+    </button>
+    <button class="nav-btn" onclick="showPanel('layers')" id="nav-layers">
+      ◈ Alerts Breakdown
+    </button>
+
+    <span class="nav-label" style="margin-top:8px">Defense</span>
+    <button class="nav-btn" onclick="showPanel('blacklist')" id="nav-blacklist">
+      ⊘ IOC Blacklists
+    </button>
+
+    <button class="nav-btn" onclick="showPanel('approvals')" id="nav-approvals">
+      ⚑ Pending Approvals <span id="nav-approvals-badge" style="display:none;background:var(--critical);color:#fff;font-size:9px;padding:1px 5px;border-radius:8px;margin-left:4px"></span>
+    </button>
+
+    <span class="nav-label" style="margin-top:8px">System</span>
+    <a href="http://localhost:3000" target="_blank" class="nav-btn" style="text-decoration:none">
+      ⬡ Memgraph Lab
+    </a>
+  </nav>
+
+  <!-- Main content -->
+  <main class="main">
+
+    <!-- ── ALERTS PANEL ─────────────────────────────────────── -->
+    <section class="panel active" id="panel-alerts">
+
+      <!-- Stat summary -->
+      <div class="stat-row" id="stat-row">
+        <div class="stat-card total"><div class="label">Total</div><div class="value loading" id="s-total">…</div></div>
+        <div class="stat-card critical"><div class="label">Critical</div><div class="value loading" id="s-critical">…</div></div>
+        <div class="stat-card high"><div class="label">High</div><div class="value loading" id="s-high">…</div></div>
+        <div class="stat-card medium"><div class="label">Medium</div><div class="value loading" id="s-medium">…</div></div>
+        <div class="stat-card low"><div class="label">Low</div><div class="value loading" id="s-low">…</div></div>
+        <div class="stat-card recent"><div class="label">Last 24 h</div><div class="value loading" id="s-recent">…</div></div>
+      </div>
+
+      <!-- Filters -->
+      <div class="section-head"><h2>Event Log</h2><div class="line"></div></div>
+      <div class="filter-bar">
+        <select id="f-severity" onchange="fetchAlerts()">
+          <option value="all">All severities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+<select id="f-status" onchange="fetchAlerts()">
+          <option value="all">All statuses</option>
+          <option value="executed">Executed</option>
+          <option value="error">Error</option>
+          <option value="skipped">Skipped</option>
+        </select>
+        <span style="flex:1"></span>
+        <button class="btn ghost" onclick="fetchAlerts(); fetchStats()">↻ Refresh</button>
+      </div>
+
+      <!-- Table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Severity</th>
+              <th>Action</th>
+              <th>Status</th>
+              <th>Target / Message</th>
+            </tr>
+          </thead>
+          <tbody id="alerts-tbody">
+            <tr><td colspan="5" class="empty loading">Loading…</td></tr>
+          </tbody>
+        </table>
+        <div class="pagination">
+          <span id="page-info">—</span>
+          <span class="spacer"></span>
+          <button class="btn ghost" id="btn-prev" onclick="changePage(-1)" disabled>← Prev</button>
+          <button class="btn ghost" id="btn-next" onclick="changePage(1)">Next →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── DETECTION LAYERS PANEL ────────────────────────────── -->
+    <section class="panel" id="panel-layers">
+      <div class="section-head"><h2>Actions</h2><div class="line"></div></div>
+      <p style="color:var(--muted);font-size:13px">Events grouped by action type (e.g. file_quarantine, ip_block, blacklist).</p>
+      <div class="layer-grid" id="layer-grid">
+        <div class="empty loading" style="grid-column:1/-1">Loading…</div>
+      </div>
+
+      <div class="section-head" style="margin-top:8px"><h2>Status Breakdown</h2><div class="line"></div></div>
+      <div class="layer-grid" id="status-grid">
+        <div class="empty loading" style="grid-column:1/-1">Loading…</div>
+      </div>
+    </section>
+
+    <!-- ── IOC BLACKLISTS PANEL ─────────────────────────────── -->
+    <section class="panel" id="panel-blacklist">
+
+      <!-- Tabs -->
+      <div class="filter-bar" style="margin-bottom:4px">
+        <button class="btn" id="bl-tab-hash"   onclick="switchBlTab('hash')"  >Hashes</button>
+        <button class="btn ghost" id="bl-tab-domain" onclick="switchBlTab('domain')">Domains</button>
+        <button class="btn ghost" id="bl-tab-ip"     onclick="switchBlTab('ip')"    >IP Addresses</button>
+        <button class="btn ghost" id="bl-tab-agent"  onclick="switchBlTab('agent')" >Agent JSON</button>
+        <span style="flex:1"></span>
+        <button class="btn ghost" onclick="refreshCurrentBlTab()">↻ Refresh</button>
+      </div>
+
+      <!-- Hash sub-panel -->
+      <div id="bl-sub-hash">
+        <div class="section-head"><h2>Hash Blacklist <span id="bl-count" style="color:var(--accent)"></span></h2><div class="line"></div></div>
+        <p style="color:var(--muted);font-size:13px">SHA-256 / MD5 hashes blocked by L1 reputation engine.</p>
+        <div class="add-hash-form">
+          <input type="text" id="new-hash" placeholder="Paste SHA-256 or MD5 hash…"/>
+          <button class="btn" onclick="addHash()">+ Add</button>
+        </div>
+        <div class="hash-list" id="hash-list"><div class="empty loading">Loading…</div></div>
+        <p style="color:var(--muted);font-size:11px;font-family:var(--font-mono)">File: <code>config/ioc/hash_blacklist.txt</code></p>
+      </div>
+
+      <!-- Domain sub-panel -->
+      <div id="bl-sub-domain" style="display:none">
+        <div class="section-head"><h2>Domain Blacklist <span id="bl-domain-count" style="color:var(--accent)"></span></h2><div class="line"></div></div>
+        <p style="color:var(--muted);font-size:13px">Blocked domains — matched against DNS queries and HTTP hosts.</p>
+        <div class="add-hash-form">
+          <input type="text" id="new-domain" placeholder="e.g. evil.example.com"/>
+          <button class="btn" onclick="addDomain()">+ Add</button>
+        </div>
+        <div class="hash-list" id="domain-list"><div class="empty loading">Loading…</div></div>
+        <p style="color:var(--muted);font-size:11px;font-family:var(--font-mono)">File: <code>config/ioc/domain_blacklist.txt</code></p>
+      </div>
+
+      <!-- IP sub-panel -->
+      <div id="bl-sub-ip" style="display:none">
+        <div class="section-head"><h2>IP Blacklist <span id="bl-ip-count" style="color:var(--accent)"></span></h2><div class="line"></div></div>
+        <p style="color:var(--muted);font-size:13px">Blocked IPs — firewall rules created automatically on match.</p>
+        <div class="add-hash-form">
+          <input type="text" id="new-ip" placeholder="e.g. 192.168.1.100 or CIDR 10.0.0.0/8"/>
+          <button class="btn" onclick="addIP()">+ Add</button>
+        </div>
+        <div class="hash-list" id="ip-list"><div class="empty loading">Loading…</div></div>
+        <p style="color:var(--muted);font-size:11px;font-family:var(--font-mono)">File: <code>config/ioc/ip_blacklist.txt</code></p>
+      </div>
+
+      <!-- Agent JSON sub-panel -->
+      <div id="bl-sub-agent" style="display:none">
+        <div class="section-head"><h2>Agent Blacklist <span id="bl-agent-count" style="color:var(--accent)"></span></h2><div class="line"></div></div>
+        <p style="color:var(--muted);font-size:13px">Structured agent entries from <code>agent_blacklist.json</code>. Paste a JSON object per entry.</p>
+        <div class="add-hash-form">
+          <input type="text" id="new-agent" placeholder='{"type":"domain","value":"evil.local","added":"2026-05-10"}'/>
+          <button class="btn" onclick="addAgent()">+ Add</button>
+        </div>
+        <div class="hash-list" id="agent-list"><div class="empty loading">Loading…</div></div>
+        <p style="color:var(--muted);font-size:11px;font-family:var(--font-mono)">File: <code>config/ioc/agent_blacklist.json</code></p>
+      </div>
+
+    </section>
+
+    <!-- ── PENDING APPROVALS PANEL ─────────────────────────────── -->
+    <section class="panel" id="panel-approvals">
+      <div class="section-head"><h2>Pending Approvals</h2><div class="line"></div></div>
+      <p style="color:var(--muted);font-size:13px">Actions queued in <code>approval</code> mode — review each action and approve or reject individually.</p>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ap-filter" onchange="renderApprovals()" style="background:var(--surface);border:1px solid var(--border);color:var(--text);font:13px var(--font-mono);padding:6px 10px;border-radius:4px;outline:none;appearance:none;cursor:pointer">
+          <option value="all">All actions</option>
+          <option value="pending">Pending only</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+        </select>
+        <span style="flex:1"></span>
+        <button class="btn ghost" onclick="fetchApprovals()">↻ Refresh</button>
+      </div>
+      <div id="approvals-container">
+        <div class="empty loading">Loading…</div>
+      </div>
+    </section>
+
+
+
+<div id="toast"></div>
+
+<script>
+/* ── State ──────────────────────────────────────────────────────── */
+let currentPage = 1;
+const perPage   = 20;
+
+/* ── Navigation ─────────────────────────────────────────────────── */
+function showPanel(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  document.getElementById('nav-' + name).classList.add('active');
+
+  // Lazy-load panel data
+  if (name === 'layers')    fetchLayers();
+  if (name === 'blacklist') loadBlTab(currentBlTab);
+  if (name === 'health')    fetchHealth();
+  if (name === 'approvals') fetchApprovals();
+}
+
+/* ── Toast ───────────────────────────────────────────────────────── */
+function showToast(msg, type = 'success') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className   = type;
+  t.style.display = 'block';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+
+/* ── Helpers ─────────────────────────────────────────────────────── */
+function fmtTime(ts) {
+  if (!ts) return '—';
+  try {
+    return new Date(ts).toLocaleString('en-GB', {
+      year:'numeric', month:'2-digit', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', second:'2-digit'
+    });
+  } catch { return ts; }
+}
+
+function badge(val, cls) {
+  return `<span class="badge ${cls || val}">${val}</span>`;
+}
+
+/* ── Statistics ──────────────────────────────────────────────────── */
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/statistics');
+    const d = await r.json();
+    document.getElementById('s-total').textContent    = d.total_alerts ?? 0;
+    document.getElementById('s-critical').textContent = d.critical ?? 0;
+    document.getElementById('s-high').textContent     = d.high ?? 0;
+    document.getElementById('s-medium').textContent   = d.medium ?? 0;
+    document.getElementById('s-low').textContent      = d.low ?? 0;
+    document.getElementById('s-recent').textContent   = d.last_24h ?? 0;
+    document.querySelectorAll('#stat-row .value').forEach(el => el.classList.remove('loading'));
+
+  } catch (e) {
+    console.error('fetchStats', e);
+  }
+}
+
+/* ── Alerts table ────────────────────────────────────────────────── */
+async function fetchAlerts() {
+  const severity = document.getElementById('f-severity').value;
+  const status   = document.getElementById('f-status').value;
+
+  const params = new URLSearchParams({
+    severity, status,
+    page: currentPage, per_page: perPage
+  });
+
+  const tbody = document.getElementById('alerts-tbody');
+  tbody.innerHTML = '<tr><td colspan="5" class="empty loading">Loading…</td></tr>';
+
+  try {
+    const r = await fetch('/api/alerts?' + params);
+    const d = await r.json();
+    renderAlerts(d);
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">⚠ Failed to load alerts</td></tr>';
+    console.error('fetchAlerts', e);
+  }
+}
+
+function renderAlerts(data) {
+  const tbody = document.getElementById('alerts-tbody');
+  const { alerts, total, page, per_page } = data;
+
+  if (!alerts || alerts.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No events match the current filters</td></tr>';
+    document.getElementById('page-info').textContent = '0 results';
+    document.getElementById('btn-prev').disabled = true;
+    document.getElementById('btn-next').disabled = true;
+    return;
+  }
+
+  tbody.innerHTML = alerts.map(a => `
+    <tr>
+      <td class="muted" style="white-space:nowrap">${fmtTime(a.timestamp)}</td>
+      <td>${badge(a.threat_level || 'LOW')}</td>
+      <td style="color:var(--accent)">${a.action || '—'}</td>
+      <td>${badge(a.status, a.status)}</td>
+      <td style="max-width:360px">${escHtml(a.message || a.target || '—')}</td>
+    </tr>
+  `).join('');
+
+  const start = (page - 1) * per_page + 1;
+  const end   = Math.min(page * per_page, total);
+  document.getElementById('page-info').textContent = `${start}–${end} of ${total}`;
+  document.getElementById('btn-prev').disabled = page <= 1;
+  document.getElementById('btn-next').disabled = end >= total;
+}
+
+function changePage(dir) {
+  currentPage = Math.max(1, currentPage + dir);
+  fetchAlerts();
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Alerts Breakdown panel ─────────────────────────────────────── */
+async function fetchLayers() {
+  try {
+    const r = await fetch('/api/statistics');
+    const d = await r.json();
+    renderLayerCards('layer-grid', d.by_action || {}, 'var(--accent)');
+    renderLayerCards('status-grid', d.by_status || {}, 'var(--medium)');
+  } catch (e) {
+    document.getElementById('layer-grid').innerHTML =
+      '<div class="empty">⚠ Failed to load layer data</div>';
+    console.error('fetchLayers', e);
+  }
+}
+
+function renderLayerCards(containerId, obj, barColor) {
+  const container = document.getElementById(containerId);
+  const entries   = Object.entries(obj).sort((a,b) => b[1] - a[1]);
+  const maxVal    = entries[0]?.[1] || 1;
+
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="empty">No data</div>';
+    return;
+  }
+
+  container.innerHTML = entries.map(([name, count]) => {
+    const pct = Math.round((count / maxVal) * 100);
+    return `
+      <div class="layer-card">
+        <div class="lname">${escHtml(name)}</div>
+        <div class="lcount">${count}</div>
+        <div class="lbar-bg"><div class="lbar" style="width:${pct}%;background:${barColor}"></div></div>
+      </div>`;
+  }).join('');
+}
+
+/* ── IOC Blacklist panels ───────────────────────────────────────── */
+let currentBlTab = 'hash';
+
+function switchBlTab(tab) {
+  currentBlTab = tab;
+  ['hash','domain','ip','agent'].forEach(t => {
+    document.getElementById('bl-sub-' + t).style.display  = t === tab ? '' : 'none';
+    const btn = document.getElementById('bl-tab-' + t);
+    btn.className = t === tab ? 'btn' : 'btn ghost';
+  });
+  loadBlTab(tab);
+}
+
+function refreshCurrentBlTab() { loadBlTab(currentBlTab); }
+
+function loadBlTab(tab) {
+  if (tab === 'hash')   fetchBlacklist();
+  if (tab === 'domain') fetchDomainBlacklist();
+  if (tab === 'ip')     fetchIPBlacklist();
+  if (tab === 'agent')  fetchAgentBlacklist();
+}
+
+function renderList(containerId, items, emptyMsg) {
+  const el = document.getElementById(containerId);
+  if (!items || items.length === 0) {
+    el.innerHTML = `<div class="empty">${emptyMsg}</div>`;
+    return;
+  }
+  el.innerHTML = items.map((v, i) => `
+    <div class="hash-item">
+      <span class="muted" style="font-size:10px;min-width:20px">${i+1}</span>
+      <span class="hval">${escHtml(typeof v === 'object' ? JSON.stringify(v) : String(v))}</span>
+    </div>`).join('');
+}
+
+async function fetchBlacklist() {
+  document.getElementById('hash-list').innerHTML = '<div class="empty loading">Loading…</div>';
+  try {
+    const d = await fetch('/api/blacklist').then(r => r.json());
+    document.getElementById('bl-count').textContent = `(${d.count})`;
+    renderList('hash-list', d.hashes, 'No hashes in blacklist');
+  } catch(e) {
+    document.getElementById('hash-list').innerHTML = '<div class="empty">⚠ Failed to load</div>';
+  }
+}
+
+async function fetchDomainBlacklist() {
+  document.getElementById('domain-list').innerHTML = '<div class="empty loading">Loading…</div>';
+  try {
+    const d = await fetch('/api/domain-blacklist').then(r => r.json());
+    document.getElementById('bl-domain-count').textContent = `(${d.count})`;
+    renderList('domain-list', d.domains, 'No domains in blacklist');
+  } catch(e) {
+    document.getElementById('domain-list').innerHTML = '<div class="empty">⚠ Failed to load</div>';
+  }
+}
+
+async function fetchIPBlacklist() {
+  document.getElementById('ip-list').innerHTML = '<div class="empty loading">Loading…</div>';
+  try {
+    const d = await fetch('/api/ip-blacklist').then(r => r.json());
+    document.getElementById('bl-ip-count').textContent = `(${d.count})`;
+    renderList('ip-list', d.ips, 'No IPs in blacklist');
+  } catch(e) {
+    document.getElementById('ip-list').innerHTML = '<div class="empty">⚠ Failed to load</div>';
+  }
+}
+
+async function fetchAgentBlacklist() {
+  document.getElementById('agent-list').innerHTML = '<div class="empty loading">Loading…</div>';
+  try {
+    const d = await fetch('/api/agent-blacklist').then(r => r.json());
+    document.getElementById('bl-agent-count').textContent = `(${d.count})`;
+    renderList('agent-list', d.entries, 'No entries in agent blacklist');
+  } catch(e) {
+    document.getElementById('agent-list').innerHTML = '<div class="empty">⚠ Failed to load</div>';
+  }
+}
+
+async function addToList(url, body, inputId, refreshFn, label) {
+  const inp = document.getElementById(inputId);
+  const val = inp.value.trim();
+  if (!val) { showToast(`Enter a ${label} first`, 'error'); return; }
+  try {
+    const d = await fetch(url, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body(val))
+    }).then(r => r.json());
+    if (d.success) { inp.value = ''; showToast(`${label} added`); refreshFn(); }
+    else showToast(d.error || `Failed to add ${label}`, 'error');
+  } catch(e) { showToast('Network error', 'error'); }
+}
+
+function addHash()   { addToList('/api/blacklist',        v=>({hash:v}),   'new-hash',   fetchBlacklist,       'Hash'); }
+function addDomain() { addToList('/api/domain-blacklist', v=>({domain:v}), 'new-domain', fetchDomainBlacklist, 'Domain'); }
+function addIP()     { addToList('/api/ip-blacklist',     v=>({ip:v}),     'new-ip',     fetchIPBlacklist,     'IP'); }
+function addAgent()  {
+  const inp = document.getElementById('new-agent');
+  const raw = inp.value.trim();
+  if (!raw) { showToast('Enter a JSON entry first', 'error'); return; }
+  let entry;
+  try { entry = JSON.parse(raw); } catch { entry = raw; }
+  fetch('/api/agent-blacklist', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({entry})
+  }).then(r=>r.json()).then(d => {
+    if (d.success) { inp.value = ''; showToast('Agent entry added'); fetchAgentBlacklist(); }
+    else showToast(d.error || 'Failed', 'error');
+  }).catch(() => showToast('Network error', 'error'));
+}
+
+/* ── Pending Approvals panel ────────────────────────────────────── */
+let _approvalsData = [];
+
+async function fetchApprovals() {
+  const container = document.getElementById('approvals-container');
+  if (container) container.innerHTML = '<div class="empty loading">Loading…</div>';
+  try {
+    const d = await fetch('/api/approvals').then(r => r.json());
+    _approvalsData = d.records || [];
+    renderApprovals();
+    updateApprovalsBadge();
+  } catch(e) {
+    if (container) container.innerHTML = '<div class="empty">⚠ Failed to load approvals</div>';
+    console.error('fetchApprovals', e);
+  }
+}
+
+function updateApprovalsBadge() {
+  const pending = _approvalsData.reduce((n, rec) =>
+    n + (rec.actions || []).filter(a => !a.decision).length, 0);
+  const badge = document.getElementById('nav-approvals-badge');
+  if (!badge) return;
+  if (pending > 0) { badge.textContent = pending; badge.style.display = 'inline'; }
+  else             { badge.style.display = 'none'; }
+}
+
+function renderApprovals() {
+  const container = document.getElementById('approvals-container');
+  const filter    = document.getElementById('ap-filter')?.value || 'all';
+
+  if (!_approvalsData.length) {
+    container.innerHTML = '<div class="empty">No pending approval records found</div>';
+    return;
+  }
+
+  const html = _approvalsData.map(rec => {
+    const actions = (rec.actions || []).filter(a => {
+      if (filter === 'pending')  return !a.decision;
+      if (filter === 'approved') return a.decision === 'approved';
+      if (filter === 'rejected') return a.decision === 'rejected';
+      return true;
+    });
+    if (!actions.length) return '';
+
+    const verdict   = rec.verdict || 'UNKNOWN';
+    const produced  = rec.produced_at ? fmtTime(rec.produced_at) : '—';
+    const analysisId = rec.analysis_id || '';
+
+    const rows = actions.map(a => {
+      const decided = a.decision;
+      const btns = decided
+        ? `<span class="decision-badge ${decided}">${decided}</span>`
+        : `<div class="abtns">
+             <button class="btn approve" onclick="decideAction('${analysisId}','${a.id}','approve',this)">✓ Approve</button>
+             <button class="btn reject"  onclick="decideAction('${analysisId}','${a.id}','reject',this)" >✕ Reject</button>
+           </div>`;
+      return `
+        <div class="approval-action-row" id="row-${analysisId}-${a.id}">
+          <div class="prio">#${a.priority ?? '?'}</div>
+          <div class="atype">${escHtml(a.type || '—')}</div>
+          <div class="atarget">${escHtml(a.target_value || '—')}</div>
+          <div class="areason">${escHtml(a.reason || '—')}</div>
+          <div class="abtns-wrap">${btns}</div>
+        </div>`;
+    }).join('');
+
+    return `
+      <div class="approval-card">
+        <div class="approval-header">
+          <span class="verdict ${verdict}">${verdict}</span>
+          <span class="anchor">${escHtml(rec.anchor_guid || analysisId)}</span>
+          <span class="produced">${produced}</span>
+        </div>
+        ${rows}
+      </div>`;
+  }).join('');
+
+  container.innerHTML = html || '<div class="empty">No actions match the current filter</div>';
+}
+
+async function decideAction(analysisId, actionId, decision, btn) {
+  btn.disabled = true;
+  const row = document.getElementById(`row-${analysisId}-${actionId}`);
+  try {
+    const d = await fetch(`/api/approvals/${analysisId}/actions/${actionId}/${decision}`, {
+      method: 'POST'
+    }).then(r => r.json());
+
+    if (d.success) {
+      // Update local data so re-renders stay consistent
+      for (const rec of _approvalsData) {
+        if (rec.analysis_id === analysisId) {
+          for (const a of rec.actions || []) {
+            if (a.id === actionId) a.decision = decision;
+          }
+        }
+      }
+      const wrap = row?.querySelector('.abtns-wrap');
+      if (wrap) wrap.innerHTML = `<span class="decision-badge ${decision}">${decision}</span>`;
+      showToast(`Action ${actionId} ${decision}`);
+      updateApprovalsBadge();
+    } else {
+      showToast(d.error || 'Failed', 'error');
+      btn.disabled = false;
+    }
+  } catch(e) {
+    showToast('Network error', 'error');
+    btn.disabled = false;
+  }
+}
+
+/* ── Health panel ────────────────────────────────────────────────── */
+async function fetchHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+
+    // Status cards
+    document.getElementById('health-cards').innerHTML = `
+      <div class="stat-card ${d.status === 'operational' ? 'low' : 'critical'}">
+        <div class="label">Status</div>
+        <div class="value" style="font-size:18px">${d.status}</div>
+      </div>
+      <div class="stat-card total">
+        <div class="label">Log File</div>
+        <div class="value" style="font-size:18px">${d.log_exists ? '✓ Found' : '✗ Missing'}</div>
+      </div>
+    `;
+
+    // Feature matrix
+    const features = d.features || {};
+    const featureLabels = {
+      l1_hash_reputation: 'L1 Hash Reputation',
+      l2_sigma_rules:     'L2 Sigma Rules',
+      l3_yara_scanner:    'L3 YARA Scanner',
+      l4_ai_engine:       'L4 AI Engine',
+    };
+    document.getElementById('feature-tbody').innerHTML =
+      Object.entries(features).map(([k, v]) => `
+        <tr>
+          <td>${featureLabels[k] || k}</td>
+          <td>${v ? badge('active', 'LOW') : badge('inactive', 'skipped')}</td>
+        </tr>
+      `).join('');
+
+    document.getElementById('health-txt').textContent = d.status;
+  } catch (e) {
+    document.getElementById('health-cards').innerHTML =
+      '<div class="empty">⚠ Failed to load health data</div>';
+    console.error('fetchHealth', e);
+  }
+}
+
+/* ── Init ────────────────────────────────────────────────────────── */
+fetchStats();
+fetchAlerts();
+fetchApprovals();
+</script>
+</body>
+</html>
