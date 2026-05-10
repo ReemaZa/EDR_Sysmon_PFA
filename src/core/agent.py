@@ -21,6 +21,8 @@ from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
 from src.graph.Graph_Builder_Batch import GraphBuilderBatch
+from src.PAT.pat_builder import PATBuilder
+
 
 # ============================================================================
 # LOGGING SETUP: Log all console output to both console and file
@@ -115,6 +117,9 @@ if BATCH_GRAPH:
     graph_builder = GraphBuilderBatch()
 else:
     graph_builder = GraphBuilder()
+
+
+process_artifact_tree = PATBuilder()
 
 # Self-identification state
 _self_pid        = os.getpid()
@@ -377,6 +382,12 @@ def process_event(evt: dict) -> None:
     print(f"\n[PROCESSING] Running through detection layers...\n")
     verdict = detection_pipeline.process_event(evt)
     output  = []
+
+    # ── PAT — runs FIRST, on EVERY event, no sigma gate ──────────────────
+    try:
+        process_artifact_tree.process_event(evt)
+    except Exception as e:
+        print(f"  [ERROR] [PAT ERROR] {str(e)}")
 
     # ── Graph builder ─────────────────────────────────────────────────────
     print(f"\n[GRAPH] Building threat relationships in graph...\n")
