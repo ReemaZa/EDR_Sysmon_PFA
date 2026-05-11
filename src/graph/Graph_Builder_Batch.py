@@ -1179,7 +1179,7 @@ class GraphBuilderBatch:
             # live graph state and cannot be precomputed across the batch.
             parent_score = self._get_score(parent_guid) if parent_guid else 0
             delta        = int(parent_score * PARENT_INHERITANCE)
-            child_eff    = eff + delta
+            child_eff    = eff*0.6 + delta
 
             cmdline_clean = re.sub(
                 r'(?i)(-encodedcommand|-enc)\s+[A-Za-z0-9+/=]{20,}',
@@ -1194,12 +1194,12 @@ class GraphBuilderBatch:
                     "cmdline":      (parent_cmd or "").lower(),
                     "user":         parent_user,
                     "description":  "",
-                    "score":        0,
+                    "score":        eff,
                     "ts":           ts,
                 })
                 instance_records_parent.append({
                     "guid":   parent_guid,
-                    "score":  0,
+                    "score":  eff,
                     "ts":     ts,
                     "pid":    parent_pid,
                     "t_hash": p_hash,
@@ -1539,7 +1539,7 @@ class GraphBuilderBatch:
             events, detections,
             rel_type        = "INJECTED_THREAD",
             src_guid_field  = "SourceProcessGuid",
-            tgt_guid_field  = "TargetProcessGuid",
+            tgt_guid_field  = "TargetProcessGuid" or "TargetProcessGUID" or "",
             src_image_field = "SourceImage",
             tgt_image_field = "TargetImage",
             src_user_field  = "SourceUser",
@@ -1553,7 +1553,7 @@ class GraphBuilderBatch:
         self._batch_handle_dual_process(
             events, detections,
             rel_type        = "ACCESSED_MEMORY",
-            src_guid_field  = "SourceProcessGuid",
+            src_guid_field  = "SourceProcessGUID",
             tgt_guid_field  = "TargetProcessGUID",
             src_image_field = "SourceImage",
             tgt_image_field = "TargetImage",
@@ -1673,17 +1673,6 @@ class GraphBuilderBatch:
     }
 
     def process_event_batch(self, events: list, detections: list) -> None:
-        """
-        Public batch entry point.
-
-        Groups events by event_id, dispatches each group to the
-        corresponding batch handler.  Falls back to single-event
-        process_event() for any event_id without a batch handler.
-
-        Args:
-            events:     list of raw event dicts
-            detections: parallel list of detection dicts (None-safe)
-        """
         groups:  dict[int, list] = defaultdict(list)
         det_map: dict[int, list] = defaultdict(list)
 
@@ -1692,16 +1681,14 @@ class GraphBuilderBatch:
             groups[eid].append(evt)
             det_map[eid].append(detections[i] if i < len(detections) else None)
 
-        for eid, evts in groups.items():
-            dets    = det_map[eid]
+        # EV5 always last
+        for eid in sorted(groups, key=lambda e: (e == 5, e != 1)):
             handler = self._BATCH_HANDLERS.get(eid)
-            if handler:
-                try:
-                    getattr(self, handler)(evts, dets)
-                except Exception:
-                    traceback.print_exc()
-            else:
-                # Fallback: single-event path
-                print(f"[GRAPH BATCH] No batch handler for event_id={eid}, falling back")
-                for evt, det in zip(evts, dets):
-                    self.process_event(evt, det)
+            try:
+                if handler:
+                    getattr(self, handler)(groups[eid], det_map[eid])
+                else:
+                    for evt, det in zip(groups[eid], det_map[eid]):
+                        self.process_event(evt, det)
+            except Exception:
+                traceback.print_exc()
