@@ -21,6 +21,8 @@ from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
 from src.graph.Graph_Builder_Batch import GraphBuilderBatch
+from src.PAT.pat_builder import PATBuilder
+from src.remediation.remediation_module import run_remediation
 
 # ============================================================================
 # LOGGING SETUP: Log all console output to both console and file
@@ -102,7 +104,7 @@ READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_datasets','sysmon_credential_dumping.txt'
+    '..', 'tests', 'logs_datasets','t1053_2.txt'
 )
 
 # ============================================================================
@@ -115,6 +117,9 @@ if BATCH_GRAPH:
     graph_builder = GraphBuilderBatch()
 else:
     graph_builder = GraphBuilder()
+
+
+process_artifact_tree = PATBuilder()
 
 # Self-identification state
 _self_pid        = os.getpid()
@@ -378,6 +383,12 @@ def process_event(evt: dict) -> None:
     verdict = detection_pipeline.process_event(evt)
     output  = []
 
+    # ── PAT — runs FIRST, on EVERY event, no sigma gate ──────────────────
+    try:
+        process_artifact_tree.process_event(evt)
+    except Exception as e:
+        print(f"  [ERROR] [PAT ERROR] {str(e)}")
+
     # ── Graph builder ─────────────────────────────────────────────────────
     print(f"\n[GRAPH] Building threat relationships in graph...\n")
     try:
@@ -533,7 +544,19 @@ def main():
                 }, f, indent=2)
 
             print(f"[TIMING] Graph timing saved → {_graph_timing_path}")"""
-            print("[INFO] Log replay completed. Exiting.\n")
+            print("[INFO] Log replay completed. EDR standing by...\n")
+
+
+            # ── Remediation Module ────────────────────────────────────────────
+            # Trigger post-containment forensic sweep.
+            # run_remediation() blocks for GRACE_PERIOD_SECONDS (default 60s)
+            # so the AnalystAgent background thread can finish its last tick
+            # and stamp all pending_actions before we query Memgraph.
+            # We pass the global `process_artifact_tree` (PATBuilder) so the
+            # remediation agent can query the Redis PAT without a new connection.
+            # Memgraph connection is opened inside run_remediation() automatically.
+            if READ_FROM_FILE:
+                run_remediation(pat=process_artifact_tree)
 
         except Exception as e:
             print(f"[ERROR] Failed to run log replay engine: {e}")
@@ -541,10 +564,30 @@ def main():
             traceback.print_exc()
             sys.exit(1)
 
-        return  # replay mode never falls into live mode
+        # ── Keep EDR running until Ctrl+C ────────────────────────────────
+        def _stop(signum, frame):
+            print("\n" + "=" * 70)
+            print("Stopping EDR...")
+            if BATCH_GRAPH:
+                _flush_batch()
+            if detection_pipeline:
+                detection_pipeline.print_stats()
+            print("=" * 70)
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT,  _stop)
+        signal.signal(signal.SIGTERM, _stop)
+
+        print("[INFO] Press Ctrl+C to shutdown.\n")
+        
+        try:
+            while True:
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            _stop(None, None)
 
     else:
-        # ── LIVE MODE ────────────────────────────────────────────────────
+        # ── LIVE MODE (direct live mode when READ_FROM_FILE is False) ────
         stop_event = threading.Event()
         watcher = SysmonEventWatcher(callback=process_event, stop_event=stop_event)
 
