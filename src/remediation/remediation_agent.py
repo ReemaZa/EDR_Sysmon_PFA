@@ -12,7 +12,9 @@ The RemediationAgent is a COMPLETELY SEPARATE agent from the AnalystAgent.
                      Goal: "What did the attacker leave behind?
                             Is any persistence still active?
                             Was data stolen? Any backdoors?"
-                     Output: findings, cleanup actions, IOC list, narrative.
+                     Output: findings (with confidence scores), cleanup
+                             actions (with confidence scores), IOC list,
+                             narrative.
 
 REACT LOOP
 ----------
@@ -20,6 +22,35 @@ Iterates up to MAX_TOOL_ROUNDS rounds. Each round:
   - LLM calls a tool  → we execute it, log args + full result, continue.
   - LLM produces text → we force a final structured-output call.
 After MAX_TOOL_ROUNDS the loop is broken and the final call is forced.
+
+CHANGES vs previous version
+----------------------------
+1. Confidence scoring added throughout:
+     - RemediationFinding schema now includes `confidence` (float 0.0–1.0)
+       and `confidence_reason` (str).
+     - cleanup_actions schema now includes `confidence` (float 0.0–1.0)
+       and `confidence_reason` (str).
+     - _get_final_report_schema() updated accordingly.
+     - _parse() updated to propagate confidence fields into RemediationFinding
+       dataclasses.
+     - System prompt updated with confidence scoring guidance.
+
+2. Initial message updated:
+     - Section 3 (Executed Actions) now shows REAL target values (file paths,
+       IPs, domains) instead of always showing process GUIDs.  This is because
+       ContextBuilder._build_executed_actions was fixed to pass correct values.
+     - NEW Section 4a: Analyst-Actioned Files — lists every file the analyst
+       already quarantined/deleted that is scoped to this incident.
+     - NEW Section 4b: Analyst-Actioned Network/DNS — lists every IP/domain
+       the analyst already blocked that is scoped to this incident.
+     - Section 8 (Task) updated: instructs the LLM to call
+       get_analyst_actioned_artifacts FIRST for each GUID, and to use
+       find_processes_by_ioc for lateral-spread pivots.
+     - Section 8 also reminds the LLM: for NEW files use quarantine_file,
+       never delete_file; do NOT re-recommend already-actioned artifacts.
+
+3. _force_final_report: no structural changes; benefits automatically from
+   the updated schema.
 
 LOGGING
 -------
@@ -53,7 +84,7 @@ if not GEMINI_API_KEY:
         "[RemediationAgent] GEMINI_API_KEY environment variable is not set."
     )
 
-MODEL_NAME     = "gemini-3.1-flash-lite-preview"
+MODEL_NAME      = "gemini-3.1-flash-lite-preview"
 MAX_TOOL_ROUNDS = 10
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -67,37 +98,55 @@ def _get_final_report_schema():
     """
     Build the Gemini response schema for the final structured output call.
     Only used in the force-final call (no tools, schema-only mode).
+
+    CHANGES: findings and cleanup_actions now include confidence (number)
+    and confidence_reason (string).
     """
     from google.ai.generativelanguage import Schema, Type
 
     finding_schema = Schema(
         type=Type.OBJECT,
         properties={
-            "category":    Schema(type=Type.STRING, enum=[
+            "category":          Schema(type=Type.STRING, enum=[
                 "persistence", "exfiltration", "backdoor", "lateral_movement", "other"
             ]),
-            "severity":    Schema(type=Type.STRING, enum=["critical", "high", "medium", "low"]),
-            "guid":        Schema(type=Type.STRING),
-            "description": Schema(type=Type.STRING),
-            "iocs":        Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
+            "severity":          Schema(type=Type.STRING, enum=["critical", "high", "medium", "low"]),
+            "guid":              Schema(type=Type.STRING),
+            "description":       Schema(type=Type.STRING),
+            "iocs":              Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
+            # NEW: confidence scoring
+            "confidence":        Schema(type=Type.NUMBER),
+            "confidence_reason": Schema(type=Type.STRING),
         },
-        required=["category", "severity", "guid", "description", "iocs"],
+        required=["category", "severity", "guid", "description", "iocs",
+                  "confidence", "confidence_reason"],
     )
 
     cleanup_schema = Schema(
         type=Type.OBJECT,
         properties={
-            "priority":    Schema(type=Type.INTEGER),
-            "action_type": Schema(type=Type.STRING, enum=[
-                "delete_file", "quarantine_file", "remove_registry_key",
-                "block_ip", "block_domain", "disable_service",
-                "scan_process", "revoke_credential", "patch_vulnerability",
-                "reimage_host", "alert_analyst",
+            "priority":          Schema(type=Type.INTEGER),
+            "action_type":       Schema(type=Type.STRING, enum=[
+                "quarantine_file",        # use this for ALL new file threats
+                "remove_registry_key",
+                "block_ip",
+                "block_domain",
+                "disable_service",
+                "scan_process",
+                "revoke_credential",
+                "patch_vulnerability",
+                "reimage_host",
+                "alert_analyst",
+                # delete_file is intentionally REMOVED — use quarantine_file
             ]),
-            "target":  Schema(type=Type.STRING),
-            "reason":  Schema(type=Type.STRING),
+            "target":            Schema(type=Type.STRING),
+            "reason":            Schema(type=Type.STRING),
+            # NEW: confidence scoring
+            "confidence":        Schema(type=Type.NUMBER),
+            "confidence_reason": Schema(type=Type.STRING),
         },
-        required=["priority", "action_type", "target", "reason"],
+        required=["priority", "action_type", "target", "reason",
+                  "confidence", "confidence_reason"],
     )
 
     return Schema(
@@ -120,8 +169,8 @@ _SYSTEM_PROMPT = """
 You are a senior forensic incident responder. Your role is POST-CONTAINMENT SWEEP.
 
 The Analyst Agent has already triaged this incident and issued initial containment
-actions (process kills, IP/domain blocks). Those actions are marked as EXECUTED in
-your context. Your job is NOT to re-triage. It is to answer:
+actions (process kills, IP/domain blocks, file quarantines). Those actions are marked
+as EXECUTED in your context. Your job is NOT to re-triage. It is to answer:
 
   1. PERSISTENCE  — Did the attacker plant any mechanisms that survive a reboot?
                     (Registry Run keys, startup files, scheduled tasks, services,
@@ -135,20 +184,51 @@ your context. Your job is NOT to re-triage. It is to answer:
                     still resident in memory or on disk?
 
   4. CLEANUP      — Produce a prioritised, machine-executable cleanup action list.
-                    Be specific: exact registry key to delete, exact file path to remove,
-                    exact IP to block.
+                    Be specific: exact registry key to delete, exact file path to
+                    quarantine, exact IP to block.
 
   5. IOC LIST     — Extract every artefact that could be used to hunt for this threat
                     on other hosts: file hashes, IPs, domains, registry keys, mutex names.
 
 TOOL USAGE STRATEGY:
-  - You MUST call tools before concluding. Do not guess.
-  - Start with the blast radius GUIDs. Call get_file_activity and
-    get_registry_changes on every process that had a PROCESS_TERMINATION action.
-  - Call get_network_activity on every process to find C2 / exfil endpoints.
+  - For EACH blast-radius GUID, call get_analyst_actioned_artifacts FIRST.
+    This tells you what the analyst already handled — do NOT re-recommend those.
+  - Then call get_file_activity, get_network_activity, get_registry_changes,
+    get_injection_chains, get_loaded_drivers, get_process_tampering.
+  - For any suspicious IP, domain, or file hash you discover, call
+    find_processes_by_ioc to detect lateral spread (other processes that
+    touched the same IOC but were never flagged by the analyst).
   - If you find injections, call get_injection_chains on the source process.
   - If you find suspicious children, call get_child_processes then investigate each.
   - Be exhaustive: cover EVERY guid in blast_radius_guids.
+
+FILE ACTION RULES (CRITICAL — follow exactly):
+  - If get_file_activity or get_analyst_actioned_artifacts shows
+    already_actioned_by_analyst=True for a file path → SKIP IT. Do not
+    include it in cleanup_actions. Acknowledge it as already handled.
+  - For any NEW suspicious file not already actioned → use quarantine_file.
+    NEVER use delete_file. Quarantine is reversible; deletion is not.
+
+NETWORK ACTION RULES (CRITICAL — follow exactly):
+  - If get_network_activity or get_analyst_actioned_artifacts shows
+    already_actioned_by_analyst=True for an IP or domain → SKIP IT.
+    Do not recommend blocking it again.
+  - For any NEW suspicious external IP or domain not already blocked → use block_ip
+    or block_domain.
+
+CONFIDENCE SCORING (required for every finding and every cleanup action):
+  Assign a confidence score (0.0–1.0) based on the quality of corroborating evidence:
+    1.0 — Multiple independent tool results confirm it
+           (e.g. registry Run key found AND the file at that path exists AND
+            network beacon to same IP confirmed)
+    0.7 — Single clear, direct tool result
+           (e.g. registry key confirmed by get_registry_changes alone)
+    0.4 — Indirect or circumstantial evidence
+           (e.g. file path matches persistence pattern but no registry key confirms it)
+    0.2 — Heuristic / pattern match only
+           (e.g. process image is in Temp folder but no suspicious action confirmed)
+  Always provide confidence_reason: a short sentence explaining what evidence
+  drove the score.
 
 IMPORTANT:
   - Base every finding strictly on tool results. Never invent file paths, IPs, or keys.
@@ -369,6 +449,11 @@ class RemediationAgent:
             "Based on all the tool results and reasoning above, produce your final "
             "RemediationReport now. Be exhaustive — include every finding, every IOC, "
             "and every cleanup action you identified.\n\n"
+            "Remember:\n"
+            "  - Every finding MUST have a confidence (0.0–1.0) and confidence_reason.\n"
+            "  - Every cleanup action MUST have a confidence (0.0–1.0) and confidence_reason.\n"
+            "  - Do NOT include cleanup actions for artifacts already actioned by the analyst.\n"
+            "  - Use quarantine_file for new file threats, never delete_file.\n\n"
             f"Your accumulated analysis:\n{accumulated_reasoning}"
         )
 
@@ -402,11 +487,13 @@ class RemediationAgent:
         Sections:
           1 — Incident overview
           2 — Analyst reasoning
-          3 — Executed actions
-          4 — Process lineage (ancestry chain + blast radius)
-          5 — Process action summaries (what each process DID)
-          6 — Injection victims
-          7 — Task instructions
+          3 — Executed actions  (FIXED: real file paths / IPs / domains)
+          4a — Analyst-actioned files (NEW)
+          4b — Analyst-actioned network/DNS (NEW)
+          5 — Process lineage
+          6 — Process action summaries
+          7 — Injection victims
+          8 — Task instructions (UPDATED: new tool usage rules)
         """
         lines = []
 
@@ -433,7 +520,7 @@ class RemediationAgent:
                 "",
             ]
 
-        # ── Section 3: Executed actions ───────────────────────────────────────
+        # ── Section 3: Executed actions (FIXED target_values) ─────────────────
         lines += ["═" * 80, "EXECUTED ACTIONS (containment already performed)", "═" * 80]
         for act in context_payload.get("executed_actions", []):
             lines.append(
@@ -443,7 +530,42 @@ class RemediationAgent:
             )
         lines.append("")
 
-        # ── Section 4: Process lineage ────────────────────────────────────────
+        # ── Section 4a: Analyst-actioned files (NEW) ──────────────────────────
+        analyst_files = context_payload.get("analyst_file_actions", [])
+        lines += ["═" * 80, "ANALYST-ACTIONED FILES (already quarantined/deleted)", "═" * 80]
+        if analyst_files:
+            lines.append(
+                "  These files have ALREADY been actioned by the AnalystAgent. "
+                "Do NOT recommend any cleanup action for them."
+            )
+            for f in analyst_files:
+                lines.append(
+                    f"  [{f.get('action_type', '?')}]  path={f.get('path', '?')}  "
+                    f"reason={f.get('action_reason', 'N/A')}"
+                )
+        else:
+            lines.append("  (none — analyst did not action any files for this incident)")
+        lines.append("")
+
+        # ── Section 4b: Analyst-actioned network/DNS (NEW) ───────────────────
+        analyst_network = context_payload.get("analyst_network_actions", [])
+        lines += ["═" * 80, "ANALYST-ACTIONED NETWORK/DNS (already blocked)", "═" * 80]
+        if analyst_network:
+            lines.append(
+                "  These IPs/domains have ALREADY been blocked by the AnalystAgent. "
+                "Do NOT recommend blocking them again."
+            )
+            for n in analyst_network:
+                lines.append(
+                    f"  [{n.get('action_type', '?')}]  {n.get('ioc_type', '?')}="
+                    f"{n.get('value', '?')}  "
+                    f"reason={n.get('action_reason', 'N/A')}"
+                )
+        else:
+            lines.append("  (none — analyst did not block any IPs/domains for this incident)")
+        lines.append("")
+
+        # ── Section 5: Process lineage ────────────────────────────────────────
         lines += ["═" * 80, "PROCESS LINEAGE", "═" * 80]
         lines.append("  ANCESTRY CHAIN (root → flagged node):")
         for node in context_payload.get("lineage", {}).get("ancestry_chain", []):
@@ -465,7 +587,7 @@ class RemediationAgent:
             )
         lines.append("")
 
-        # ── Section 5: Process action summaries ───────────────────────────────
+        # ── Section 6: Process action summaries ───────────────────────────────
         lines += [
             "═" * 80,
             "PROCESS ACTION SUMMARIES (what each blast-radius process DID)",
@@ -488,7 +610,7 @@ class RemediationAgent:
                     )
             lines.append("")
 
-        # ── Section 6: Injection victims ──────────────────────────────────────
+        # ── Section 7: Injection victims ──────────────────────────────────────
         if context_payload.get("injection_victims"):
             lines += ["═" * 80, "INJECTION VICTIMS (scan — do NOT kill)", "═" * 80]
             for vic in context_payload["injection_victims"]:
@@ -499,7 +621,7 @@ class RemediationAgent:
                 )
             lines.append("")
 
-        # ── Section 7: Task ───────────────────────────────────────────────────
+        # ── Section 8: Task (UPDATED) ─────────────────────────────────────────
         blast_guids = [
             n.get("guid")
             for n in context_payload.get("lineage", {}).get("blast_radius", [])
@@ -512,13 +634,31 @@ class RemediationAgent:
             f"Investigate the following {len(blast_guids)} GUID(s) using the available tools:",
             f"  {blast_guids}",
             "",
-            "For EACH guid:",
+            "For EACH guid, in this order:",
+            "  0. get_analyst_actioned_artifacts — call THIS FIRST to see what the analyst",
+            "     already handled. Skip those artifacts in your cleanup_actions.",
             "  1. get_file_activity      — dropped files / persistence droppers.",
+            "     → For files with already_actioned_by_analyst=True: acknowledge, skip.",
+            "     → For NEW suspicious files: recommend quarantine_file (NOT delete_file).",
             "  2. get_network_activity   — C2 / exfil endpoints.",
+            "     → For IPs/domains with already_actioned_by_analyst=True: acknowledge, skip.",
+            "     → For NEW suspicious IPs/domains: recommend block_ip / block_domain.",
             "  3. get_registry_changes   — persistence keys.",
             "  4. get_injection_chains   — remote thread injections.",
             "  5. get_loaded_drivers     — unsigned kernel drivers.",
-            "  6. Follow suspicious leads (get_child_processes, get_process_tampering).",
+            "  6. get_process_tampering  — hollowing / herpadering.",
+            "  7. get_child_processes    — suspicious children.",
+            "",
+            "For ANY suspicious file path, IP, or domain you find:",
+            "  → Call find_processes_by_ioc(ioc_value, ioc_type) to detect lateral spread.",
+            "  → Any returned GUID not in your blast_radius_guids may be a co-infected",
+            "     process — investigate it with get_process_identity.",
+            "",
+            "Confidence scoring (REQUIRED for every finding and cleanup action):",
+            "  1.0 — Multiple independent tool results confirm the finding.",
+            "  0.7 — Single clear, direct tool result.",
+            "  0.4 — Indirect / circumstantial evidence.",
+            "  0.2 — Heuristic / pattern match only.",
             "",
             "When done, produce your final RemediationReport.",
         ]
@@ -538,12 +678,14 @@ class RemediationAgent:
         """Convert the raw LLM JSON dict into a typed RemediationReport."""
         findings = [
             RemediationFinding(
-                category=    f.get("category",    "other"),
-                severity=    f.get("severity",    "medium"),
-                guid=        f.get("guid",        ""),
-                description= f.get("description", ""),
-                evidence=    f.get("evidence",    {}),
-                iocs=        f.get("iocs",        []),
+                category=          f.get("category",          "other"),
+                severity=          f.get("severity",          "medium"),
+                guid=              f.get("guid",              ""),
+                description=       f.get("description",       ""),
+                evidence=          f.get("evidence",          {}),
+                iocs=              f.get("iocs",              []),
+                confidence=        float(f.get("confidence",  0.5)),
+                confidence_reason= f.get("confidence_reason", ""),
             )
             for f in raw.get("findings", [])
         ]
@@ -567,9 +709,7 @@ class RemediationAgent:
     # ── REPORT PERSISTENCE ────────────────────────────────────────────────────
 
     def _save_report(self, report: RemediationReport) -> None:
-        """
-        Save the final RemediationReport to remediation_reports/<incident_id>.json.
-        """
+        """Save the final RemediationReport to remediation_reports/<incident_id>.json."""
         import dataclasses
         try:
             os.makedirs("remediation_reports", exist_ok=True)
