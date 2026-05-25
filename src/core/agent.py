@@ -16,7 +16,7 @@ import threading
 import time
 import logging
 from datetime import datetime, timezone
-
+#from src.graph.graph_pruner import GraphPruner  # Adjust this import path to match your project layout
 from src.core.event_watcher import SysmonEventWatcher
 from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
@@ -393,13 +393,23 @@ def process_event(evt: dict) -> None:
     print(f"\n[GRAPH] Building threat relationships in graph...\n")
     try:
         graph_detection = None
+        
+        hash_graph_detection=None
         if verdict and verdict.layer_results:
             for result in verdict.layer_results:
                 if result.layer_name == "L2-Sigma":
+                    
                     graph_detection = result.metadata.get("graph_detection")
                     print("wssel lahne")
-                    break
-
+                    
+                elif result.layer_name == "L1-Hash":  # ← add this
+                    hash_graph_detection = result.metadata.get("graph_detection")
+        if not graph_detection:
+             graph_detection=hash_graph_detection
+        elif hash_graph_detection:
+            graph_detection['total_score']+=hash_graph_detection['total_score']
+            
+                   
         if BATCH_GRAPH:
             # Accumulate — timing is recorded inside _flush_batch
             with _batch_lock:
@@ -484,7 +494,10 @@ def main():
         enable_l4=True,
         enable_l2_hash=True,
     )
-
+    print("[INFO] Initializing Lifecycle-based Graph Pruner...")
+    #db_instance = graph_builder.db if hasattr(graph_builder, '_db') else graph_builder.db
+    #pruner = GraphPruner(db=db_instance, log_fn=logging.info)
+    #pruner.start()
     if READ_FROM_FILE:
         try:
             from tests.log_replay import LogReplayEngine
@@ -568,6 +581,8 @@ def main():
         def _stop(signum, frame):
             print("\n" + "=" * 70)
             print("Stopping EDR...")
+            print("[INFO] Shutting down Graph Pruner background thread...")
+            #pruner.stop(timeout=5)
             if BATCH_GRAPH:
                 _flush_batch()
             if detection_pipeline:
