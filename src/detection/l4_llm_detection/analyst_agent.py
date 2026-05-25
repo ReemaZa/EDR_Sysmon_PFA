@@ -192,11 +192,13 @@ class AnalystAgent:
             for g in guids:
                 inst      = next((i for i in sg.instances if i.guid == g), None)
                 alive_tag = "alive" if (inst and inst.alive) else "dead"
-                
                 score_val = inst.score if inst else "?"
-                # only show user per-instance when instances differ
                 user_str  = f"  user={inst.user}" if (inst and inst.user and len(users) > 1) else ""
-                lines.append(f"      guid={g}  score={score_val}    [{alive_tag}]{user_str}")
+
+                # ← add this
+       
+
+                lines.append(f"      guid={g}  score={score_val}  [{alive_tag}]{user_str}")
 
         return "\n".join(lines)
 
@@ -230,8 +232,10 @@ class AnalystAgent:
                     f"  score={inst.score}  guid={inst.guid}{tag_str}"
                 )
             else:
+                ioc_str = "  ⚠ SIGNATURE MATCH — hash confirmed malicious by threat intelligence (IOC)" \
+                          if inst.score >= 1000 else ""
                 lines.append(
-                    f"{prefix}score={inst.score}  tmpl={t_short}  guid={inst.guid}{tag_str}"
+                    f"{prefix}score={inst.score}  tmpl={t_short}  guid={inst.guid}{tag_str}{ioc_str}"
                 )
 
             for child in sg.process_tree.get(guid, []):
