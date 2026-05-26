@@ -78,8 +78,9 @@ from src.remediation.remediation_models import (
 )
 from src.remediation.remediation_tools import RemediationToolRegistry
 from src.remediation.remediation_agent import RemediationAgent
-
+from src.detection.l4_llm_detection.action_executor import ActionExecutor
 GRACE_PERIOD_SECONDS = 60
+MAX_BLAST_RADIUS_IN_PROMPT = 15  # Limit blast radius shown in LLM prompt to reduce tokens
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -832,8 +833,22 @@ class ContextBuilder:
     ) -> List[Dict[str, Any]]:
         """
         For every blast-radius node, summarise its PAT action stream and log it.
+        
+        OPTIMISED: Limit notable actions to the 3 most relevant types to reduce
+        token usage and comply with API rate limits. Only show actions that are
+        most likely to reveal persistence, exfiltration, or backdoors.
         """
         summaries = []
+        
+        # Priority order: which action types are most forensically significant?
+        PRIORITY_ACTIONS = [
+            "registry_write",  # persistence indicators
+            "file_created",    # dropped files, persistence droppers
+            "network_connection",  # exfiltration, C2
+            "injected_thread_into",  # backdoors
+            "driver_loaded",   # rootkit indicators
+            "child_spawned",   # lateral movement, command execution
+        ]
 
         for node in blast_radius:
             guid    = node.get("guid", "")
@@ -843,11 +858,21 @@ class ContextBuilder:
             counts:        Dict[str, int]            = defaultdict(int)
             first_notable: Dict[str, Dict[str, Any]] = {}
 
+            # First pass: count all actions and find first of each notable type
             for action in actions:
                 atype = action.get("type", "unknown")
                 counts[atype] += 1
                 if atype in self._NOTABLE_TYPES and atype not in first_notable:
                     first_notable[atype] = self._extract_notable_fields(atype, action)
+
+            # Second pass: prioritize which notable actions to include
+            # Keep only the top 3 most important types to reduce token usage
+            prioritized_notable = {}
+            for priority_type in PRIORITY_ACTIONS:
+                if priority_type in first_notable:
+                    prioritized_notable[priority_type] = first_notable[priority_type]
+                if len(prioritized_notable) >= 3:  # Limit to 3 to save tokens
+                    break
 
             summary = {
                 "guid":            guid,
@@ -856,7 +881,7 @@ class ContextBuilder:
                 "action_counts":   dict(counts),
                 "notable_actions": [
                     {"type": atype, **fields}
-                    for atype, fields in first_notable.items()
+                    for atype, fields in prioritized_notable.items()
                 ],
             }
             summaries.append(summary)
@@ -866,7 +891,8 @@ class ContextBuilder:
                 {
                     "total_actions":   summary["total_actions"],
                     "action_counts":   summary["action_counts"],
-                    "notable_actions": summary["notable_actions"],
+                    "notable_actions_shown": len(summary["notable_actions"]),
+                    "notable_actions_total": len(first_notable),
                 },
             )
 
@@ -875,8 +901,44 @@ class ContextBuilder:
     def _extract_notable_fields(
         self, action_type: str, action: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Extract the most relevant fields for a given PAT action type."""
+        """Extract the most relevant fields for a given PAT action type.
+        
+        Truncates only -EncodedCommand values in cmdlines to reduce token usage.
+        All other strings (file paths, etc.) are kept intact.
+        """
         ts = action.get("ts", "")
+        
+        def truncate_encoded_command(cmdline: str) -> str:
+            """
+            Find '-EncodedCommand' in cmdline and truncate everything after it
+            to just a few characters (e.g., 'TRUNCATED').
+            
+            Example:
+                Input:  'powershell.exe -EncodedCommand JgBGQBwAHAAZQByAA=='
+                Output: 'powershell.exe -EncodedCommand TRUNCATED'
+            """
+            if not isinstance(cmdline, str):
+                return cmdline
+            
+            lower_cmd = cmdline.lower()
+            if "encodedcommand" not in lower_cmd:
+                return cmdline  # No encoded command, return as-is
+            
+            # Find the index of '-EncodedCommand' (case-insensitive)
+            idx = lower_cmd.find("encodedcommand")
+            if idx == -1:
+                return cmdline
+            
+            # Find where the encoded string starts (after '-EncodedCommand' and optional spaces)
+            # Typically: '-EncodedCommand JkBG...'
+            start = idx + len("encodedcommand")
+            # Skip whitespace/hyphens
+            while start < len(cmdline) and cmdline[start] in (' ', '\t', '-'):
+                start += 1
+            
+            # Keep everything before the encoded value, replace encoded value with 'TRUNCATED'
+            return cmdline[:start] + "TRUNCATED"
+        
         if action_type in ("file_created", "file_deleted", "file_timestomped"):
             return {"path": action.get("path", ""), "sha256": action.get("sha256", ""), "ts": ts}
         if action_type == "wrote_ads":
@@ -901,10 +963,154 @@ class ContextBuilder:
             return {"target_guid": action.get("target_guid", ""), "target_image": action.get("target_image", ""),
                     "access_mask": action.get("access_mask", ""), "ts": ts}
         if action_type == "child_spawned":
+            child_cmdline = action.get("child_cmdline", "")
+            # Truncate only if it contains -EncodedCommand
+            child_cmdline = truncate_encoded_command(child_cmdline)
             return {"child_guid": action.get("child_guid", ""), "child_image": action.get("child_image", ""),
-                    "child_cmdline": action.get("child_cmdline", ""), "ts": ts}
+                    "child_cmdline": child_cmdline, "ts": ts}
         return {"ts": ts}
 
+
+# ── ACTION TYPE MAPPING ───────────────────────────────────────────────────────
+# RemediationAgent uses different field names / action type strings than
+# AnalystAgent.  This adapter normalises a cleanup_action dict into the
+# shape ActionExecutor._dispatch() expects.
+
+_REMEDIATION_TO_ANALYST_TYPE: Dict[str, str] = {
+    "quarantine_file":      "file_quarantine",
+    "remove_registry_key":  "registry_delete",  # DELETE registry key instead of alerting
+    "block_ip":             "ip_block",
+    "block_domain":         "dns_block",
+    "disable_service":      "alert",          # no direct RF call — raise alert
+    "scan_process":         "alert",          # informational — raise alert
+    "revoke_credential":    "identity_revocation",
+    "patch_vulnerability":  "patching",
+    "reimage_host":         "shutdown",       # closest available action
+    "alert_analyst":        "alert",
+}
+
+def _transform_task_name_to_registry_path(target: str) -> str:
+    """
+    Convert a remediation agent task target (e.g., "Task: T1053_005_OnStartup")
+    into a registry value deletion path that deletes ONLY the specific scheduled task,
+    not the entire parent registry key.
+    
+    Windows Scheduled Tasks are stored in:
+    - Task subkeys: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks
+      (Each task is a subkey with GUID name)
+    
+    For deleting a task by name, use:
+    - schtasks /delete /tn "TaskName" /f
+    
+    However, if we need registry-level deletion, we delete the task's subkey:
+    - Format: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\{GUID}
+    
+    Since the remediation report only provides the task NAME, we construct a command
+    that will be converted to schtasks deletion instead of direct registry deletion.
+    
+    For now, return a special format: "schtasks://{task_name}" which indicates
+    that ActionExecutor should handle this via schtasks command rather than registry.
+    """
+    # Extract task name from formats like:
+    # - "Task: T1053_005_OnStartup"
+    # - "T1053_005_OnStartup"
+    # - "Task:T1053_005_OnStartup"
+    
+    task_name = target
+    if target.lower().startswith("task:"):
+        task_name = target[5:].strip()
+    elif target.lower().startswith("task "):
+        task_name = target[5:].strip()
+    
+    # Return format that indicates this should use schtasks deletion
+    # Format: HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Scheduler@schtasks:{task_name}
+    # This tells registry_delete to use schtasks /delete instead
+    return f"HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\Scheduler@schtasks:{task_name}"
+
+def _remediation_action_to_executor_format(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert a RemediationAgent cleanup_action dict into the format
+    ActionExecutor._dispatch() expects.
+
+    RemediationAgent schema:
+        { priority, action_type, target, reason, confidence, confidence_reason }
+
+    ActionExecutor schema:
+        { id, priority, type, target_type, target_value, reason }
+
+    Returns None if the action_type has no RF equivalent (will be skipped).
+    """
+    import uuid
+
+    action_type  = action.get("action_type", "")
+    target       = action.get("target", "")
+    priority     = action.get("priority", 5)
+    reason       = action.get("reason", "")
+    confidence   = action.get("confidence", 0.5)
+
+    mapped_type = _REMEDIATION_TO_ANALYST_TYPE.get(action_type)
+    if not mapped_type:
+        return None  # unknown — skip
+
+    # Infer target_type from the target string content
+    if mapped_type == "ip_block":
+        target_type = "ip"
+    elif mapped_type == "dns_block":
+        target_type = "domain"
+    elif mapped_type in ("file_quarantine", "file_deletion"):
+        target_type = "file"
+    elif mapped_type == "registry_delete":
+        target_type = "registry"
+        # Transform task name to registry path for scheduled tasks
+        # Example: "Task: T1053_005_OnStartup" → registry path to delete
+        target = _transform_task_name_to_registry_path(target)
+    elif mapped_type == "identity_revocation":
+        target_type = "user"
+    elif mapped_type in ("patching", "shutdown"):
+        target_type = "host"
+    else:
+        target_type = "host"  # alert / generic
+
+    return {
+        "id":           f"rem-{uuid.uuid4().hex[:8]}",
+        "priority":     priority,
+        "type":         mapped_type,
+        "target_type":  target_type,
+        "target_value": target,
+        "reason":       f"[Remediation|conf={confidence:.2f}] {reason}",
+    }
+
+
+def _transform_task_name_to_registry_path(target: str) -> str:
+    """
+    Transform a scheduled task name into a registry deletion path.
+    
+    Windows Scheduled Tasks are stored in the registry at:
+      HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\<TaskName>
+    
+    Parameters
+    ----------
+    target : str
+        Either a task name (e.g., "T1053_005_OnStartup") or 
+        a prefixed description (e.g., "Task: T1053_005_OnStartup")
+    
+    Returns
+    -------
+    str
+        Full registry path to delete, or the original target if it's already a path
+    """
+    # If it's already a registry path, return as-is
+    if target.startswith("HKEY_") or target.startswith("HKLM\\") or target.startswith("HKU\\"):
+        return target
+    
+    # Extract task name (remove "Task: " prefix if present)
+    task_name = target.replace("Task: ", "").strip()
+    
+    # Build the registry path to the scheduled task
+    # Note: Scheduled tasks are stored under TaskCache\Tree\
+    registry_path = f"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\{task_name}"
+    
+    return registry_path
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP-LEVEL ENTRY POINT
@@ -996,6 +1202,11 @@ def run_remediation(
         # ── Per-group pipeline (steps 3-5) ────────────────────────────────────
         lineage_builder = LineageBuilder(pat)
         context_builder = ContextBuilder(pat, db)
+        
+        # Rate limiting: delay between incident groups to avoid API rate limits
+        # Google Gemini: 15 requests per minute = 1 request per 4 seconds
+        # Using 5 seconds between incidents to stay well under the limit
+        inter_incident_delay = 5 if len(groups) > 1 else 0  # seconds between incidents
 
         for i, group in enumerate(groups, 1):
             logger.group_header(
@@ -1061,6 +1272,49 @@ def run_remediation(
 
                 reports.append(report)
                 logger.report_summary(report)
+
+                # ── Execute remediation cleanup_actions ───────────────────────
+                # Mirror exactly what ThreatAnalyst does for analyst actions.
+                if report.cleanup_actions:
+                    executor_actions = []
+                    for ca in report.cleanup_actions:
+                        converted = _remediation_action_to_executor_format(ca)
+                        if converted:
+                            executor_actions.append(converted)
+                        else:
+                            logger.info(
+                                f"[Remediation] Skipping unmapped action_type="
+                                f"{ca.get('action_type')} target={ca.get('target', '')}"
+                            )
+
+                    if executor_actions:
+                        logger.info(
+                            f"[Remediation] Executing {len(executor_actions)} "
+                            f"cleanup action(s) for incident {group.incident_id[:8]} ..."
+                        )
+                        # ActionExecutor is instantiated in automatic mode.
+                        # If you want approval mode, pass mode="approval" and
+                        # use the existing approval_response_executor flow.
+                        action_executor = ActionExecutor(mode="automatic")
+                        # execute_sync so we wait before moving to the next incident
+                        results = action_executor.execute_sync(
+                            executor_actions, group.root_guid
+                        )
+                        for r in results:
+                            logger.info(
+                                f"[Remediation][ACTION RESULT] "
+                                f"{r.get('action')} → status={r.get('status')} "
+                                f"target={r.get('target_value', '')}"
+                            )
+                
+                # Rate limiting: add delay between incident groups to avoid 
+                # hitting Google API per-minute rate limits
+                if i < len(groups) and inter_incident_delay > 0:
+                    logger.info(
+                        f"Rate limit delay: waiting {inter_incident_delay}s "
+                        f"before processing next incident group..."
+                    )
+                    time.sleep(inter_incident_delay)
 
             except Exception as exc:
                 logger.error(

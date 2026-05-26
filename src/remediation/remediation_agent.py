@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -84,8 +85,9 @@ if not GEMINI_API_KEY:
         "[RemediationAgent] GEMINI_API_KEY environment variable is not set."
     )
 
-MODEL_NAME      = "gemini-3.1-flash-lite-preview"
+MODEL_NAME      = "gemini-3.1-flash-lite"
 MAX_TOOL_ROUNDS = 10
+TOOL_CALL_DELAY = 5.0  # seconds between tool calls to respect rate limits (15 req/min)
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -414,6 +416,14 @@ class RemediationAgent:
                     )
                 )
 
+            # Rate limiting: wait before sending tool results back to respect API quotas
+            # 15 requests/minute = 1 request per 4 seconds; we use 5s delay per tool call
+            if len(tool_response_parts) > 0:
+                self._logger.info(
+                    f"Rate limit: waiting {TOOL_CALL_DELAY}s before sending tool results..."
+                )
+                time.sleep(TOOL_CALL_DELAY)
+
             # Send all tool results back in one turn
             response = chat.send_message(tool_response_parts)
 
@@ -483,17 +493,13 @@ class RemediationAgent:
     def _build_initial_message(self, context_payload: Dict[str, Any]) -> str:
         """
         Serialise the ContextBuilder payload into the opening LLM message.
-
+        
+        OPTIMISED: Reduced message size to comply with rate limits.
         Sections:
-          1 — Incident overview
-          2 — Analyst reasoning
-          3 — Executed actions  (FIXED: real file paths / IPs / domains)
-          4a — Analyst-actioned files (NEW)
-          4b — Analyst-actioned network/DNS (NEW)
-          5 — Process lineage
-          6 — Process action summaries
-          7 — Injection victims
-          8 — Task instructions (UPDATED: new tool usage rules)
+          1 — Incident overview (condensed)
+          2 — Process action summaries (condensed - notable actions already filtered)
+          3 — Analyst-actioned artifacts (what NOT to re-recommend)
+          4 — Task instructions
         """
         lines = []
 
@@ -510,84 +516,7 @@ class RemediationAgent:
             "",
         ]
 
-        # ── Section 2: Analyst reasoning ─────────────────────────────────────
-        lines += ["═" * 80, "ANALYST AGENT REASONING", "═" * 80]
-        for entry in context_payload.get("analyst_reasoning", []):
-            lines += [
-                f"  GUID={entry.get('guid')}  action={entry.get('pending_action')}",
-                f"  reason: {entry.get('action_reason', 'N/A')}",
-                f"  stamped_at: {entry.get('action_stamped_at', 'N/A')}",
-                "",
-            ]
-
-        # ── Section 3: Executed actions (FIXED target_values) ─────────────────
-        lines += ["═" * 80, "EXECUTED ACTIONS (containment already performed)", "═" * 80]
-        for act in context_payload.get("executed_actions", []):
-            lines.append(
-                f"  [{act.get('status', '?')}] {act.get('action')} "
-                f"→ {act.get('target_type')}={act.get('target_value')}  "
-                f"at={act.get('executed_at', '?')}"
-            )
-        lines.append("")
-
-        # ── Section 4a: Analyst-actioned files (NEW) ──────────────────────────
-        analyst_files = context_payload.get("analyst_file_actions", [])
-        lines += ["═" * 80, "ANALYST-ACTIONED FILES (already quarantined/deleted)", "═" * 80]
-        if analyst_files:
-            lines.append(
-                "  These files have ALREADY been actioned by the AnalystAgent. "
-                "Do NOT recommend any cleanup action for them."
-            )
-            for f in analyst_files:
-                lines.append(
-                    f"  [{f.get('action_type', '?')}]  path={f.get('path', '?')}  "
-                    f"reason={f.get('action_reason', 'N/A')}"
-                )
-        else:
-            lines.append("  (none — analyst did not action any files for this incident)")
-        lines.append("")
-
-        # ── Section 4b: Analyst-actioned network/DNS (NEW) ───────────────────
-        analyst_network = context_payload.get("analyst_network_actions", [])
-        lines += ["═" * 80, "ANALYST-ACTIONED NETWORK/DNS (already blocked)", "═" * 80]
-        if analyst_network:
-            lines.append(
-                "  These IPs/domains have ALREADY been blocked by the AnalystAgent. "
-                "Do NOT recommend blocking them again."
-            )
-            for n in analyst_network:
-                lines.append(
-                    f"  [{n.get('action_type', '?')}]  {n.get('ioc_type', '?')}="
-                    f"{n.get('value', '?')}  "
-                    f"reason={n.get('action_reason', 'N/A')}"
-                )
-        else:
-            lines.append("  (none — analyst did not block any IPs/domains for this incident)")
-        lines.append("")
-
-        # ── Section 5: Process lineage ────────────────────────────────────────
-        lines += ["═" * 80, "PROCESS LINEAGE", "═" * 80]
-        lines.append("  ANCESTRY CHAIN (root → flagged node):")
-        for node in context_payload.get("lineage", {}).get("ancestry_chain", []):
-            lines.append(
-                f"    {node.get('image', '?')} "
-                f"[pid={node.get('pid', '?')} alive={node.get('alive', '?')} "
-                f"signed={node.get('signed', '?')} il={node.get('integrity_level', '?')}]"
-                f"  GUID={node.get('guid', '?')}"
-            )
-            if node.get("cmdline"):
-                lines.append(f"      cmdline: {node['cmdline'][:200]}")
-        lines.append("")
-        lines.append("  BLAST RADIUS (sweep targets):")
-        for node in context_payload.get("lineage", {}).get("blast_radius", []):
-            lines.append(
-                f"    {node.get('image', '?')} "
-                f"[pid={node.get('pid', '?')} alive={node.get('alive', '?')}]"
-                f"  GUID={node.get('guid', '?')}"
-            )
-        lines.append("")
-
-        # ── Section 6: Process action summaries ───────────────────────────────
+        # ── Section 2: Process action summaries (CRITICAL forensic data) ──────
         lines += [
             "═" * 80,
             "PROCESS ACTION SUMMARIES (what each blast-radius process DID)",
@@ -598,11 +527,13 @@ class RemediationAgent:
                 f"  GUID={summary.get('guid')}  image={summary.get('image', '?')}"
             )
             counts = summary.get("action_counts", {})
-            for atype, cnt in counts.items():
+            # Show top counts only
+            top_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            for atype, cnt in top_counts:
                 lines.append(f"    {atype}: {cnt} event(s)")
             notable = summary.get("notable_actions", [])
             if notable:
-                lines.append("    NOTABLE (first occurrence of each type):")
+                lines.append(f"    NOTABLE (top {len(notable)} types):")
                 for note in notable:
                     lines.append(
                         f"      [{note.get('type')}] "
@@ -610,18 +541,32 @@ class RemediationAgent:
                     )
             lines.append("")
 
-        # ── Section 7: Injection victims ──────────────────────────────────────
-        if context_payload.get("injection_victims"):
-            lines += ["═" * 80, "INJECTION VICTIMS (scan — do NOT kill)", "═" * 80]
-            for vic in context_payload["injection_victims"]:
-                lines.append(
-                    f"  GUID={vic.get('guid')}  image={vic.get('image', '?')} "
-                    f"injected_by={vic.get('injected_by', '?')} "
-                    f"signed={vic.get('signed', '?')}"
-                )
+        # ── Section 3: Analyst-actioned artifacts (what NOT to re-recommend) ──
+        analyst_files = context_payload.get("analyst_file_actions", [])
+        analyst_network = context_payload.get("analyst_network_actions", [])
+        
+        if analyst_files or analyst_network:
+            lines += ["═" * 80, "ALREADY-ACTIONED BY ANALYST (do NOT re-recommend)", "═" * 80]
+            if analyst_files:
+                lines.append(f"  Files ({len(analyst_files)}):")
+                for f in analyst_files[:10]:  # Limit to first 10
+                    lines.append(
+                        f"    [{f.get('action_type', '?')}] {f.get('path', '?')[:100]}"
+                    )
+                if len(analyst_files) > 10:
+                    lines.append(f"    ... and {len(analyst_files) - 10} more files")
+            if analyst_network:
+                lines.append(f"  Network/DNS ({len(analyst_network)}):")
+                for n in analyst_network[:10]:  # Limit to first 10
+                    lines.append(
+                        f"    [{n.get('action_type', '?')}] "
+                        f"{n.get('ioc_type', '?')}={n.get('value', '?')}"
+                    )
+                if len(analyst_network) > 10:
+                    lines.append(f"    ... and {len(analyst_network) - 10} more IOCs")
             lines.append("")
 
-        # ── Section 8: Task (UPDATED) ─────────────────────────────────────────
+        # ── Section 4: Task (OPTIMISED) ───────────────────────────────────────
         blast_guids = [
             n.get("guid")
             for n in context_payload.get("lineage", {}).get("blast_radius", [])
@@ -631,36 +576,32 @@ class RemediationAgent:
             "═" * 80,
             "TASK",
             "═" * 80,
-            f"Investigate the following {len(blast_guids)} GUID(s) using the available tools:",
+            f"Investigate {len(blast_guids)} process(es) for persistence, exfiltration, backdoors:",
             f"  {blast_guids}",
             "",
-            "For EACH guid, in this order:",
-            "  0. get_analyst_actioned_artifacts — call THIS FIRST to see what the analyst",
-            "     already handled. Skip those artifacts in your cleanup_actions.",
-            "  1. get_file_activity      — dropped files / persistence droppers.",
-            "     → For files with already_actioned_by_analyst=True: acknowledge, skip.",
-            "     → For NEW suspicious files: recommend quarantine_file (NOT delete_file).",
-            "  2. get_network_activity   — C2 / exfil endpoints.",
-            "     → For IPs/domains with already_actioned_by_analyst=True: acknowledge, skip.",
-            "     → For NEW suspicious IPs/domains: recommend block_ip / block_domain.",
-            "  3. get_registry_changes   — persistence keys.",
-            "  4. get_injection_chains   — remote thread injections.",
-            "  5. get_loaded_drivers     — unsigned kernel drivers.",
-            "  6. get_process_tampering  — hollowing / herpadering.",
-            "  7. get_child_processes    — suspicious children.",
+            "For EACH guid:",
+            "  1. get_analyst_actioned_artifacts  — call FIRST to avoid re-recommending",
+            "  2. get_file_activity              — quarantine_file for NEW suspicious files",
+            "  3. get_network_activity           — block_ip / block_domain for NEW IOCs",
+            "  4. get_registry_changes           — persistence keys",
+            "  5. get_injection_chains           — remote thread injections",
+            "  6. get_loaded_drivers             — unsigned drivers",
+            "  7. get_process_tampering          — process hollowing",
+            "  8. get_child_processes            — suspicious children",
             "",
-            "For ANY suspicious file path, IP, or domain you find:",
-            "  → Call find_processes_by_ioc(ioc_value, ioc_type) to detect lateral spread.",
-            "  → Any returned GUID not in your blast_radius_guids may be a co-infected",
-            "     process — investigate it with get_process_identity.",
+            "For ANY suspicious IOC found:",
+            "  → Call find_processes_by_ioc(ioc_value, ioc_type) to detect lateral spread",
             "",
-            "Confidence scoring (REQUIRED for every finding and cleanup action):",
-            "  1.0 — Multiple independent tool results confirm the finding.",
-            "  0.7 — Single clear, direct tool result.",
-            "  0.4 — Indirect / circumstantial evidence.",
-            "  0.2 — Heuristic / pattern match only.",
+            "CONFIDENCE SCORING (required):",
+            "  1.0 = Multiple independent tool results confirm it",
+            "  0.7 = Single clear tool result",
+            "  0.4 = Indirect evidence",
+            "  0.2 = Heuristic / pattern match only",
             "",
-            "When done, produce your final RemediationReport.",
+            "FILE RULES: use quarantine_file (never delete_file); skip already-actioned",
+            "NETWORK RULES: use block_ip/block_domain for NEW IOCs only; skip already-blocked",
+            "",
+            "When done, produce RemediationReport.",
         ]
 
         return "\n".join(lines)

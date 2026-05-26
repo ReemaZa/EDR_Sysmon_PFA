@@ -104,7 +104,7 @@ READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_datasets','t1053_2.txt'
+    '..', 'tests', 'logs_datasets','sysmon_credential_dumping.txt'
 )
 
 # ============================================================================
@@ -625,8 +625,76 @@ def main():
         watcher.start()
         print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
 
+        # ── Get reference to the ThreatAnalyst that is running inside L4 ──────
+        # DetectionPipeline exposes the L4 layer; we reach its analyst instance.
+        _threat_analyst = None
+        try:
+            from src.detection.l4_llm_detection.threat_analyst import ThreatAnalyst
+            for layer in detection_pipeline._layers:          # internal list
+                if hasattr(layer, "_analyst_thread") or isinstance(layer, ThreatAnalyst):
+                    _threat_analyst = layer
+                    break
+                # also check if the layer holds a ThreatAnalyst as an attribute
+                for attr in vars(layer).values():
+                    if isinstance(attr, ThreatAnalyst):
+                        _threat_analyst = attr
+                        break
+        except Exception as _e:
+            print(f"[WARN] Could not locate ThreatAnalyst instance: {_e}")
+
+        _last_remediation_time: float = 0.0          # epoch seconds
+        REMEDIATION_COOLDOWN_HOURS    = 1             # minimum gap between runs
+        _remediation_running          = threading.Event()
+
+        def _run_remediation_background():
+            """Runs run_remediation() in a background thread so the watcher loop
+            keeps processing live events during the forensic sweep."""
+            nonlocal _last_remediation_time
+            _remediation_running.set()
+            print("[INFO] [LiveRemediation] Starting remediation sweep ...")
+            try:
+                run_remediation(pat=process_artifact_tree, grace_seconds=30)
+            except Exception as _rem_exc:
+                print(f"[ERROR] [LiveRemediation] run_remediation failed: {_rem_exc}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                _last_remediation_time = time.time()
+                _remediation_running.clear()
+                print("[INFO] [LiveRemediation] Remediation sweep complete.")
+
+        def _maybe_trigger_remediation(reason: str):
+            """Fire remediation in a background thread if not already running
+            and the cooldown has elapsed."""
+            if _remediation_running.is_set():
+                print(f"[INFO] [LiveRemediation] Skipping ({reason}) — already running.")
+                return
+            t = threading.Thread(
+                target=_run_remediation_background,
+                name="LiveRemediation",
+                daemon=True,
+            )
+            print(f"[INFO] [LiveRemediation] Triggered: {reason}")
+            t.start()
+
         while not stop_event.is_set():
             time.sleep(0.2)
+
+            # ── Check quiet-tick signal from ThreatAnalyst ────────────────────
+            if _threat_analyst is not None:
+                if _threat_analyst.consume_remediation_request():
+                    _maybe_trigger_remediation(
+                        "5 consecutive quiet ticks (no nodes above threshold)"
+                    )
+
+            # ── Hourly fallback ───────────────────────────────────────────────
+            if (
+                _last_remediation_time > 0
+                and not _remediation_running.is_set()
+                and (time.time() - _last_remediation_time)
+                    >= REMEDIATION_COOLDOWN_HOURS * 3600
+            ):
+                _maybe_trigger_remediation("1 hour since last remediation run")
 
         if detection_pipeline:
             detection_pipeline.print_stats()

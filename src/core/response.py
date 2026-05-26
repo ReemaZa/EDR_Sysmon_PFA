@@ -21,6 +21,7 @@ Response functions:
     file_deletion
     patching
     identity_revocation
+    registry_delete
     ip_block
     dns_block
 
@@ -31,9 +32,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
+import winreg
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 _approval_callback = None  # module-level
@@ -711,6 +714,255 @@ def ip_block(
         f"Block {direction} traffic for IP '{ip_address}'",
         _block,
     )
+
+def registry_delete(
+    key_path: str,
+    mode: Mode = "approval",
+    force: bool = False,
+) -> Dict:
+    """
+    Delete a Windows registry key or value, OR delete a scheduled task via schtasks.
+
+    Parameters
+    ----------
+    key_path : Full registry path. Formats:
+               1. Standard key deletion: "HKEY_LOCAL_MACHINE\\Software\\..."
+               2. Short form: "HKLM\\Software\\..."
+               3. Value deletion: "HKEY_LOCAL_MACHINE\\Software\\key\\@value_name"
+               4. Scheduled task deletion: "HKEY_LOCAL_MACHINE\\System\\...\\@schtasks:{task_name}"
+                  Special format that triggers schtasks /delete instead of registry deletion.
+    mode     : "automatic" | "approval"
+    force    : If True, forcefully delete even if doesn't exist (no error).
+
+    Returns
+    -------
+    Dict with status, action, target, details, and timestamp.
+    """
+    
+    # PROTECTION CHECK: Verify this is not a protected registry key
+    is_protected, reason = _protection.is_protected_file(key_path)  # Reuse file protection check
+    if is_protected:
+        warning_msg = _protection.get_warning("general")
+        log.error(f"{warning_msg} - {reason}")
+        print(f"\n{'!' * 60}")
+        print(f"  {warning_msg}")
+        print(f"  Registry Key: {key_path}")
+        print(f"  Reason: {reason}")
+        print(f"  Action BLOCKED for system safety")
+        print(f"{'!' * 60}\n")
+        return _result("blocked", "registry_delete", key_path, 
+                      {"reason": reason, "warning": warning_msg})
+    
+    def _delete():
+        """Delete registry key/value OR scheduled task via schtasks"""
+        # Check for special schtasks format: "...@schtasks:{task_name}"
+        if "@schtasks:" in key_path:
+            return _delete_scheduled_task(key_path)
+        
+        # Standard registry deletion
+        return _delete_registry(key_path)
+    
+    def _delete_scheduled_task(key_path: str) -> Dict[str, Any]:
+        """
+        Delete a scheduled task using schtasks command.
+        
+        Input format: "HKEY_LOCAL_MACHINE\\System\\...\\@schtasks:{task_name}"
+        Extracts task_name and runs: schtasks /delete /tn "task_name" /f
+        """
+        # Extract task name from format: "...@schtasks:{task_name}"
+        parts = key_path.split("@schtasks:", 1)
+        if len(parts) < 2:
+            raise ValueError(f"Invalid schtasks format: {key_path}")
+        
+        task_name = parts[1].strip()
+        
+        # Delete using schtasks command (safer, more appropriate for scheduled tasks)
+        cmd = ["schtasks", "/delete", "/tn", task_name, "/f"]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            return {
+                "method": "schtasks_cmd",
+                "task_name": task_name,
+                "command": " ".join(cmd),
+                "returncode": result.returncode,
+                "success": result.returncode == 0,
+                "stdout": result.stdout.strip() or None,
+                "stderr": result.stderr.strip() or None,
+            }
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete scheduled task '{task_name}': {e}")
+    
+    def _delete_registry(key_path: str) -> Dict[str, Any]:
+        """Delete registry key/value using winreg module or subprocess"""
+        # Normalize key_path: convert short hive names to full names
+        hive_mapping = {
+            "HKLM": "HKEY_LOCAL_MACHINE",
+            "HKCU": "HKEY_CURRENT_USER",
+            "HKCR": "HKEY_CLASSES_ROOT",
+            "HKU":  "HKEY_USERS",
+            "HKCC": "HKEY_CURRENT_CONFIG",
+        }
+        
+        normalized_path = key_path
+        for short, full in hive_mapping.items():
+            if key_path.upper().startswith(short + "\\"):
+                normalized_path = key_path.replace(short, full, 1)
+                break
+        
+        # Check if this is a value deletion (contains @)
+        is_value_deletion = "@" in normalized_path
+        
+        # Split hive and path
+        parts = normalized_path.split("\\", 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid registry path format: {key_path}")
+        
+        hive_name = parts[0]
+        reg_path = parts[1]
+        
+        if is_value_deletion:
+            # Format: HKEY_...\path\@value_name
+            # This DELETES ONLY THE VALUE, not the entire key
+            reg_path, value_name = reg_path.rsplit("\\", 1)
+            value_name = value_name.lstrip("@")
+            return _delete_value(hive_name, reg_path, value_name)
+        else:
+            # Delete the entire key (careful - use only for malware-dropped keys)
+            return _delete_key(hive_name, reg_path)
+    
+    def _delete_key(hive_name: str, reg_path: str) -> Dict[str, Any]:
+        """Delete an entire registry key recursively"""
+        hive_map = {
+            "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+            "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+            "HKEY_CLASSES_ROOT": winreg.HKEY_CLASSES_ROOT,
+            "HKEY_USERS": winreg.HKEY_USERS,
+            "HKEY_CURRENT_CONFIG": winreg.HKEY_CURRENT_CONFIG,
+        }
+        
+        if hive_name not in hive_map:
+            raise ValueError(f"Unknown registry hive: {hive_name}")
+        
+        hive = hive_map[hive_name]
+        
+        try:
+            # Try using winreg's recursive delete
+            def _recursive_delete(hkey: int, key_path: str):
+                """Recursively delete a registry key and all subkeys"""
+                try:
+                    # Open the key
+                    key = winreg.OpenKey(hkey, key_path, 0, winreg.KEY_ALL_ACCESS)
+                    
+                    # Delete all subkeys first
+                    while True:
+                        try:
+                            subkey = winreg.EnumKey(key, 0)
+                            _recursive_delete(hkey, f"{key_path}\\{subkey}")
+                        except OSError:
+                            break  # No more subkeys
+                    
+                    winreg.CloseKey(key)
+                    
+                    # Now delete the key itself
+                    winreg.DeleteKey(hkey, key_path)
+                except OSError as e:
+                    if not force:
+                        raise
+                    # If force=True, ignore errors
+                    log.warning(f"Could not delete registry key {key_path}: {e}")
+            
+            _recursive_delete(hive, reg_path)
+            
+            return {
+                "method": "winreg",
+                "deleted_key": f"{hive_name}\\{reg_path}",
+                "success": True,
+            }
+        
+        except Exception as e:
+            # Fallback: use reg delete command
+            log.warning(f"winreg delete failed, trying subprocess: {e}")
+            
+            hive_short = {
+                "HKEY_LOCAL_MACHINE": "HKLM",
+                "HKEY_CURRENT_USER": "HKCU",
+                "HKEY_CLASSES_ROOT": "HKCR",
+                "HKEY_USERS": "HKU",
+                "HKEY_CURRENT_CONFIG": "HKCC",
+            }.get(hive_name, hive_name)
+            
+            cmd = ["reg", "delete", f"{hive_short}\\{reg_path}", "/f"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0 or force:
+                return {
+                    "method": "reg_delete_cmd",
+                    "deleted_key": f"{hive_name}\\{reg_path}",
+                    "command": " ".join(cmd),
+                    "success": result.returncode == 0,
+                    "stderr": result.stderr.strip() or None,
+                }
+            else:
+                raise RuntimeError(f"reg delete command failed: {result.stderr}")
+    
+    def _delete_value(hive_name: str, reg_path: str, value_name: str) -> Dict[str, Any]:
+        """Delete a specific registry value within a key"""
+        hive_map = {
+            "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+            "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+            "HKEY_CLASSES_ROOT": winreg.HKEY_CLASSES_ROOT,
+            "HKEY_USERS": winreg.HKEY_USERS,
+            "HKEY_CURRENT_CONFIG": winreg.HKEY_CURRENT_CONFIG,
+        }
+        
+        if hive_name not in hive_map:
+            raise ValueError(f"Unknown registry hive: {hive_name}")
+        
+        hive = hive_map[hive_name]
+        
+        try:
+            # Try using winreg
+            key = winreg.OpenKey(hive, reg_path, 0, winreg.KEY_ALL_ACCESS)
+            winreg.DeleteValue(key, value_name)
+            winreg.CloseKey(key)
+            
+            return {
+                "method": "winreg",
+                "deleted_value": f"{hive_name}\\{reg_path}@{value_name}",
+                "success": True,
+            }
+        
+        except Exception as e:
+            # Fallback: use reg delete command
+            log.warning(f"winreg value delete failed, trying subprocess: {e}")
+            
+            hive_short = {
+                "HKEY_LOCAL_MACHINE": "HKLM",
+                "HKEY_CURRENT_USER": "HKCU",
+                "HKEY_CLASSES_ROOT": "HKCR",
+                "HKEY_USERS": "HKU",
+                "HKEY_CURRENT_CONFIG": "HKCC",
+            }.get(hive_name, hive_name)
+            
+            cmd = ["reg", "delete", f"{hive_short}\\{reg_path}", "/v", value_name, "/f"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0 or force:
+                return {
+                    "method": "reg_delete_cmd",
+                    "deleted_value": f"{hive_name}\\{reg_path}@{value_name}",
+                    "command": " ".join(cmd),
+                    "success": result.returncode == 0,
+                    "stderr": result.stderr.strip() or None,
+                }
+            else:
+                raise RuntimeError(f"reg delete command failed: {result.stderr}")
+    
+    return _gate(mode, "registry_delete", key_path,
+                 f"Delete registry key '{key_path}'", _delete)
+
 
 def identity_revocation(
     identity: str,

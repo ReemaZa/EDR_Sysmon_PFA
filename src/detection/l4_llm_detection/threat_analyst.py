@@ -92,6 +92,10 @@ class ThreatAnalyst:
             "findings":       0,
         }
 
+        # ── Remediation trigger state (used by live mode in agent.py) ─────────
+        self._quiet_ticks        = 0   # incremented each tick with no candidates
+        self._remediation_requested = threading.Event()  # set when threshold met
+
         # Thread
         self._stop_event = threading.Event()
         self._thread     = threading.Thread(
@@ -151,6 +155,15 @@ class ThreatAnalyst:
             while time.monotonic() < deadline and not self._stop_event.is_set():
                 time.sleep(1)
 
+    def consume_remediation_request(self) -> bool:
+        """
+        Returns True (and clears the flag) if a remediation run was requested
+        since the last call.  Thread-safe.
+        """
+        if self._remediation_requested.is_set():
+            self._remediation_requested.clear()
+            return True
+        return False
     # ── TICK ──────────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -161,7 +174,22 @@ class ThreatAnalyst:
         candidates = self._scan_graph()
         self._log(f"[ThreatAnalyst] {len(candidates)} candidate(s) above threshold={self.threat_threshold}")
         if not candidates:
+            self._quiet_ticks += 1
+            self._log(
+                f"[ThreatAnalyst] Quiet tick #{self._quiet_ticks} "
+                f"(no nodes above threshold)"
+            )
+            if self._quiet_ticks >= 10:
+                self._log(
+                    "[ThreatAnalyst] 10 consecutive quiet ticks — "
+                    "signalling remediation."
+                )
+                self._quiet_ticks = 0          # reset so it doesn't fire again immediately
+                self._remediation_requested.set()
             return
+
+        # candidates found — reset quiet counter
+        self._quiet_ticks = 0
     
         # Remaining pool — shrinks as nodes get visited
         remaining = [guid for guid, _ in candidates]
@@ -327,6 +355,7 @@ class ThreatAnalyst:
             "domain":   ("DNS",             "id"),
             "registry": ("Registry",        "id"),
             "user":     ("User",            "id"),
+            "host":     ("Host",            "id"),
         }
 
         for target_type, actions_list in groups.items():
@@ -340,47 +369,70 @@ class ThreatAnalyst:
             label, id_field = TYPE_MAP[target_type]
 
             try:
-                self._db.execute(
-                    f"""
-                    UNWIND $actions AS a
-                    MATCH (n:{label} {{{id_field}: a.val}})
-                    SET n.pending_action    = a.action_type,
-                        n.action_reason     = a.reason,
-                        n.action_stamped_at = $ts
-                    """,
-                    {"actions": actions_list, "ts": ts},
+                # Build query with proper syntax
+                query = f"""
+                UNWIND $actions AS a
+                MATCH (n:{label} {{{id_field}: a.val}})
+                SET n.pending_action    = a.action_type,
+                    n.action_reason     = a.reason,
+                    n.action_stamped_at = $ts
+                RETURN count(n) AS matched
+                """
+                result_rows = list(self._db.execute_and_fetch(query, {"actions": actions_list, "ts": ts}))
+                matched = result_rows[0]["matched"] if result_rows else 0
+                
+                self._log(
+                    f"[ThreatAnalyst][ACTION BATCH] {label}: {matched}/{len(actions_list)} nodes updated"
                 )
+                
+                if matched == 0:
+                    self._log(
+                        f"[ThreatAnalyst][CRITICAL] No {label} nodes matched! "
+                        f"Sample values: {[a['val'][:40] for a in actions_list[:2]]}"
+                    )
+                
                 for a in actions_list:
                     self._log(
                         f"[ThreatAnalyst][ACTION] [{a['action_type']}] "
-                        f"→ {label} {a['val'][:20] if len(a['val']) > 20 else a['val']}"
+                        f"→ {label} {a['val'][:40]}"
                     )
 
             except Exception as exc:
                 self._log(
-                    f"[ThreatAnalyst][WARN] Batch stamp failed for "
+                    f"[ThreatAnalyst][ERROR] Batch stamp failed for "
                     f"target_type={target_type}: {exc}"
                 )
+                import traceback
+                self._log(traceback.format_exc())
+                
                 # Fallback: retry one by one
                 for a in actions_list:
                     try:
-                        self._db.execute(
-                            f"""
-                            MATCH (n:{label} {{{id_field}: $val}})
-                            SET n.pending_action    = $action_type,
-                                n.action_reason     = $reason,
-                                n.action_stamped_at = $ts
-                            """,
+                        fallback_query = f"""
+                        MATCH (n:{label} {{{id_field}: $val}})
+                        SET n.pending_action    = $action_type,
+                            n.action_reason     = $reason,
+                            n.action_stamped_at = $ts
+                        RETURN count(n) AS cnt
+                        """
+                        fallback_result = list(self._db.execute_and_fetch(
+                            fallback_query,
                             {
                                 "val":         a["val"],
                                 "action_type": a["action_type"],
                                 "reason":      a["reason"],
                                 "ts":          ts,
                             },
-                        )
+                        ))
+                        cnt = fallback_result[0]["cnt"] if fallback_result else 0
+                        if cnt == 0:
+                            self._log(
+                                f"[ThreatAnalyst][WARN] No node found for "
+                                f"{label}.{id_field}={a['val']}"
+                            )
                     except Exception as inner_exc:
                         self._log(
-                            f"[ThreatAnalyst][WARN] Single fallback also failed "
+                            f"[ThreatAnalyst][ERROR] Single fallback also failed "
                             f"for {label} {a['val']}: {inner_exc}"
                         )
 

@@ -54,6 +54,12 @@ ACTION TYPES → FUNCTION MAPPING:
       target_value : Windows username string
       calls        : response_functions.identity_revocation(identity: str, mode)
 
+  "registry_delete"
+      target_type  : "registry"
+      target_value : full registry key path (e.g., "HKEY_LOCAL_MACHINE\\Software\\Evil")
+      calls        : response_functions.registry_delete(key_path: str, mode, force=False)
+      note         : supports both key deletion and value deletion (use @value_name for value)
+
   "patching"
       target_type  : (any — target_value is treated as asset/package identifier)
       target_value : package name or asset GUID
@@ -242,6 +248,19 @@ class ActionExecutor:
                         {"val": domain, "action_type": action_type, "ts": ts},
                     )
 
+                case "registry_delete":
+                    # For registry keys, update any RegistryKey node matching the path
+                    db.execute(
+                        """
+                        MATCH (r:RegistryKey {id: $val})
+                        SET r.pending_action      = null,
+                            r.action_executed     = $action_type,
+                            r.action_executed_at  = $ts,
+                            r.status              = 'deleted'
+                        """,
+                        {"val": target_value, "action_type": action_type, "ts": ts},
+                    )
+
                 case _:
                     # alert, blacklist, host_isolation, shutdown, etc.
                     # no specific node to update
@@ -370,6 +389,16 @@ class ActionExecutor:
                     identifier=target_value,
                     blacklist_type=bl_type,
                     mode="automatic",
+                )
+
+            # ── registry_delete ───────────────────────────────────────────────
+            # target_type  : "registry"
+            # target_value : full registry key path (e.g., "HKLM\\Software\\Evil")
+            case "registry_delete":
+                return rf.registry_delete(
+                    key_path=target_value,
+                    mode=self.mode,
+                    force=False,
                 )
 
             # ── identity_revocation ───────────────────────────────────────────
