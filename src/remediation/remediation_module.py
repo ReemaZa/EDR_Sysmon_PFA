@@ -3,10 +3,12 @@ remediation_module.py  —  Orchestrator: runs the full remediation pipeline.
 
 PIPELINE (called once, after log ingestion is complete + 60s grace period)
 ──────────────────────────────────────────────────────────────────────────
-  1. IncidentCollector  — query Memgraph for stamped GUIDs
+  1. IncidentCollector  — query Memgraph for stamped GUIDs (ProcessInstance)
+                          AND stamped File / Network / DNS nodes
   2. IncidentGrouper    — union-find clustering via PAT parent chains
   3. LineageBuilder     — full ancestry + blast radius from PAT
-  4. ContextBuilder     — assemble LLM payload
+  4. ContextBuilder     — assemble LLM payload, including analyst_file_actions
+                          and analyst_network_actions scoped to blast radius
   5. RemediationAgent   — ReAct tool-calling loop → RemediationReport
 
 TRIGGER
@@ -16,6 +18,44 @@ Called from agent.py after log replay finishes:
 
 Sleeps GRACE_PERIOD_SECONDS first so the AnalystAgent background thread
 can stamp all pending_actions before we query Memgraph.
+
+CHANGES vs previous version
+----------------------------
+1. IncidentCollector.get_actioned_guids — unchanged.
+
+2. NEW: IncidentCollector.get_analyst_file_actions(db, logger)
+   Queries File nodes with pending_action IS NOT NULL.
+   Returns list of dicts: {path, action_type, action_reason,
+                            action_stamped_at, source_process_guid}.
+   `source_process_guid` is resolved by following the CREATED/WROTE
+   relationship back to a ProcessInstance so we can scope files to
+   incident blast radii.
+
+3. NEW: IncidentCollector.get_analyst_network_actions(db, logger)
+   Queries Network nodes (ip_block) and DNS nodes (dns_block) with
+   pending_action IS NOT NULL.
+   Returns list of dicts: {value, action_type, action_reason,
+                            action_stamped_at, ioc_type}.
+
+4. ContextBuilder.build_context — now accepts analyst_file_actions and
+   analyst_network_actions lists.  Filters them to only entries whose
+   source_process_guid appears in the blast radius of the current incident
+   (or whose value can be reverse-looked-up via PAT into the blast radius).
+   Adds two new top-level keys to the payload:
+     "analyst_file_actions"    : scoped list
+     "analyst_network_actions" : scoped list
+
+5. ContextBuilder._simulate_executed_actions — fixed: now also includes
+   entries from analyst_file_actions and analyst_network_actions with
+   the REAL target_value (file path / IP / domain) instead of always
+   using the process GUID.
+
+6. run_remediation — now collects file + network actions upfront and
+   passes them through ContextBuilder into RemediationToolRegistry so
+   that tool results can carry inline already_actioned_by_analyst flags.
+
+7. RemediationToolRegistry is now constructed with analyst_actioned_files
+   and analyst_actioned_network dicts so tools can annotate results inline.
 """
 
 from __future__ import annotations
@@ -38,8 +78,9 @@ from src.remediation.remediation_models import (
 )
 from src.remediation.remediation_tools import RemediationToolRegistry
 from src.remediation.remediation_agent import RemediationAgent
-
+from src.detection.l4_llm_detection.action_executor import ActionExecutor
 GRACE_PERIOD_SECONDS = 60
+MAX_BLAST_RADIUS_IN_PROMPT = 15  # Limit blast radius shown in LLM prompt to reduce tokens
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,11 +89,15 @@ GRACE_PERIOD_SECONDS = 60
 
 class IncidentCollector:
     """
-    Queries Memgraph for ProcessInstance nodes stamped with a pending_action
-    by the AnalystAgent.
+    Queries Memgraph for all nodes the AnalystAgent stamped with a
+    pending_action:
+      - ProcessInstance nodes  (unchanged)
+      - File nodes             (NEW — file_quarantine / file_deletion)
+      - Network nodes          (NEW — ip_block)
+      - DNS nodes              (NEW — dns_block)
 
-    When the Response Module is complete, update the Cypher query to filter on
-    action_executed IS NOT NULL instead of pending_action IS NOT NULL.
+    When the Response Module is complete, update the ProcessInstance query
+    to filter on action_executed IS NOT NULL instead of pending_action IS NOT NULL.
     """
 
     @staticmethod
@@ -110,6 +155,154 @@ class IncidentCollector:
             )
 
         return guids
+
+    @staticmethod
+    def get_analyst_file_actions(
+        db: Memgraph, logger: RemediationLogger
+    ) -> List[Dict[str, Any]]:
+        """
+        Query Memgraph for File nodes the analyst stamped with pending_action.
+
+        Returns
+        -------
+        List of dicts:
+          {
+            "path":                str,   # File.id (the file path)
+            "action_type":         str,   # "file_quarantine" | "file_deletion"
+            "action_reason":       str,
+            "action_stamped_at":   str,
+            "source_process_guid": str,   # GUID of the ProcessInstance that
+                                          # CREATED or WROTE this file, or ""
+                                          # if the relationship is missing.
+          }
+        """
+        logger.info(
+            "Querying Memgraph for File nodes with pending_action IS NOT NULL ..."
+        )
+
+        try:
+            # Try to follow CREATED/WROTE relationships back to the source process.
+            # The OPTIONAL MATCH means we still get the file even if the relationship
+            # is absent (e.g. file was added by static rule, not a live process).
+            rows = list(db.execute_and_fetch(
+                """
+                MATCH (f:File)
+                WHERE f.pending_action IS NOT NULL
+                  AND f.pending_action <> ''
+                OPTIONAL MATCH (p:ProcessInstance)-[:CREATED|WROTE]->(f)
+                RETURN
+                    f.id                AS path,
+                    f.pending_action    AS action_type,
+                    f.action_reason     AS action_reason,
+                    f.action_stamped_at AS action_stamped_at,
+                    p.id                AS source_process_guid
+                """
+            ))
+        except Exception as exc:
+            logger.error("Memgraph File node query failed", exc)
+            return []
+
+        result = [
+            {
+                "path":                row.get("path", ""),
+                "action_type":         row.get("action_type", ""),
+                "action_reason":        row.get("action_reason", ""),
+                "action_stamped_at":   row.get("action_stamped_at", ""),
+                "source_process_guid": row.get("source_process_guid") or "",
+            }
+            for row in rows
+            if row.get("path")
+        ]
+
+        logger.info(f"Found {len(result)} analyst-actioned File node(s).")
+        if result:
+            logger.data("Analyst-actioned File nodes", result)
+
+        return result
+
+    @staticmethod
+    def get_analyst_network_actions(
+        db: Memgraph, logger: RemediationLogger
+    ) -> List[Dict[str, Any]]:
+        """
+        Query Memgraph for Network (ip_block) and DNS (dns_block) nodes the
+        analyst stamped with pending_action.
+
+        Returns
+        -------
+        List of dicts:
+          {
+            "value":             str,   # IP address or domain name (node .id)
+            "action_type":       str,   # "ip_block" | "dns_block"
+            "action_reason":     str,
+            "action_stamped_at": str,
+            "ioc_type":          str,   # "ip" | "domain"
+          }
+        """
+        logger.info(
+            "Querying Memgraph for Network/DNS nodes with "
+            "pending_action IS NOT NULL ..."
+        )
+
+        results = []
+
+        # Network nodes (ip_block)
+        try:
+            rows = list(db.execute_and_fetch(
+                """
+                MATCH (n:Network)
+                WHERE n.pending_action IS NOT NULL
+                  AND n.pending_action <> ''
+                RETURN
+                    n.id                AS value,
+                    n.pending_action    AS action_type,
+                    n.action_reason     AS action_reason,
+                    n.action_stamped_at AS action_stamped_at
+                """
+            ))
+            for row in rows:
+                if row.get("value"):
+                    results.append({
+                        "value":             row.get("value", ""),
+                        "action_type":       row.get("action_type", ""),
+                        "action_reason":     row.get("action_reason", ""),
+                        "action_stamped_at": row.get("action_stamped_at", ""),
+                        "ioc_type":          "ip",
+                    })
+        except Exception as exc:
+            logger.error("Memgraph Network node query failed", exc)
+
+        # DNS nodes (dns_block)
+        try:
+            rows = list(db.execute_and_fetch(
+                """
+                MATCH (d:DNS)
+                WHERE d.pending_action IS NOT NULL
+                  AND d.pending_action <> ''
+                RETURN
+                    d.id                AS value,
+                    d.pending_action    AS action_type,
+                    d.action_reason     AS action_reason,
+                    d.action_stamped_at AS action_stamped_at
+                """
+            ))
+            for row in rows:
+                if row.get("value"):
+                    results.append({
+                        "value":             row.get("value", ""),
+                        "action_type":       row.get("action_type", ""),
+                        "action_reason":     row.get("action_reason", ""),
+                        "action_stamped_at": row.get("action_stamped_at", ""),
+                        "ioc_type":          "domain",
+                    })
+        except Exception as exc:
+            logger.error("Memgraph DNS node query failed", exc)
+
+        logger.info(f"Found {len(results)} analyst-actioned Network/DNS node(s).")
+        if results:
+            logger.data("Analyst-actioned Network/DNS nodes", results)
+
+        return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,6 +528,8 @@ class ContextBuilder:
     - Memgraph : pending_action, action_reason, action_stamped_at per node.
     - PAT      : full action stream per blast-radius process.
     - Lineage  : ancestry chain + blast radius node records.
+    - NEW: analyst_file_actions    — File nodes stamped by analyst.
+    - NEW: analyst_network_actions — Network/DNS nodes stamped by analyst.
     """
 
     # PAT action types surfaced as "notable" (first occurrence per type)
@@ -355,16 +550,20 @@ class ContextBuilder:
 
     def build_context(
         self,
-        lineage: IncidentLineage,
-        logger:  RemediationLogger,
+        lineage:                 IncidentLineage,
+        analyst_file_actions:    List[Dict[str, Any]],
+        analyst_network_actions: List[Dict[str, Any]],
+        logger:                  RemediationLogger,
     ) -> Dict[str, Any]:
         """
         Assemble and log the full LLM context payload.
 
         Parameters
         ----------
-        lineage : IncidentLineage from LineageBuilder.
-        logger  : shared RemediationLogger.
+        lineage                 : IncidentLineage from LineageBuilder.
+        analyst_file_actions    : all File nodes stamped by analyst (global).
+        analyst_network_actions : all Network/DNS nodes stamped by analyst (global).
+        logger                  : shared RemediationLogger.
 
         Returns
         -------
@@ -372,11 +571,32 @@ class ContextBuilder:
         """
         group = lineage.group
 
+        # Build the set of blast-radius GUIDs for scoping
+        blast_radius_guids = {
+            node.get("guid", "")
+            for node in lineage.blast_radius
+            if node.get("guid")
+        }
+
         logger.info("Fetching analyst reasoning from Memgraph ...")
         analyst_reasoning = self._fetch_analyst_reasoning(group.member_guids, logger)
 
-        logger.info("Building simulated executed-actions list ...")
-        executed_actions  = self._simulate_executed_actions(analyst_reasoning, logger)
+        # Scope file actions to this incident's blast radius
+        logger.info("Scoping analyst file actions to this incident's blast radius ...")
+        scoped_file_actions = self._scope_file_actions(
+            analyst_file_actions, blast_radius_guids, logger
+        )
+
+        # Scope network actions to this incident's blast radius via PAT reverse index
+        logger.info("Scoping analyst network actions to this incident's blast radius ...")
+        scoped_network_actions = self._scope_network_actions(
+            analyst_network_actions, blast_radius_guids, logger
+        )
+
+        logger.info("Building executed-actions list ...")
+        executed_actions = self._build_executed_actions(
+            analyst_reasoning, scoped_file_actions, scoped_network_actions, logger
+        )
 
         logger.info("Building per-process action summaries from PAT ...")
         process_action_summaries = self._build_action_summaries(
@@ -390,6 +610,9 @@ class ContextBuilder:
             "chain_truncated":          lineage.chain_truncated,
             "analyst_reasoning":        analyst_reasoning,
             "executed_actions":         executed_actions,
+            # NEW: analyst-actioned artifacts scoped to this incident
+            "analyst_file_actions":     scoped_file_actions,
+            "analyst_network_actions":  scoped_network_actions,
             "lineage": {
                 "ancestry_chain": lineage.ancestry_chain,
                 "blast_radius":   lineage.blast_radius,
@@ -401,8 +624,91 @@ class ContextBuilder:
         # Log the full payload (raw per-node action streams stripped for brevity;
         # those are fully visible in the tool-call log inside the agent section)
         logger.context_payload(payload)
-
         return payload
+
+    # ── Scoping helpers ───────────────────────────────────────────────────────
+
+    def _scope_file_actions(
+        self,
+        all_file_actions:    List[Dict[str, Any]],
+        blast_radius_guids:  set,
+        logger:              RemediationLogger,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter analyst file actions to only those belonging to this incident.
+
+        Primary filter : source_process_guid is in blast_radius_guids.
+        Fallback filter: use PAT reverse index find_guids_by_file() to check
+                         if any process that touched the file is in the blast
+                         radius (covers files added by static rules with no
+                         direct CREATED relationship in Memgraph).
+        """
+        scoped = []
+        for entry in all_file_actions:
+            path        = entry.get("path", "")
+            source_guid = entry.get("source_process_guid", "")
+
+            # Primary: direct relationship in Memgraph
+            if source_guid and source_guid in blast_radius_guids:
+                scoped.append(entry)
+                continue
+
+            # Fallback: PAT reverse index
+            try:
+                touching_guids = set(self._pat.find_guids_by_file(path))
+                if touching_guids & blast_radius_guids:
+                    scoped.append(entry)
+            except Exception:
+                pass  # PAT unavailable for this path — skip silently
+
+        logger.info(
+            f"File action scoping: {len(all_file_actions)} global → "
+            f"{len(scoped)} scoped to this incident."
+        )
+        if scoped:
+            logger.data("Scoped analyst file actions", scoped)
+
+        return scoped
+
+    def _scope_network_actions(
+        self,
+        all_network_actions: List[Dict[str, Any]],
+        blast_radius_guids:  set,
+        logger:              RemediationLogger,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter analyst network/DNS actions to only those belonging to this incident.
+
+        Uses PAT reverse indices:
+          find_guids_by_ip(ip)       for ioc_type == "ip"
+          find_guids_by_domain(dom)  for ioc_type == "domain"
+        """
+        scoped = []
+        for entry in all_network_actions:
+            value    = entry.get("value", "")
+            ioc_type = entry.get("ioc_type", "")
+
+            try:
+                if ioc_type == "ip":
+                    touching_guids = set(self._pat.find_guids_by_ip(value))
+                elif ioc_type == "domain":
+                    touching_guids = set(self._pat.find_guids_by_domain(value))
+                else:
+                    continue
+
+                if touching_guids & blast_radius_guids:
+                    scoped.append(entry)
+            except Exception:
+                pass
+
+        logger.info(
+            f"Network action scoping: {len(all_network_actions)} global → "
+            f"{len(scoped)} scoped to this incident."
+        )
+        if scoped:
+            logger.data("Scoped analyst network/DNS actions", scoped)
+
+        return scoped
 
     # ── Analyst reasoning ─────────────────────────────────────────────────────
 
@@ -451,43 +757,72 @@ class ContextBuilder:
         logger.data("Analyst reasoning entries", result)
         return result
 
-    # ── Simulated executed actions ────────────────────────────────────────────
+    # ── Executed actions (FIXED) ──────────────────────────────────────────────
 
-    def _simulate_executed_actions(
+    def _build_executed_actions(
         self,
-        analyst_reasoning: List[Dict[str, Any]],
-        logger:            RemediationLogger,
+        analyst_reasoning:       List[Dict[str, Any]],
+        scoped_file_actions:     List[Dict[str, Any]],
+        scoped_network_actions:  List[Dict[str, Any]],
+        logger:                  RemediationLogger,
     ) -> List[Dict[str, Any]]:
         """
-        Mark every pending_action as simulated_done for testing.
-        Replace with a real Memgraph query once the Response Module is complete.
+        Build the executed_actions list that the LLM sees under
+        "EXECUTED ACTIONS (containment already performed)".
+
+        This is FIXED vs the old _simulate_executed_actions:
+          - Process actions: target_type=guid, target_value=process GUID  (correct)
+          - File actions:    target_type=file, target_value=file path      (FIXED)
+          - Network actions: target_type=ip,   target_value=IP address     (FIXED)
+          - DNS actions:     target_type=domain, target_value=domain name  (FIXED)
+
+        All entries are still marked status="simulated_done" until the Response
+        Module is complete and action_executed can be queried instead.
         """
-        simulated = []
+        executed = []
+
+        # Process-level actions (from analyst_reasoning)
         for entry in analyst_reasoning:
             action = entry.get("pending_action", "")
             if not action:
                 continue
-            target_type = "guid"
-            if action in ("ip_block",):            target_type = "ip"
-            elif action in ("dns_block",):         target_type = "domain"
-            elif action in ("file_quarantine",
-                            "file_deletion"):      target_type = "file"
-            elif action in ("identity_revocation",): target_type = "user"
-
-            simulated.append({
+            executed.append({
                 "action":       action,
-                "target_type":  target_type,
+                "target_type":  "guid",
                 "target_value": entry.get("guid", ""),
                 "status":       "simulated_done",
                 "executed_at":  entry.get("action_stamped_at", ""),
                 "reason":       entry.get("action_reason", ""),
             })
 
+        # File actions — target_value is the REAL file path
+        for entry in scoped_file_actions:
+            executed.append({
+                "action":       entry.get("action_type", ""),
+                "target_type":  "file",
+                "target_value": entry.get("path", ""),      # FIXED: actual path
+                "status":       "simulated_done",
+                "executed_at":  entry.get("action_stamped_at", ""),
+                "reason":       entry.get("action_reason", ""),
+            })
+
+        # Network / DNS actions — target_value is the REAL IP or domain
+        for entry in scoped_network_actions:
+            ioc_type = entry.get("ioc_type", "ip")
+            executed.append({
+                "action":       entry.get("action_type", ""),
+                "target_type":  ioc_type,
+                "target_value": entry.get("value", ""),     # FIXED: actual IP/domain
+                "status":       "simulated_done",
+                "executed_at":  entry.get("action_stamped_at", ""),
+                "reason":       entry.get("action_reason", ""),
+            })
+
         logger.data(
-            "Simulated executed actions (Response Module not yet complete)",
-            simulated,
+            "Executed actions (simulated — Response Module not yet complete)",
+            executed,
         )
-        return simulated
+        return executed
 
     # ── Process action summaries ──────────────────────────────────────────────
 
@@ -498,12 +833,22 @@ class ContextBuilder:
     ) -> List[Dict[str, Any]]:
         """
         For every blast-radius node, summarise its PAT action stream and log it.
-
-        Produces:
-          - action_counts  : {type: count} for ALL types seen.
-          - notable_actions: first occurrence of each interesting type.
+        
+        OPTIMISED: Limit notable actions to the 3 most relevant types to reduce
+        token usage and comply with API rate limits. Only show actions that are
+        most likely to reveal persistence, exfiltration, or backdoors.
         """
         summaries = []
+        
+        # Priority order: which action types are most forensically significant?
+        PRIORITY_ACTIONS = [
+            "registry_write",  # persistence indicators
+            "file_created",    # dropped files, persistence droppers
+            "network_connection",  # exfiltration, C2
+            "injected_thread_into",  # backdoors
+            "driver_loaded",   # rootkit indicators
+            "child_spawned",   # lateral movement, command execution
+        ]
 
         for node in blast_radius:
             guid    = node.get("guid", "")
@@ -513,11 +858,21 @@ class ContextBuilder:
             counts:        Dict[str, int]            = defaultdict(int)
             first_notable: Dict[str, Dict[str, Any]] = {}
 
+            # First pass: count all actions and find first of each notable type
             for action in actions:
                 atype = action.get("type", "unknown")
                 counts[atype] += 1
                 if atype in self._NOTABLE_TYPES and atype not in first_notable:
                     first_notable[atype] = self._extract_notable_fields(atype, action)
+
+            # Second pass: prioritize which notable actions to include
+            # Keep only the top 3 most important types to reduce token usage
+            prioritized_notable = {}
+            for priority_type in PRIORITY_ACTIONS:
+                if priority_type in first_notable:
+                    prioritized_notable[priority_type] = first_notable[priority_type]
+                if len(prioritized_notable) >= 3:  # Limit to 3 to save tokens
+                    break
 
             summary = {
                 "guid":            guid,
@@ -526,19 +881,18 @@ class ContextBuilder:
                 "action_counts":   dict(counts),
                 "notable_actions": [
                     {"type": atype, **fields}
-                    for atype, fields in first_notable.items()
+                    for atype, fields in prioritized_notable.items()
                 ],
             }
             summaries.append(summary)
 
-            # Log the full summary for this node so you can see exactly
-            # what it did without needing to open Redis yourself
             logger.data(
                 f"Action summary for {image} (GUID={guid[:20]})",
                 {
                     "total_actions":   summary["total_actions"],
                     "action_counts":   summary["action_counts"],
-                    "notable_actions": summary["notable_actions"],
+                    "notable_actions_shown": len(summary["notable_actions"]),
+                    "notable_actions_total": len(first_notable),
                 },
             )
 
@@ -547,8 +901,44 @@ class ContextBuilder:
     def _extract_notable_fields(
         self, action_type: str, action: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Extract the most relevant fields for a given PAT action type."""
+        """Extract the most relevant fields for a given PAT action type.
+        
+        Truncates only -EncodedCommand values in cmdlines to reduce token usage.
+        All other strings (file paths, etc.) are kept intact.
+        """
         ts = action.get("ts", "")
+        
+        def truncate_encoded_command(cmdline: str) -> str:
+            """
+            Find '-EncodedCommand' in cmdline and truncate everything after it
+            to just a few characters (e.g., 'TRUNCATED').
+            
+            Example:
+                Input:  'powershell.exe -EncodedCommand JgBGQBwAHAAZQByAA=='
+                Output: 'powershell.exe -EncodedCommand TRUNCATED'
+            """
+            if not isinstance(cmdline, str):
+                return cmdline
+            
+            lower_cmd = cmdline.lower()
+            if "encodedcommand" not in lower_cmd:
+                return cmdline  # No encoded command, return as-is
+            
+            # Find the index of '-EncodedCommand' (case-insensitive)
+            idx = lower_cmd.find("encodedcommand")
+            if idx == -1:
+                return cmdline
+            
+            # Find where the encoded string starts (after '-EncodedCommand' and optional spaces)
+            # Typically: '-EncodedCommand JkBG...'
+            start = idx + len("encodedcommand")
+            # Skip whitespace/hyphens
+            while start < len(cmdline) and cmdline[start] in (' ', '\t', '-'):
+                start += 1
+            
+            # Keep everything before the encoded value, replace encoded value with 'TRUNCATED'
+            return cmdline[:start] + "TRUNCATED"
+        
         if action_type in ("file_created", "file_deleted", "file_timestomped"):
             return {"path": action.get("path", ""), "sha256": action.get("sha256", ""), "ts": ts}
         if action_type == "wrote_ads":
@@ -573,10 +963,154 @@ class ContextBuilder:
             return {"target_guid": action.get("target_guid", ""), "target_image": action.get("target_image", ""),
                     "access_mask": action.get("access_mask", ""), "ts": ts}
         if action_type == "child_spawned":
+            child_cmdline = action.get("child_cmdline", "")
+            # Truncate only if it contains -EncodedCommand
+            child_cmdline = truncate_encoded_command(child_cmdline)
             return {"child_guid": action.get("child_guid", ""), "child_image": action.get("child_image", ""),
-                    "child_cmdline": action.get("child_cmdline", ""), "ts": ts}
+                    "child_cmdline": child_cmdline, "ts": ts}
         return {"ts": ts}
 
+
+# ── ACTION TYPE MAPPING ───────────────────────────────────────────────────────
+# RemediationAgent uses different field names / action type strings than
+# AnalystAgent.  This adapter normalises a cleanup_action dict into the
+# shape ActionExecutor._dispatch() expects.
+
+_REMEDIATION_TO_ANALYST_TYPE: Dict[str, str] = {
+    "quarantine_file":      "file_quarantine",
+    "remove_registry_key":  "registry_delete",  # DELETE registry key instead of alerting
+    "block_ip":             "ip_block",
+    "block_domain":         "dns_block",
+    "disable_service":      "alert",          # no direct RF call — raise alert
+    "scan_process":         "alert",          # informational — raise alert
+    "revoke_credential":    "identity_revocation",
+    "patch_vulnerability":  "patching",
+    "reimage_host":         "shutdown",       # closest available action
+    "alert_analyst":        "alert",
+}
+
+def _transform_task_name_to_registry_path(target: str) -> str:
+    """
+    Convert a remediation agent task target (e.g., "Task: T1053_005_OnStartup")
+    into a registry value deletion path that deletes ONLY the specific scheduled task,
+    not the entire parent registry key.
+    
+    Windows Scheduled Tasks are stored in:
+    - Task subkeys: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks
+      (Each task is a subkey with GUID name)
+    
+    For deleting a task by name, use:
+    - schtasks /delete /tn "TaskName" /f
+    
+    However, if we need registry-level deletion, we delete the task's subkey:
+    - Format: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\{GUID}
+    
+    Since the remediation report only provides the task NAME, we construct a command
+    that will be converted to schtasks deletion instead of direct registry deletion.
+    
+    For now, return a special format: "schtasks://{task_name}" which indicates
+    that ActionExecutor should handle this via schtasks command rather than registry.
+    """
+    # Extract task name from formats like:
+    # - "Task: T1053_005_OnStartup"
+    # - "T1053_005_OnStartup"
+    # - "Task:T1053_005_OnStartup"
+    
+    task_name = target
+    if target.lower().startswith("task:"):
+        task_name = target[5:].strip()
+    elif target.lower().startswith("task "):
+        task_name = target[5:].strip()
+    
+    # Return format that indicates this should use schtasks deletion
+    # Format: HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Scheduler@schtasks:{task_name}
+    # This tells registry_delete to use schtasks /delete instead
+    return f"HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\Scheduler@schtasks:{task_name}"
+
+def _remediation_action_to_executor_format(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert a RemediationAgent cleanup_action dict into the format
+    ActionExecutor._dispatch() expects.
+
+    RemediationAgent schema:
+        { priority, action_type, target, reason, confidence, confidence_reason }
+
+    ActionExecutor schema:
+        { id, priority, type, target_type, target_value, reason }
+
+    Returns None if the action_type has no RF equivalent (will be skipped).
+    """
+    import uuid
+
+    action_type  = action.get("action_type", "")
+    target       = action.get("target", "")
+    priority     = action.get("priority", 5)
+    reason       = action.get("reason", "")
+    confidence   = action.get("confidence", 0.5)
+
+    mapped_type = _REMEDIATION_TO_ANALYST_TYPE.get(action_type)
+    if not mapped_type:
+        return None  # unknown — skip
+
+    # Infer target_type from the target string content
+    if mapped_type == "ip_block":
+        target_type = "ip"
+    elif mapped_type == "dns_block":
+        target_type = "domain"
+    elif mapped_type in ("file_quarantine", "file_deletion"):
+        target_type = "file"
+    elif mapped_type == "registry_delete":
+        target_type = "registry"
+        # Transform task name to registry path for scheduled tasks
+        # Example: "Task: T1053_005_OnStartup" → registry path to delete
+        target = _transform_task_name_to_registry_path(target)
+    elif mapped_type == "identity_revocation":
+        target_type = "user"
+    elif mapped_type in ("patching", "shutdown"):
+        target_type = "host"
+    else:
+        target_type = "host"  # alert / generic
+
+    return {
+        "id":           f"rem-{uuid.uuid4().hex[:8]}",
+        "priority":     priority,
+        "type":         mapped_type,
+        "target_type":  target_type,
+        "target_value": target,
+        "reason":       f"[Remediation|conf={confidence:.2f}] {reason}",
+    }
+
+
+def _transform_task_name_to_registry_path(target: str) -> str:
+    """
+    Transform a scheduled task name into a registry deletion path.
+    
+    Windows Scheduled Tasks are stored in the registry at:
+      HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\<TaskName>
+    
+    Parameters
+    ----------
+    target : str
+        Either a task name (e.g., "T1053_005_OnStartup") or 
+        a prefixed description (e.g., "Task: T1053_005_OnStartup")
+    
+    Returns
+    -------
+    str
+        Full registry path to delete, or the original target if it's already a path
+    """
+    # If it's already a registry path, return as-is
+    if target.startswith("HKEY_") or target.startswith("HKLM\\") or target.startswith("HKU\\"):
+        return target
+    
+    # Extract task name (remove "Task: " prefix if present)
+    task_name = target.replace("Task: ", "").strip()
+    
+    # Build the registry path to the scheduled task
+    # Note: Scheduled tasks are stored under TaskCache\Tree\
+    registry_path = f"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\{task_name}"
+    
+    return registry_path
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP-LEVEL ENTRY POINT
@@ -639,8 +1173,14 @@ def run_remediation(
         # ── STEP 1 ────────────────────────────────────────────────────────────
         logger.step(1, "INCIDENT COLLECTION",
                     "Query Memgraph for ProcessInstance nodes with "
-                    "pending_action IS NOT NULL.")
+                    "pending_action IS NOT NULL, plus File/Network/DNS nodes.")
+
         guids = IncidentCollector.get_actioned_guids(db, logger)
+
+        # NEW: collect all analyst-actioned file and network artifacts globally.
+        # These will be scoped per-incident in ContextBuilder.
+        analyst_file_actions    = IncidentCollector.get_analyst_file_actions(db, logger)
+        analyst_network_actions = IncidentCollector.get_analyst_network_actions(db, logger)
 
         if not guids:
             logger.info("No actioned GUIDs found — nothing to remediate.")
@@ -662,7 +1202,11 @@ def run_remediation(
         # ── Per-group pipeline (steps 3-5) ────────────────────────────────────
         lineage_builder = LineageBuilder(pat)
         context_builder = ContextBuilder(pat, db)
-        tool_registry   = RemediationToolRegistry(pat)
+        
+        # Rate limiting: delay between incident groups to avoid API rate limits
+        # Google Gemini: 15 requests per minute = 1 request per 4 seconds
+        # Using 5 seconds between incidents to stay well under the limit
+        inter_incident_delay = 5 if len(groups) > 1 else 0  # seconds between incidents
 
         for i, group in enumerate(groups, 1):
             logger.group_header(
@@ -683,12 +1227,42 @@ def run_remediation(
                 # STEP 4
                 logger.step(4, "CONTEXT BUILD",
                             "Assemble LLM payload: analyst reasoning, "
-                            "executed actions, lineage, process action summaries.")
-                context_payload = context_builder.build_context(lineage, logger)
+                            "executed actions, file/network analyst actions, "
+                            "lineage, process action summaries.")
+                context_payload = context_builder.build_context(
+                    lineage=                 lineage,
+                    analyst_file_actions=    analyst_file_actions,
+                    analyst_network_actions= analyst_network_actions,
+                    logger=                  logger,
+                )
+
+                # Build per-incident dicts for the tool registry
+                # so tools can annotate results inline.
+                blast_guids = {
+                    node.get("guid", "")
+                    for node in lineage.blast_radius
+                    if node.get("guid")
+                }
+                actioned_files_dict: Dict[str, str] = {}
+                for entry in context_payload.get("analyst_file_actions", []):
+                    path = entry.get("path", "")
+                    if path:
+                        actioned_files_dict[path.lower()] = entry.get("action_type", "")
+
+                actioned_network_dict: Dict[str, str] = {}
+                for entry in context_payload.get("analyst_network_actions", []):
+                    value = entry.get("value", "")
+                    if value:
+                        actioned_network_dict[value.lower()] = entry.get("action_type", "")
 
                 # STEP 5
                 logger.step(5, "REMEDIATION AGENT",
                             "Run ReAct tool-calling loop → produce RemediationReport.")
+                tool_registry = RemediationToolRegistry(
+                    pat,
+                    analyst_actioned_files=   actioned_files_dict,
+                    analyst_actioned_network= actioned_network_dict,
+                )
                 agent  = RemediationAgent(tool_registry, logger)
                 report = agent.run(
                     context_payload=context_payload,
@@ -698,6 +1272,49 @@ def run_remediation(
 
                 reports.append(report)
                 logger.report_summary(report)
+
+                # ── Execute remediation cleanup_actions ───────────────────────
+                # Mirror exactly what ThreatAnalyst does for analyst actions.
+                if report.cleanup_actions:
+                    executor_actions = []
+                    for ca in report.cleanup_actions:
+                        converted = _remediation_action_to_executor_format(ca)
+                        if converted:
+                            executor_actions.append(converted)
+                        else:
+                            logger.info(
+                                f"[Remediation] Skipping unmapped action_type="
+                                f"{ca.get('action_type')} target={ca.get('target', '')}"
+                            )
+
+                    if executor_actions:
+                        logger.info(
+                            f"[Remediation] Executing {len(executor_actions)} "
+                            f"cleanup action(s) for incident {group.incident_id[:8]} ..."
+                        )
+                        # ActionExecutor is instantiated in automatic mode.
+                        # If you want approval mode, pass mode="approval" and
+                        # use the existing approval_response_executor flow.
+                        action_executor = ActionExecutor(mode="automatic")
+                        # execute_sync so we wait before moving to the next incident
+                        results = action_executor.execute_sync(
+                            executor_actions, group.root_guid
+                        )
+                        for r in results:
+                            logger.info(
+                                f"[Remediation][ACTION RESULT] "
+                                f"{r.get('action')} → status={r.get('status')} "
+                                f"target={r.get('target_value', '')}"
+                            )
+                
+                # Rate limiting: add delay between incident groups to avoid 
+                # hitting Google API per-minute rate limits
+                if i < len(groups) and inter_incident_delay > 0:
+                    logger.info(
+                        f"Rate limit delay: waiting {inter_incident_delay}s "
+                        f"before processing next incident group..."
+                    )
+                    time.sleep(inter_incident_delay)
 
             except Exception as exc:
                 logger.error(

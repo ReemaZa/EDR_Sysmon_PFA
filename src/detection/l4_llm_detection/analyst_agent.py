@@ -42,7 +42,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
     raise EnvironmentError("[AnalystAgent] GEMINI_API_KEY environment variable is not set.")
 
-MODEL_NAME = "gemini-3.1-flash-lite-preview"
+MODEL_NAME = "gemini-3.1-flash-lite"
 
 genai.configure(api_key=GEMINI_API_KEY)
 

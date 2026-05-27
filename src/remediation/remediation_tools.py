@@ -13,6 +13,9 @@ These tools answer the core forensic questions:
   • Did child processes create backdoors (injections, drivers, ADS)?
   • What DLLs did the process load (suspicious injection vectors)?
   • Was this process itself tampered with (hollowing, herpadering)?
+  • Did the analyst already quarantine a file this process dropped?   [NEW]
+  • Did the analyst already block a network/DNS IOC from this process? [NEW]
+  • Which OTHER processes (outside blast radius) also touched a given IOC? [NEW]
 
 DESIGN NOTES
 ------------
@@ -22,16 +25,48 @@ DESIGN NOTES
 - The PAT is the single data source — no Memgraph queries here.
 - Persistence detection uses a keyword allowlist for common persistence paths
   and registry keys so the LLM gets a pre-filtered "suspicious" flag.
+- analyst_actioned_files / analyst_actioned_network are injected at
+  construction time by ContextBuilder so tools can annotate inline.
 
-GEMINI TOOL SCHEMA
-------------------
-Each function is wrapped with a schema dict that Gemini function-calling
-understands. The schema is assembled in get_tool_declarations().
+CHANGES vs previous version
+----------------------------
+1. RemediationToolRegistry.__init__ now accepts two new dicts:
+     analyst_actioned_files   : {file_path_lower → action_type}
+     analyst_actioned_network : {ip_or_domain_lower → action_type}
+   These are built by ContextBuilder from the Memgraph File/Network/DNS
+   node queries and injected here.  Every existing tool that touches
+   files or network data annotates its results with
+   `already_actioned_by_analyst` and `analyst_action` fields.
+
+2. get_file_activity — each "created" record now includes:
+     already_actioned_by_analyst : bool
+     analyst_action              : str  ("file_quarantine" | "file_deletion" | "")
+
+3. get_network_activity — each connection record now includes:
+     already_actioned_by_analyst : bool
+     analyst_action              : str  ("ip_block" | "")
+   Each dns_query record now includes:
+     already_actioned_by_analyst : bool
+     analyst_action              : str  ("dns_block" | "")
+
+4. Two new tools added:
+     get_analyst_actioned_artifacts(guid)
+         Returns all files/IPs/domains the analyst already actioned that
+         are linked to this process.  The LLM should call this first to
+         avoid re-recommending already-handled artifacts.
+
+     find_processes_by_ioc(ioc_value, ioc_type)
+         Reverse-index pivot via PAT: given a file path, IP, or domain,
+         returns every process GUID that ever touched it — including
+         processes OUTSIDE the current blast radius.  Lets the agent
+         discover lateral spread the analyst never flagged.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from numpy import identity
 
 # Persistence indicator keywords — paths and registry keys frequently abused
 # for persistence (Run keys, startup folder, scheduled tasks, services, etc.)
@@ -86,7 +121,14 @@ def _is_suspicious_reg_key(key: str) -> bool:
     lower = key.lower()
     return any(kw in lower for kw in _PERSISTENCE_REG_KEYWORDS)
 
-
+def _trunc(s):
+                if not isinstance(s, str) or "encodedcommand" not in s.lower():
+                    return s
+                idx = s.lower().find("encodedcommand")
+                start = idx + len("encodedcommand")
+                while start < len(s) and s[start] in (' ', '\t', '-'):
+                    start += 1
+                return s[:start] + "[B64_TRUNCATED]"
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -97,20 +139,41 @@ class RemediationToolRegistry:
 
     Usage
     -----
-        registry = RemediationToolRegistry(pat)
-        result   = registry.call("get_file_activity", {"guid": "..."})
+        registry = RemediationToolRegistry(
+            pat,
+            analyst_actioned_files={...},
+            analyst_actioned_network={...},
+        )
+        result = registry.call("get_file_activity", {"guid": "..."})
 
     The RemediationAgent calls registry.call(tool_name, args_dict) inside
     its ReAct loop — it never calls tool functions directly.
+
+    Parameters
+    ----------
+    pat                    : PATBuilder instance (already connected to Redis).
+    analyst_actioned_files : dict mapping lowercase file path → action_type
+                             for every File node the analyst stamped with
+                             pending_action.  Built by ContextBuilder.
+    analyst_actioned_network: dict mapping lowercase ip or domain → action_type
+                             for every Network/DNS node the analyst stamped.
+                             Built by ContextBuilder.
     """
 
-    def __init__(self, pat):
-        """
-        Parameters
-        ----------
-        pat : PATBuilder instance (already connected to Redis).
-        """
-        self._pat = pat
+    def __init__(
+        self,
+        pat,
+        analyst_actioned_files:   Optional[Dict[str, str]] = None,
+        analyst_actioned_network: Optional[Dict[str, str]] = None,
+    ):
+        self._pat                    = pat
+        # Normalise to lowercase for case-insensitive lookups
+        self._analyst_files:   Dict[str, str] = {
+            k.lower(): v for k, v in (analyst_actioned_files or {}).items()
+        }
+        self._analyst_network: Dict[str, str] = {
+            k.lower(): v for k, v in (analyst_actioned_network or {}).items()
+        }
 
     # ── DISPATCHER ────────────────────────────────────────────────────────────
 
@@ -128,14 +191,17 @@ class RemediationToolRegistry:
         JSON-serialisable dict — always, even on error.
         """
         handler = {
-            "get_file_activity":      self.get_file_activity,
-            "get_network_activity":   self.get_network_activity,
-            "get_registry_changes":   self.get_registry_changes,
-            "get_process_identity":   self.get_process_identity,
-            "get_injection_chains":   self.get_injection_chains,
-            "get_loaded_drivers":     self.get_loaded_drivers,
-            "get_process_tampering":  self.get_process_tampering,
-            "get_child_processes":    self.get_child_processes,
+            "get_file_activity":             self.get_file_activity,
+            "get_network_activity":          self.get_network_activity,
+            "get_registry_changes":          self.get_registry_changes,
+            "get_process_identity":          self.get_process_identity,
+            "get_injection_chains":          self.get_injection_chains,
+            "get_loaded_drivers":            self.get_loaded_drivers,
+            "get_process_tampering":         self.get_process_tampering,
+            "get_child_processes":           self.get_child_processes,
+            # NEW tools
+            "get_analyst_actioned_artifacts": self.get_analyst_actioned_artifacts,
+            "find_processes_by_ioc":          self.find_processes_by_ioc,
         }.get(tool_name)
 
         if handler is None:
@@ -154,8 +220,18 @@ class RemediationToolRegistry:
 
         Covers: file_created, file_deleted, file_timestomped, wrote_ads (ADS).
 
-        Each record is annotated with a `suspicious` flag when the path matches
-        a known persistence or staging location (Temp, Startup, Tasks, etc.).
+        Each record is annotated with:
+          - `suspicious`                   : path matches a known persistence location.
+          - `already_actioned_by_analyst`  : True if the analyst stamped this file
+                                             with a pending_action in Memgraph.
+          - `analyst_action`               : the action type the analyst chose
+                                             ("file_quarantine" | "file_deletion" | "").
+
+        IMPORTANT FOR THE LLM
+        ---------------------
+        If `already_actioned_by_analyst` is True, do NOT recommend any cleanup
+        action for this file — acknowledge it as already handled by the analyst.
+        For files where it is False, recommend `quarantine_file` (not delete).
 
         Parameters
         ----------
@@ -166,30 +242,39 @@ class RemediationToolRegistry:
         {
           "guid": str,
           "total_file_events": int,
-          "created":     [{"path": str, "sha256": str, "ts": str, "suspicious": bool}],
-          "deleted":     [{"path": str, "sha256": str, "ts": str}],
-          "timestomped": [{"path": str, "sha256": str, "ts": str}],
-          "ads_written": [{"path": str, "stream_name": str, "sha256": str, "ts": str}],
-          "suspicious_paths": [str],   # deduplicated list of flagged paths
+          "created":     [{"path", "sha256", "ts", "suspicious",
+                           "already_actioned_by_analyst", "analyst_action"}],
+          "deleted":     [{"path", "sha256", "ts"}],
+          "timestomped": [{"path", "sha256", "ts"}],
+          "ads_written": [{"path", "stream_name", "sha256", "ts"}],
+          "suspicious_paths": [str],
+          "analyst_actioned_paths": [str],  # paths the analyst already handled
         }
         """
-        created     = []
-        deleted     = []
-        timestomped = []
-        ads_written = []
-        suspicious_paths = []
+        created          = []
+        deleted          = []
+        timestomped      = []
+        ads_written      = []
+        suspicious_paths      = []
+        analyst_actioned_paths = []
 
         # --- file_created ---
         for action in self._pat.get_actions_by_type(guid, "file_created"):
-            path = action.get("path", "")
-            susp = _is_suspicious_path(path)
+            path       = action.get("path", "")
+            susp       = _is_suspicious_path(path)
+            actioned   = path.lower() in self._analyst_files
+            act_type   = self._analyst_files.get(path.lower(), "")
             if susp:
                 suspicious_paths.append(path)
+            if actioned:
+                analyst_actioned_paths.append(path)
             created.append({
-                "path":       path,
-                "sha256":     action.get("sha256", ""),
-                "ts":         action.get("ts", ""),
-                "suspicious": susp,
+                "path":                       path,
+                "sha256":                     action.get("sha256", ""),
+                "ts":                         action.get("ts", ""),
+                "suspicious":                 susp,
+                "already_actioned_by_analyst": actioned,
+                "analyst_action":             act_type,
             })
 
         # --- file_deleted ---
@@ -219,13 +304,14 @@ class RemediationToolRegistry:
             })
 
         return {
-            "guid":              guid,
-            "total_file_events": len(created) + len(deleted) + len(timestomped) + len(ads_written),
-            "created":           created,
-            "deleted":           deleted,
-            "timestomped":       timestomped,
-            "ads_written":       ads_written,
-            "suspicious_paths":  list(set(suspicious_paths)),
+            "guid":                   guid,
+            "total_file_events":      len(created) + len(deleted) + len(timestomped) + len(ads_written),
+            "created":                created,
+            "deleted":                deleted,
+            "timestomped":            timestomped,
+            "ads_written":            ads_written,
+            "suspicious_paths":       list(set(suspicious_paths)),
+            "analyst_actioned_paths": list(set(analyst_actioned_paths)),
         }
 
     # ── TOOL 2: NETWORK ACTIVITY ──────────────────────────────────────────────
@@ -236,9 +322,21 @@ class RemediationToolRegistry:
 
         Covers: network_connection, dns_query.
 
-        Each connection is annotated with `external` = True when the destination
-        IP is NOT a private RFC-1918 / loopback address — these are potential
-        C2 or exfiltration endpoints.
+        Each connection is annotated with:
+          - `external`                     : destination IP is not RFC-1918.
+          - `already_actioned_by_analyst`  : True if the analyst issued an
+                                             ip_block for this destination IP.
+          - `analyst_action`               : "ip_block" or "".
+
+        Each dns_query is annotated with:
+          - `already_actioned_by_analyst`  : True if the analyst issued a
+                                             dns_block for this domain.
+          - `analyst_action`               : "dns_block" or "".
+
+        IMPORTANT FOR THE LLM
+        ---------------------
+        If `already_actioned_by_analyst` is True for an IP or domain, do NOT
+        recommend blocking it again — acknowledge it as already handled.
 
         Parameters
         ----------
@@ -248,63 +346,79 @@ class RemediationToolRegistry:
         -------
         {
           "guid": str,
-          "connections": [{
-              "dst_ip": str, "dst_port": str, "dst_host": str,
-              "src_ip": str, "src_port": str,
-              "protocol": str, "initiated": str,
-              "ts": str, "external": bool
-          }],
-          "dns_queries": [{"query": str, "results": str, "status": str, "ts": str}],
-          "external_ips":     [str],   # unique external IPs contacted
-          "external_domains": [str],   # unique external domains queried
+          "connections": [{"dst_ip", "dst_port", "dst_host", "src_ip",
+                           "src_port", "protocol", "initiated", "ts",
+                           "external", "already_actioned_by_analyst",
+                           "analyst_action"}],
+          "dns_queries": [{"query", "results", "status", "ts",
+                           "already_actioned_by_analyst", "analyst_action"}],
+          "external_ips":     [str],
+          "external_domains": [str],
+          "analyst_actioned_ips":     [str],
+          "analyst_actioned_domains": [str],
           "total_connections": int,
           "total_dns_queries": int,
         }
         """
-        connections      = []
-        dns_queries      = []
-        external_ips     = set()
-        external_domains = set()
+        connections               = []
+        dns_queries               = []
+        external_ips              = set()
+        external_domains          = set()
+        analyst_actioned_ips      = set()
+        analyst_actioned_domains  = set()
 
         # --- network_connection ---
         for action in self._pat.get_actions_by_type(guid, "network_connection"):
-            dst_ip = action.get("dst_ip", "")
-            ext    = _is_external_ip(dst_ip) if dst_ip else False
+            dst_ip   = action.get("dst_ip", "")
+            ext      = _is_external_ip(dst_ip) if dst_ip else False
+            actioned = dst_ip.lower() in self._analyst_network
+            act_type = self._analyst_network.get(dst_ip.lower(), "")
             if ext and dst_ip:
                 external_ips.add(dst_ip)
+            if actioned and dst_ip:
+                analyst_actioned_ips.add(dst_ip)
             connections.append({
-                "dst_ip":   dst_ip,
-                "dst_port": action.get("dst_port", ""),
-                "dst_host": action.get("dst_host", ""),
-                "src_ip":   action.get("src_ip", ""),
-                "src_port": action.get("src_port", ""),
-                "protocol": action.get("protocol", ""),
-                "initiated":action.get("initiated", ""),
-                "ts":       action.get("ts", ""),
-                "external": ext,
+                "dst_ip":                      dst_ip,
+                "dst_port":                    action.get("dst_port", ""),
+                "dst_host":                    action.get("dst_host", ""),
+                "src_ip":                      action.get("src_ip", ""),
+                "src_port":                    action.get("src_port", ""),
+                "protocol":                    action.get("protocol", ""),
+                "initiated":                   action.get("initiated", ""),
+                "ts":                          action.get("ts", ""),
+                "external":                    ext,
+                "already_actioned_by_analyst": actioned,
+                "analyst_action":              act_type,
             })
 
         # --- dns_query ---
         for action in self._pat.get_actions_by_type(guid, "dns_query"):
-            query = action.get("query", "")
+            query    = action.get("query", "")
+            actioned = query.lower() in self._analyst_network
+            act_type = self._analyst_network.get(query.lower(), "")
+            if actioned and query:
+                analyst_actioned_domains.add(query)
             dns_queries.append({
-                "query":   query,
-                "results": action.get("results", ""),
-                "status":  action.get("status", ""),
-                "ts":      action.get("ts", ""),
+                "query":                       query,
+                "results":                     action.get("results", ""),
+                "status":                      action.get("status", ""),
+                "ts":                          action.get("ts", ""),
+                "already_actioned_by_analyst": actioned,
+                "analyst_action":              act_type,
             })
-            # treat all queried external domains as potential C2 indicators
             if query and not query.endswith((".local", ".internal", ".corp")):
                 external_domains.add(query)
 
         return {
-            "guid":              guid,
-            "connections":       connections,
-            "dns_queries":       dns_queries,
-            "external_ips":      sorted(external_ips),
-            "external_domains":  sorted(external_domains),
-            "total_connections": len(connections),
-            "total_dns_queries": len(dns_queries),
+            "guid":                      guid,
+            "connections":               connections,
+            "dns_queries":               dns_queries,
+            "external_ips":              sorted(external_ips),
+            "external_domains":          sorted(external_domains),
+            "analyst_actioned_ips":      sorted(analyst_actioned_ips),
+            "analyst_actioned_domains":  sorted(analyst_actioned_domains),
+            "total_connections":         len(connections),
+            "total_dns_queries":         len(dns_queries),
         }
 
     # ── TOOL 3: REGISTRY CHANGES ──────────────────────────────────────────────
@@ -327,18 +441,12 @@ class RemediationToolRegistry:
         {
           "guid": str,
           "total_registry_writes": int,
-          "writes": [{
-              "reg_type": str,   # "add" | "set" | "rename"
-              "key": str,
-              "details": str,
-              "new_name": str,
-              "ts": str,
-              "suspicious": bool,
-          }],
-          "suspicious_keys": [str],   # deduplicated list of flagged keys
+          "writes": [{"reg_type", "key", "details", "new_name", "ts",
+                      "suspicious"}],
+          "suspicious_keys": [str],
         }
         """
-        writes         = []
+        writes          = []
         suspicious_keys = []
 
         for action in self._pat.get_actions_by_type(guid, "registry_write"):
@@ -386,18 +494,23 @@ class RemediationToolRegistry:
         identity = self._pat.get_identity(guid)
         if identity is None:
             return {"error": f"No PAT identity record for guid={guid!r}"}
-        return dict(identity)
+        # AFTER
+        result = dict(identity)
+        if "cmdline" in result and isinstance(result["cmdline"], str):
+            cmd = result["cmdline"]
+            if "encodedcommand" in cmd.lower():
+                idx = cmd.lower().find("encodedcommand")
+                start = idx + len("encodedcommand")
+                while start < len(cmd) and cmd[start] in (' ', '\t', '-'):
+                    start += 1
+                result["cmdline"] = cmd[:start] + "[B64_TRUNCATED]"
+        return result
 
     # ── TOOL 5: INJECTION CHAINS ──────────────────────────────────────────────
 
     def get_injection_chains(self, guid: str) -> Dict[str, Any]:
         """
         Return all remote-thread injections performed by (or received by) a process.
-
-        This answers: "Did process-A inject into any other process, creating a
-        hidden execution context (backdoor)?"
-
-        Covers: injected_thread_into, received_injected_thread.
 
         Parameters
         ----------
@@ -407,15 +520,10 @@ class RemediationToolRegistry:
         -------
         {
           "guid": str,
-          "injected_into": [{
-              "target_guid": str, "target_image": str,
-              "start_address": str, "start_module": str,
-              "start_function": str, "ts": str
-          }],
-          "received_from": [{
-              "source_guid": str, "source_image": str,
-              "start_address": str, "start_function": str, "ts": str
-          }],
+          "injected_into": [{"target_guid", "target_image", "start_address",
+                             "start_module", "start_function", "ts"}],
+          "received_from": [{"source_guid", "source_image", "start_address",
+                             "start_function", "ts"}],
           "total_injections_out": int,
           "total_injections_in":  int,
         }
@@ -425,12 +533,12 @@ class RemediationToolRegistry:
 
         for action in self._pat.get_actions_by_type(guid, "injected_thread_into"):
             injected_into.append({
-                "target_guid":     action.get("target_guid", ""),
-                "target_image":    action.get("target_image", ""),
-                "start_address":   action.get("start_address", ""),
-                "start_module":    action.get("start_module", ""),
-                "start_function":  action.get("start_function", ""),
-                "ts":              action.get("ts", ""),
+                "target_guid":    action.get("target_guid", ""),
+                "target_image":   action.get("target_image", ""),
+                "start_address":  action.get("start_address", ""),
+                "start_module":   action.get("start_module", ""),
+                "start_function": action.get("start_function", ""),
+                "ts":             action.get("ts", ""),
             })
 
         for action in self._pat.get_actions_by_type(guid, "received_injected_thread"):
@@ -443,11 +551,11 @@ class RemediationToolRegistry:
             })
 
         return {
-            "guid":                  guid,
-            "injected_into":         injected_into,
-            "received_from":         received_from,
-            "total_injections_out":  len(injected_into),
-            "total_injections_in":   len(received_from),
+            "guid":                 guid,
+            "injected_into":        injected_into,
+            "received_from":        received_from,
+            "total_injections_out": len(injected_into),
+            "total_injections_in":  len(received_from),
         }
 
     # ── TOOL 6: LOADED DRIVERS ────────────────────────────────────────────────
@@ -455,11 +563,6 @@ class RemediationToolRegistry:
     def get_loaded_drivers(self, guid: str) -> Dict[str, Any]:
         """
         Return all kernel drivers and DLLs loaded by a process.
-
-        Unsigned drivers or drivers loaded from unusual paths are a strong
-        indicator of rootkit installation.
-
-        Covers: driver_loaded, image_loaded (DLL).
 
         Parameters
         ----------
@@ -469,23 +572,16 @@ class RemediationToolRegistry:
         -------
         {
           "guid": str,
-          "drivers": [{
-              "image_loaded": str, "sha256": str,
-              "signed": str, "signature": str, "ts": str,
-              "suspicious": bool   # True when unsigned or path is unusual
-          }],
-          "dlls": [{
-              "image_loaded": str, "sha256": str,
-              "signed": str, "signature": str, "ts": str
-          }],
+          "drivers": [{"image_loaded", "sha256", "signed", "signature",
+                       "ts", "suspicious"}],
+          "dlls": [{"image_loaded", "sha256", "signed", "signature", "ts"}],
           "unsigned_drivers": [str],
         }
         """
-        drivers         = []
-        dlls            = []
+        drivers          = []
+        dlls             = []
         unsigned_drivers = []
 
-        # --- driver_loaded (Sysmon event 6) ---
         for action in self._pat.get_actions_by_type(guid, "driver_loaded"):
             img    = action.get("image_loaded", "")
             signed = action.get("signed", "")
@@ -501,7 +597,6 @@ class RemediationToolRegistry:
                 "suspicious":   susp,
             })
 
-        # --- image_loaded / DLL (Sysmon event 7) ---
         for action in self._pat.get_actions_by_type(guid, "image_loaded"):
             dlls.append({
                 "image_loaded": action.get("image_loaded", ""),
@@ -534,8 +629,8 @@ class RemediationToolRegistry:
         -------
         {
           "guid": str,
-          "tampered_others": [{"target_guid": str, "target_image": str, "tamper_type": str, "ts": str}],
-          "was_tampered_by": [{"source_guid": str, "source_image": str, "tamper_type": str, "ts": str}],
+          "tampered_others": [{"target_guid", "target_image", "tamper_type", "ts"}],
+          "was_tampered_by": [{"source_guid", "source_image", "tamper_type", "ts"}],
         }
         """
         tampered_others = []
@@ -570,9 +665,6 @@ class RemediationToolRegistry:
         Return the direct children spawned by a process, with their identity
         pulled from the PAT.
 
-        Useful for tracing lateral movement: "Did process-A spawn any
-        interpreters, net commands, or unusual binaries?"
-
         Parameters
         ----------
         guid : ProcessInstance GUID string.
@@ -581,11 +673,8 @@ class RemediationToolRegistry:
         -------
         {
           "guid": str,
-          "children": [{
-              "child_guid": str, "child_image": str,
-              "child_cmdline": str, "ts": str,
-              "identity": dict | None    # full PAT identity if available
-          }],
+          "children": [{"child_guid", "child_image", "child_cmdline", "ts",
+                        "identity": dict | None}],
           "total_children": int,
         }
         """
@@ -595,18 +684,182 @@ class RemediationToolRegistry:
             child_guid  = action.get("child_guid", "")
             child_image = action.get("child_image", "")
             identity    = self._pat.get_identity(child_guid) if child_guid else None
+            # AFTER
+            
+
+            ident_dict = dict(identity) if identity else None
+            if ident_dict and "cmdline" in ident_dict:
+                ident_dict["cmdline"] = _trunc(ident_dict["cmdline"])
+
             children.append({
                 "child_guid":    child_guid,
                 "child_image":   child_image,
-                "child_cmdline": action.get("child_cmdline", ""),
+                "child_cmdline": _trunc(action.get("child_cmdline", "")),
                 "ts":            action.get("ts", ""),
-                "identity":      dict(identity) if identity else None,
+                # identity removed: LLM uses get_process_identity(child_guid) if needed
             })
 
         return {
             "guid":           guid,
             "children":       children,
             "total_children": len(children),
+        }
+
+    # ── TOOL 9 (NEW): ANALYST-ACTIONED ARTIFACTS ─────────────────────────────
+
+    def get_analyst_actioned_artifacts(self, guid: str) -> Dict[str, Any]:
+        """
+        Return all files/IPs/domains linked to this process that the analyst
+        already actioned.
+
+        The LLM should call this early in the sweep for each blast-radius GUID
+        to build an upfront picture of what has already been handled before
+        recommending any new actions.
+
+        How it works
+        ------------
+        Cross-references the process's PAT file + network events against
+        the analyst_actioned_files and analyst_actioned_network dicts that
+        were injected at registry construction time.
+
+        Parameters
+        ----------
+        guid : ProcessInstance GUID string.
+
+        Returns
+        -------
+        {
+          "guid": str,
+          "actioned_files": [{"path", "analyst_action"}],
+          "actioned_ips":   [{"ip", "analyst_action"}],
+          "actioned_domains": [{"domain", "analyst_action"}],
+          "total": int,
+          "note": str,   # reminder for the LLM about what NOT to re-recommend
+        }
+        """
+        actioned_files   = []
+        actioned_ips     = []
+        actioned_domains = []
+
+        # Check files created by this process
+        for action in self._pat.get_actions_by_type(guid, "file_created"):
+            path = action.get("path", "")
+            if path.lower() in self._analyst_files:
+                actioned_files.append({
+                    "path":          path,
+                    "analyst_action": self._analyst_files[path.lower()],
+                })
+
+        # Check network connections
+        for action in self._pat.get_actions_by_type(guid, "network_connection"):
+            ip = action.get("dst_ip", "")
+            if ip.lower() in self._analyst_network:
+                actioned_ips.append({
+                    "ip":            ip,
+                    "analyst_action": self._analyst_network[ip.lower()],
+                })
+
+        # Check DNS queries
+        for action in self._pat.get_actions_by_type(guid, "dns_query"):
+            domain = action.get("query", "")
+            if domain.lower() in self._analyst_network:
+                actioned_domains.append({
+                    "domain":         domain,
+                    "analyst_action": self._analyst_network[domain.lower()],
+                })
+
+        # Deduplicate
+        seen_files = set()
+        unique_files = []
+        for item in actioned_files:
+            if item["path"] not in seen_files:
+                seen_files.add(item["path"])
+                unique_files.append(item)
+
+        seen_ips = set()
+        unique_ips = []
+        for item in actioned_ips:
+            if item["ip"] not in seen_ips:
+                seen_ips.add(item["ip"])
+                unique_ips.append(item)
+
+        seen_domains = set()
+        unique_domains = []
+        for item in actioned_domains:
+            if item["domain"] not in seen_domains:
+                seen_domains.add(item["domain"])
+                unique_domains.append(item)
+
+        total = len(unique_files) + len(unique_ips) + len(unique_domains)
+
+        return {
+            "guid":             guid,
+            "actioned_files":   unique_files,
+            "actioned_ips":     unique_ips,
+            "actioned_domains": unique_domains,
+            "total":            total,
+        }
+
+    # ── TOOL 10 (NEW): FIND PROCESSES BY IOC ─────────────────────────────────
+
+    def find_processes_by_ioc(self, ioc_value: str, ioc_type: str) -> Dict[str, Any]:
+        """
+        Reverse-index pivot: given a file path, IP address, or domain, return
+        every process GUID in the PAT that ever touched it.
+
+        This is the key tool for lateral spread detection.  If a suspicious IP
+        was contacted by a blast-radius process, call this to find ALL other
+        processes on the host that also contacted it — they may be infected
+        but were never flagged by the analyst's detection rules.
+
+        Parameters
+        ----------
+        ioc_value : the artifact to pivot on.
+                    For file  : absolute file path (e.g. "C:\\Temp\\evil.exe")
+                    For ip    : IPv4/IPv6 address  (e.g. "1.2.3.4")
+                    For domain: domain name        (e.g. "evil.com")
+        ioc_type  : "file" | "ip" | "domain"
+
+        Returns
+        -------
+        {
+          "ioc_value":  str,
+          "ioc_type":   str,
+          "guids":      [str],   # all GUIDs that touched this IOC
+          "total":      int,
+          "identities": [dict],  # PAT identity record per GUID (image, user, etc.)
+          "note": str,           # advisory for the LLM
+        }
+        """
+        ioc_type = ioc_type.lower().strip()
+
+        if ioc_type == "file":
+            guids = self._pat.find_guids_by_file(ioc_value)
+        elif ioc_type == "ip":
+            guids = self._pat.find_guids_by_ip(ioc_value)
+        elif ioc_type == "domain":
+            guids = self._pat.find_guids_by_domain(ioc_value)
+        else:
+            return {
+                "error": (
+                    f"Unknown ioc_type={ioc_type!r}. "
+                    "Must be one of: 'file', 'ip', 'domain'."
+                )
+            }
+
+        identities = []
+        for g in guids:
+            ident = self._pat.get_identity(g)
+            identities.append(dict(ident) if ident else {"guid": g, "error": "not found in PAT"})
+
+        return {
+            "ioc_value":  ioc_value,
+            "ioc_type":   ioc_type,
+            "guids":      list(guids),
+            "total":      len(guids),
+            "identities": identities,
+            "note": "GUIDs outside blast_radius_guids = potential lateral spread. Investigate with get_process_identity + get_file_activity.",
+
         }
 
 
@@ -622,7 +875,6 @@ def get_tool_declarations() -> list:
     can call and what arguments each function expects.
     """
     import google.generativeai as genai
-    from google.generativeai import protos
 
     # Helper: build a simple single-string-arg function declaration
     def _guid_tool(name: str, description: str) -> genai.protos.Tool:
@@ -649,12 +901,15 @@ def get_tool_declarations() -> list:
         _guid_tool(
             "get_file_activity",
             "Get all file-system activity (create/delete/timestomp/ADS) for a process. "
-            "Use this to find dropped malware, staged exfil files, or persistence droppers.",
+            "Results include 'already_actioned_by_analyst' flags — do NOT re-recommend "
+            "any action for files where this flag is True. "
+            "For new suspicious files, recommend quarantine_file (never delete_file).",
         ),
         _guid_tool(
             "get_network_activity",
             "Get all network connections and DNS queries made by a process. "
-            "Use this to identify C2 beaconing, data exfiltration endpoints, or lateral movement.",
+            "Results include 'already_actioned_by_analyst' flags for IPs and domains "
+            "the analyst already blocked — do NOT recommend blocking those again.",
         ),
         _guid_tool(
             "get_registry_changes",
@@ -685,5 +940,45 @@ def get_tool_declarations() -> list:
             "get_child_processes",
             "Get all child processes spawned by a process, with their identity. "
             "Use this to trace command execution, interpreter abuse, or lateral movement.",
+        ),
+        # NEW TOOL 9
+        _guid_tool(
+            "get_analyst_actioned_artifacts",
+            "Get all files, IPs, and domains linked to this process that the AnalystAgent "
+            "already actioned (quarantined/blocked). Call this FIRST for each blast-radius "
+            "GUID to know what is already handled before recommending new cleanup actions.",
+        ),
+        # NEW TOOL 10 — different signature (ioc_value + ioc_type)
+        genai.protos.Tool(
+            function_declarations=[
+                genai.protos.FunctionDeclaration(
+                    name="find_processes_by_ioc",
+                    description=(
+                        "Reverse-index pivot: given a suspicious file path, IP address, or domain, "
+                        "find ALL process GUIDs in the PAT that ever touched it. "
+                        "Use this after finding a suspicious IOC to detect lateral spread — "
+                        "other processes that contacted the same C2 or dropped the same file "
+                        "but were never flagged by the analyst."
+                    ),
+                    parameters=genai.protos.Schema(
+                        type=genai.protos.Type.OBJECT,
+                        properties={
+                            "ioc_value": genai.protos.Schema(
+                                type=genai.protos.Type.STRING,
+                                description=(
+                                    "The artifact to pivot on: "
+                                    "absolute file path, IPv4/IPv6 address, or domain name."
+                                ),
+                            ),
+                            "ioc_type": genai.protos.Schema(
+                                type=genai.protos.Type.STRING,
+                                enum=["file", "ip", "domain"],
+                                description="Type of IOC: 'file', 'ip', or 'domain'.",
+                            ),
+                        },
+                        required=["ioc_value", "ioc_type"],
+                    ),
+                )
+            ]
         ),
     ]

@@ -17,10 +17,19 @@ Hierarchy of objects produced by the pipeline:
   RemediationFinding
       └─ a single forensic observation made by the RemediationAgent
       └─ categorised: persistence | exfiltration | backdoor | other
+      └─ now includes confidence (0.0–1.0) and confidence_reason
 
   RemediationReport
       └─ the final output of one RemediationAgent run
       └─ saved to disk as remediation_reports/<incident_id>.json
+
+CHANGES vs previous version
+----------------------------
+- RemediationFinding: added `confidence` (float 0.0–1.0) and
+  `confidence_reason` (str) fields so every finding carries an
+  explicit evidence-quality score from the LLM.
+- RemediationReport: no structural changes; confidence fields flow
+  through automatically via dataclasses.asdict().
 """
 
 from __future__ import annotations
@@ -91,20 +100,34 @@ class RemediationFinding:
     """
     One discrete forensic observation produced by the RemediationAgent.
 
-    category   : "persistence" | "exfiltration" | "backdoor" | "lateral_movement" | "other"
-    severity   : "critical" | "high" | "medium" | "low"
-    guid       : the process GUID this finding originated from.
-    description: human-readable explanation of what was found.
-    evidence   : raw data that supports the finding (file path, registry key,
-                 IP address, domain, etc.) — whatever the LLM tool call returned.
-    iocs       : list of extracted IOC strings (IPs, hashes, domains, paths).
+    category          : "persistence" | "exfiltration" | "backdoor"
+                        | "lateral_movement" | "other"
+    severity          : "critical" | "high" | "medium" | "low"
+    guid              : the process GUID this finding originated from.
+    description       : human-readable explanation of what was found.
+    evidence          : raw data that supports the finding (file path,
+                        registry key, IP address, domain, etc.)
+    iocs              : list of extracted IOC strings.
+    confidence        : float 0.0–1.0.  How certain the agent is that
+                        this is a true positive based on corroborating
+                        tool evidence.
+                          1.0 = multiple independent tool results confirm it
+                          0.7 = single clear tool result
+                          0.4 = indirect / circumstantial evidence
+                          0.2 = heuristic / pattern match only
+    confidence_reason : short human-readable explanation of why the
+                        agent assigned this confidence score (e.g.
+                        "registry Run key confirmed by get_registry_changes
+                         AND file exists at path per get_file_activity").
     """
-    category:    str          # persistence | exfiltration | backdoor | lateral_movement | other
-    severity:    str          # critical | high | medium | low
-    guid:        str
-    description: str
-    evidence:    Dict[str, Any] = field(default_factory=dict)
-    iocs:        List[str]      = field(default_factory=list)
+    category:          str            # persistence | exfiltration | backdoor | lateral_movement | other
+    severity:          str            # critical | high | medium | low
+    guid:              str
+    description:       str
+    evidence:          Dict[str, Any] = field(default_factory=dict)
+    iocs:              List[str]      = field(default_factory=list)
+    confidence:        float          = 0.5   # NEW: 0.0–1.0
+    confidence_reason: str            = ""    # NEW: explanation of the score
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,10 +144,13 @@ class RemediationReport:
     incident_id        : matches IncidentGroup.incident_id — used as filename.
     root_guid          : IncidentGroup.root_guid.
     produced_at        : ISO-8601 UTC timestamp.
-    findings           : all RemediationFinding objects the agent produced.
+    findings           : all RemediationFinding objects the agent produced,
+                         each now carrying confidence + confidence_reason.
     cleanup_actions    : ordered list of dicts the operator/automation should
                          execute to fully remediate the incident.
-                         Each dict: {priority, action_type, target, reason}
+                         Each dict: {priority, action_type, target, reason,
+                                     confidence, confidence_reason}
+                         NOTE: cleanup_actions also carry confidence now.
     ioc_list           : deduplicated master IOC list across all findings.
     narrative          : freeform forensic summary written by the LLM.
     tool_call_log      : ordered log of every tool the agent called and the
