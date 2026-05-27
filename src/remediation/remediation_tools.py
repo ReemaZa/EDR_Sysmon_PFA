@@ -66,6 +66,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from numpy import identity
+
 # Persistence indicator keywords — paths and registry keys frequently abused
 # for persistence (Run keys, startup folder, scheduled tasks, services, etc.)
 _PERSISTENCE_PATH_KEYWORDS = [
@@ -119,7 +121,14 @@ def _is_suspicious_reg_key(key: str) -> bool:
     lower = key.lower()
     return any(kw in lower for kw in _PERSISTENCE_REG_KEYWORDS)
 
-
+def _trunc(s):
+                if not isinstance(s, str) or "encodedcommand" not in s.lower():
+                    return s
+                idx = s.lower().find("encodedcommand")
+                start = idx + len("encodedcommand")
+                while start < len(s) and s[start] in (' ', '\t', '-'):
+                    start += 1
+                return s[:start] + "[B64_TRUNCATED]"
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOL FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -485,7 +494,17 @@ class RemediationToolRegistry:
         identity = self._pat.get_identity(guid)
         if identity is None:
             return {"error": f"No PAT identity record for guid={guid!r}"}
-        return dict(identity)
+        # AFTER
+        result = dict(identity)
+        if "cmdline" in result and isinstance(result["cmdline"], str):
+            cmd = result["cmdline"]
+            if "encodedcommand" in cmd.lower():
+                idx = cmd.lower().find("encodedcommand")
+                start = idx + len("encodedcommand")
+                while start < len(cmd) and cmd[start] in (' ', '\t', '-'):
+                    start += 1
+                result["cmdline"] = cmd[:start] + "[B64_TRUNCATED]"
+        return result
 
     # ── TOOL 5: INJECTION CHAINS ──────────────────────────────────────────────
 
@@ -665,12 +684,19 @@ class RemediationToolRegistry:
             child_guid  = action.get("child_guid", "")
             child_image = action.get("child_image", "")
             identity    = self._pat.get_identity(child_guid) if child_guid else None
+            # AFTER
+            
+
+            ident_dict = dict(identity) if identity else None
+            if ident_dict and "cmdline" in ident_dict:
+                ident_dict["cmdline"] = _trunc(ident_dict["cmdline"])
+
             children.append({
                 "child_guid":    child_guid,
                 "child_image":   child_image,
-                "child_cmdline": action.get("child_cmdline", ""),
+                "child_cmdline": _trunc(action.get("child_cmdline", "")),
                 "ts":            action.get("ts", ""),
-                "identity":      dict(identity) if identity else None,
+                # identity removed: LLM uses get_process_identity(child_guid) if needed
             })
 
         return {
@@ -772,11 +798,6 @@ class RemediationToolRegistry:
             "actioned_ips":     unique_ips,
             "actioned_domains": unique_domains,
             "total":            total,
-            "note": (
-                "These artifacts were already actioned by the AnalystAgent. "
-                "Do NOT recommend any cleanup action for them. "
-                "Acknowledge them as already handled in your findings."
-            ),
         }
 
     # ── TOOL 10 (NEW): FIND PROCESSES BY IOC ─────────────────────────────────
@@ -837,12 +858,8 @@ class RemediationToolRegistry:
             "guids":      list(guids),
             "total":      len(guids),
             "identities": identities,
-            "note": (
-                "Any GUID here that is NOT already in your blast_radius_guids "
-                "may represent lateral spread or a co-infected process that the "
-                "AnalystAgent did not flag. Investigate those GUIDs separately "
-                "using get_process_identity and get_file_activity."
-            ),
+            "note": "GUIDs outside blast_radius_guids = potential lateral spread. Investigate with get_process_identity + get_file_activity.",
+
         }
 
 

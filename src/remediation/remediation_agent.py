@@ -86,7 +86,7 @@ if not GEMINI_API_KEY:
     )
 
 MODEL_NAME      = "gemini-3.1-flash-lite"
-MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS = 8
 TOOL_CALL_DELAY = 5.0  # seconds between tool calls to respect rate limits (15 req/min)
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -193,10 +193,12 @@ as EXECUTED in your context. Your job is NOT to re-triage. It is to answer:
                     on other hosts: file hashes, IPs, domains, registry keys, mutex names.
 
 TOOL USAGE STRATEGY:
-  - For EACH blast-radius GUID, call get_analyst_actioned_artifacts FIRST.
-    This tells you what the analyst already handled — do NOT re-recommend those.
-  - Then call get_file_activity, get_network_activity, get_registry_changes,
-    get_injection_chains, get_loaded_drivers, get_process_tampering.
+  - For EACH blast-radius GUID, call get_file_activity, get_network_activity,
+    get_registry_changes, get_injection_chains, get_loaded_drivers,
+    get_process_tampering.
+  - Each result includes already_actioned_by_analyst flags inline — skip those.
+  - Use get_analyst_actioned_artifacts only if you need a quick summary of what
+    the analyst handled for a GUID before diving into details.  
   - For any suspicious IP, domain, or file hash you discover, call
     find_processes_by_ioc to detect lateral spread (other processes that
     touched the same IOC but were never flagged by the analyst).
@@ -217,6 +219,10 @@ NETWORK ACTION RULES (CRITICAL — follow exactly):
     Do not recommend blocking it again.
   - For any NEW suspicious external IP or domain not already blocked → use block_ip
     or block_domain.
+
+REGISTRY ACTION RULES (CRITICAL — follow exactly):
+  - For scheduled tasks → ALWAYS use
+    remove_registry_key, not disable_service.
 
 CONFIDENCE SCORING (required for every finding and every cleanup action):
   Assign a confidence score (0.0–1.0) based on the quality of corroborating evidence:
@@ -580,14 +586,13 @@ class RemediationAgent:
             f"  {blast_guids}",
             "",
             "For EACH guid:",
-            "  1. get_analyst_actioned_artifacts  — call FIRST to avoid re-recommending",
-            "  2. get_file_activity              — quarantine_file for NEW suspicious files",
-            "  3. get_network_activity           — block_ip / block_domain for NEW IOCs",
-            "  4. get_registry_changes           — persistence keys",
-            "  5. get_injection_chains           — remote thread injections",
-            "  6. get_loaded_drivers             — unsigned drivers",
-            "  7. get_process_tampering          — process hollowing",
-            "  8. get_child_processes            — suspicious children",
+            "  1. get_file_activity              — quarantine_file for NEW suspicious files",
+            "  2. get_network_activity           — block_ip / block_domain for NEW IOCs",
+            "  3. get_registry_changes           — persistence keys",
+            "  4. get_injection_chains           — remote thread injections",
+            "  5. get_loaded_drivers             — unsigned drivers",
+            "  6. get_process_tampering          — process hollowing",
+            "  7. get_child_processes            — suspicious children",
             "",
             "For ANY suspicious IOC found:",
             "  → Call find_processes_by_ioc(ioc_value, ioc_type) to detect lateral spread",
