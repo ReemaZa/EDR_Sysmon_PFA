@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+from src.detection.l4_llm_detection.action_executor import ActionExecutor
+
+_executor = ActionExecutor(mode="automatic")
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -416,6 +419,12 @@ def _set_action_decision(analysis_id: str, action_id: str, decision: str):
             if action.get('id') == action_id:
                 action['decision'] = decision
                 _save_approvals(records)
+
+                # Execute immediately if approved — single action, already human-approved
+                if decision == 'approved':
+                    anchor = rec.get('anchor_guid', analysis_id)
+                    _executor.execute_async([action], anchor_guid=anchor)
+
                 return jsonify({'success': True, 'decision': decision,
                                 'analysis_id': analysis_id, 'action_id': action_id})
     return jsonify({'error': 'action not found'}), 404
