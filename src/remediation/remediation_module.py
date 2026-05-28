@@ -89,68 +89,112 @@ MAX_BLAST_RADIUS_IN_PROMPT = 15  # Limit blast radius shown in LLM prompt to red
 
 class IncidentCollector:
     """
-    Queries Memgraph for all nodes the AnalystAgent stamped with a
-    pending_action:
-      - ProcessInstance nodes  (unchanged)
-      - File nodes             (NEW — file_quarantine / file_deletion)
-      - Network nodes          (NEW — ip_block)
-      - DNS nodes              (NEW — dns_block)
+    Reads actioned_nodes.jsonl (written by ThreatAnalyst._append_actioned_nodes)
+    for all nodes the AnalystAgent stamped with a pending_action:
+      - ProcessInstance nodes  (target_type == "guid")
+      - File nodes             (target_type == "file")
+      - Network nodes          (target_type == "ip")
+      - DNS nodes              (target_type == "domain")
 
-    When the Response Module is complete, update the ProcessInstance query
-    to filter on action_executed IS NOT NULL instead of pending_action IS NOT NULL.
+    No Memgraph queries are performed here.
     """
+
+    @staticmethod
+    def _load_unhandled(logger: RemediationLogger) -> List[Dict[str, Any]]:
+        """
+        Load all entries from actioned_nodes.jsonl where
+        remediation_handled == False.
+
+        Returns the full list of such records (not deduplicated yet).
+        """
+        from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
+        import os
+
+        if not os.path.exists(ACTIONED_NODES_FILE):
+            logger.info(
+                f"{ACTIONED_NODES_FILE} does not exist — "
+                "no actioned nodes recorded yet."
+            )
+            return []
+
+        records = []
+        try:
+            with open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
+                for lineno, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if not rec.get("remediation_handled", False):
+                            records.append(rec)
+                    except json.JSONDecodeError as exc:
+                        logger.info(
+                            f"[IncidentCollector] Skipping malformed line "
+                            f"{lineno} in {ACTIONED_NODES_FILE}: {exc}"
+                        )
+        except Exception as exc:
+            logger.error(f"Could not read {ACTIONED_NODES_FILE}", exc)
+            return []
+
+        logger.info(
+            f"Loaded {len(records)} unhandled record(s) "
+            f"from {ACTIONED_NODES_FILE}."
+        )
+        return records
 
     @staticmethod
     def get_actioned_guids(db: Memgraph, logger: RemediationLogger) -> List[str]:
         """
         Return every ProcessInstance GUID that has a non-null pending_action.
 
+        Reads from actioned_nodes.jsonl (target_type == "guid",
+        remediation_handled == False).  Deduplicates by target_value, keeping
+        the latest stamped_at entry.
+
         Parameters
         ----------
-        db     : active Memgraph connection.
+        db     : kept for API compatibility (unused).
         logger : shared RemediationLogger for this pipeline run.
 
         Returns
         -------
-        List of GUID strings, deduplicated. Empty list on DB error.
+        List of GUID strings, deduplicated. Empty list if none found.
         """
         logger.info(
-            "Querying Memgraph for ProcessInstance nodes "
-            "with pending_action IS NOT NULL ..."
+            "Reading actioned_nodes.jsonl for ProcessInstance GUIDs "
+            "(target_type='guid', remediation_handled=False) ..."
         )
 
-        try:
-            rows = list(db.execute_and_fetch(
-                """
-                MATCH (p:ProcessInstance)
-                WHERE p.pending_action IS NOT NULL
-                  AND p.pending_action <> ''
-                RETURN
-                    p.id             AS guid,
-                    p.pending_action AS pending_action,
-                    p.score          AS score,
-                    p.alive          AS alive
-                """
-            ))
-        except Exception as exc:
-            logger.error("Memgraph query failed", exc)
-            return []
+        records = IncidentCollector._load_unhandled(logger)
 
-        guids = [row["guid"] for row in rows if row.get("guid")]
+        # Filter to guid entries only
+        guid_records = [
+            r for r in records
+            if r.get("target_type") == "guid" and r.get("target_value")
+        ]
 
-        # Log every node returned so you can verify they are the right ones
+        # Deduplicate by target_value — keep the latest stamped_at
+        latest: Dict[str, Dict[str, Any]] = {}
+        for rec in guid_records:
+            tv = rec["target_value"]
+            existing = latest.get(tv)
+            if existing is None or rec.get("stamped_at", "") > existing.get("stamped_at", ""):
+                latest[tv] = rec
+
+        guids = list(latest.keys())
+
         logger.info(f"Found {len(guids)} actioned GUID(s).")
-        if rows:
+        if latest:
             logger.data(
-                "Actioned nodes returned from Memgraph",
+                "Actioned nodes returned from actioned_nodes.jsonl",
                 [
                     {
-                        "guid":           row.get("guid", ""),
-                        "pending_action": row.get("pending_action", ""),
-                        "score":          row.get("score", 0),
-                        "alive":          row.get("alive", True),
+                        "guid":        rec.get("target_value", ""),
+                        "action_type": rec.get("action_type", ""),
+                        "stamped_at":  rec.get("stamped_at", ""),
                     }
-                    for row in rows
+                    for rec in latest.values()
                 ],
             )
 
@@ -161,60 +205,52 @@ class IncidentCollector:
         db: Memgraph, logger: RemediationLogger
     ) -> List[Dict[str, Any]]:
         """
-        Query Memgraph for File nodes the analyst stamped with pending_action.
+        Read File-level actions from actioned_nodes.jsonl.
+
+        Filters: target_type == "file", remediation_handled == False.
 
         Returns
         -------
         List of dicts:
           {
-            "path":                str,   # File.id (the file path)
-            "action_type":         str,   # "file_quarantine" | "file_deletion"
+            "path":                str,   # target_value (file path)
+            "action_type":         str,
             "action_reason":       str,
             "action_stamped_at":   str,
-            "source_process_guid": str,   # GUID of the ProcessInstance that
-                                          # CREATED or WROTE this file, or ""
-                                          # if the relationship is missing.
+            "source_process_guid": str,   # guid field from the record
           }
         """
         logger.info(
-            "Querying Memgraph for File nodes with pending_action IS NOT NULL ..."
+            "Reading actioned_nodes.jsonl for File actions "
+            "(target_type='file', remediation_handled=False) ..."
         )
 
-        try:
-            # Try to follow CREATED/WROTE relationships back to the source process.
-            # The OPTIONAL MATCH means we still get the file even if the relationship
-            # is absent (e.g. file was added by static rule, not a live process).
-            rows = list(db.execute_and_fetch(
-                """
-                MATCH (f:File)
-                WHERE f.pending_action IS NOT NULL
-                  AND f.pending_action <> ''
-                OPTIONAL MATCH (p:ProcessInstance)-[:CREATED|WROTE]->(f)
-                RETURN
-                    f.id                AS path,
-                    f.pending_action    AS action_type,
-                    f.action_reason     AS action_reason,
-                    f.action_stamped_at AS action_stamped_at,
-                    p.id                AS source_process_guid
-                """
-            ))
-        except Exception as exc:
-            logger.error("Memgraph File node query failed", exc)
-            return []
+        records = IncidentCollector._load_unhandled(logger)
+
+        # Deduplicate by target_value — keep the latest stamped_at entry,
+        # same as get_actioned_guids. Without this, a file actioned across
+        # multiple ticks produces one entry per tick, bloating the LLM prompt.
+        latest: Dict[str, Any] = {}
+        for rec in records:
+            if rec.get("target_type") != "file" or not rec.get("target_value"):
+                continue
+            tv = rec["target_value"]
+            existing = latest.get(tv)
+            if existing is None or rec.get("stamped_at", "") > existing.get("stamped_at", ""):
+                latest[tv] = rec
 
         result = [
             {
-                "path":                row.get("path", ""),
-                "action_type":         row.get("action_type", ""),
-                "action_reason":        row.get("action_reason", ""),
-                "action_stamped_at":   row.get("action_stamped_at", ""),
-                "source_process_guid": row.get("source_process_guid") or "",
+                "path":                rec.get("target_value", ""),
+                "action_type":         rec.get("action_type", ""),
+                "action_reason":       rec.get("reason", ""),
+                "action_stamped_at":   rec.get("stamped_at", ""),
+                "source_process_guid": rec.get("guid", ""),
             }
-            for row in rows
-            if row.get("path")
+            for rec in latest.values()
         ]
 
-        logger.info(f"Found {len(result)} analyst-actioned File node(s).")
+        logger.info(f"Found {len(result)} analyst-actioned File record(s) (deduplicated).")
         if result:
             logger.data("Analyst-actioned File nodes", result)
 
@@ -225,14 +261,15 @@ class IncidentCollector:
         db: Memgraph, logger: RemediationLogger
     ) -> List[Dict[str, Any]]:
         """
-        Query Memgraph for Network (ip_block) and DNS (dns_block) nodes the
-        analyst stamped with pending_action.
+        Read Network/DNS actions from actioned_nodes.jsonl.
+
+        Filters: target_type in ("ip", "domain"), remediation_handled == False.
 
         Returns
         -------
         List of dicts:
           {
-            "value":             str,   # IP address or domain name (node .id)
+            "value":             str,   # IP address or domain name
             "action_type":       str,   # "ip_block" | "dns_block"
             "action_reason":     str,
             "action_stamped_at": str,
@@ -240,70 +277,38 @@ class IncidentCollector:
           }
         """
         logger.info(
-            "Querying Memgraph for Network/DNS nodes with "
-            "pending_action IS NOT NULL ..."
+            "Reading actioned_nodes.jsonl for Network/DNS actions "
+            "(target_type in ('ip','domain'), remediation_handled=False) ..."
         )
 
-        results = []
+        records = IncidentCollector._load_unhandled(logger)
 
-        # Network nodes (ip_block)
-        try:
-            rows = list(db.execute_and_fetch(
-                """
-                MATCH (n:Network)
-                WHERE n.pending_action IS NOT NULL
-                  AND n.pending_action <> ''
-                RETURN
-                    n.id                AS value,
-                    n.pending_action    AS action_type,
-                    n.action_reason     AS action_reason,
-                    n.action_stamped_at AS action_stamped_at
-                """
-            ))
-            for row in rows:
-                if row.get("value"):
-                    results.append({
-                        "value":             row.get("value", ""),
-                        "action_type":       row.get("action_type", ""),
-                        "action_reason":     row.get("action_reason", ""),
-                        "action_stamped_at": row.get("action_stamped_at", ""),
-                        "ioc_type":          "ip",
-                    })
-        except Exception as exc:
-            logger.error("Memgraph Network node query failed", exc)
+        # Deduplicate by target_value — keep the latest stamped_at entry.
+        latest: Dict[str, Any] = {}
+        for rec in records:
+            if rec.get("target_type") not in ("ip", "domain") or not rec.get("target_value"):
+                continue
+            tv = rec["target_value"]
+            existing = latest.get(tv)
+            if existing is None or rec.get("stamped_at", "") > existing.get("stamped_at", ""):
+                latest[tv] = rec
 
-        # DNS nodes (dns_block)
-        try:
-            rows = list(db.execute_and_fetch(
-                """
-                MATCH (d:DNS)
-                WHERE d.pending_action IS NOT NULL
-                  AND d.pending_action <> ''
-                RETURN
-                    d.id                AS value,
-                    d.pending_action    AS action_type,
-                    d.action_reason     AS action_reason,
-                    d.action_stamped_at AS action_stamped_at
-                """
-            ))
-            for row in rows:
-                if row.get("value"):
-                    results.append({
-                        "value":             row.get("value", ""),
-                        "action_type":       row.get("action_type", ""),
-                        "action_reason":     row.get("action_reason", ""),
-                        "action_stamped_at": row.get("action_stamped_at", ""),
-                        "ioc_type":          "domain",
-                    })
-        except Exception as exc:
-            logger.error("Memgraph DNS node query failed", exc)
+        result = [
+            {
+                "value":             rec.get("target_value", ""),
+                "action_type":       rec.get("action_type", ""),
+                "action_reason":     rec.get("reason", ""),
+                "action_stamped_at": rec.get("stamped_at", ""),
+                "ioc_type":          rec.get("target_type", ""),  # "ip" or "domain"
+            }
+            for rec in latest.values()
+        ]
 
-        logger.info(f"Found {len(results)} analyst-actioned Network/DNS node(s).")
-        if results:
-            logger.data("Analyst-actioned Network/DNS nodes", results)
+        logger.info(f"Found {len(result)} analyst-actioned Network/DNS record(s) (deduplicated).")
+        if result:
+            logger.data("Analyst-actioned Network/DNS nodes", result)
 
-        return results
-
+        return result
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UNION-FIND  (internal helper for IncidentGrouper)
@@ -594,8 +599,12 @@ class ContextBuilder:
         )
 
         logger.info("Building executed-actions list ...")
+        # Pass empty lists for file/network — those are already present in
+        # analyst_file_actions and analyst_network_actions in the payload.
+        # Passing them again into executed_actions would duplicate the data
+        # and inflate the LLM prompt unnecessarily.
         executed_actions = self._build_executed_actions(
-            analyst_reasoning, scoped_file_actions, scoped_network_actions, logger
+            analyst_reasoning, [], [], logger
         )
 
         logger.info("Building per-process action summaries from PAT ...")
@@ -1306,6 +1315,31 @@ def run_remediation(
                                 f"{r.get('action')} → status={r.get('status')} "
                                 f"target={r.get('target_value', '')}"
                             )
+
+                    # ── Change 5: Write remediation cleanup_actions to ledger ──
+                    _append_remediation_cleanup_actions(
+                        report.cleanup_actions, group.root_guid, logger
+                    )
+
+                # ── Change 4: Mark handled entries in actioned_nodes.jsonl ────
+                # Collect the exact target_values that were scoped to this group
+                # so we mark only the right file/network entries.
+                scoped_file_tv = [
+                    e.get("path", "")
+                    for e in context_payload.get("analyst_file_actions", [])
+                    if e.get("path")
+                ]
+                scoped_net_tv = [
+                    e.get("value", "")
+                    for e in context_payload.get("analyst_network_actions", [])
+                    if e.get("value")
+                ]
+                _mark_actioned_nodes_handled(
+                    member_guids=   group.member_guids,
+                    scoped_file_tv= scoped_file_tv,
+                    scoped_net_tv=  scoped_net_tv,
+                    logger=         logger,
+                )
                 
                 # Rate limiting: add delay between incident groups to avoid 
                 # hitting Google API per-minute rate limits
@@ -1336,6 +1370,134 @@ def run_remediation(
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _mark_actioned_nodes_handled(
+    member_guids:    List[str],
+    scoped_file_tv:  List[str],
+    scoped_net_tv:   List[str],
+    logger:          RemediationLogger,
+) -> None:
+    """
+    Mark entries in actioned_nodes.jsonl as remediation_handled=True for:
+      - All entries whose target_value is in member_guids (GUID entries)
+      - All file/network entries whose target_value is in scoped_file_tv or
+        scoped_net_tv (the values scoped to this incident group).
+
+    Uses a load-update-write strategy keyed by (action_type, target_value).
+    If the same key appears multiple times, ALL matching lines are updated.
+    """
+    from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
+    import os
+
+    if not os.path.exists(ACTIONED_NODES_FILE):
+        return
+
+    member_set = set(member_guids)
+    file_set   = set(scoped_file_tv)
+    net_set    = set(scoped_net_tv)
+
+    updated = 0
+    lines_out = []
+    try:
+        with open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    lines_out.append(line)
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                    tv  = rec.get("target_value", "")
+                    tt  = rec.get("target_type", "")
+                    if (
+                        (tt == "guid"   and tv in member_set) or
+                        (tt == "file"   and tv in file_set)   or
+                        (tt in ("ip", "domain") and tv in net_set)
+                    ):
+                        rec["remediation_handled"] = True
+                        updated += 1
+                    lines_out.append(json.dumps(rec) + "\n")
+                except json.JSONDecodeError:
+                    lines_out.append(line)
+
+        with open(ACTIONED_NODES_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines_out)
+
+        logger.info(
+            f"[actioned_nodes] Marked {updated} record(s) as "
+            f"remediation_handled=True."
+        )
+    except Exception as exc:
+        logger.error(
+            f"Could not update {ACTIONED_NODES_FILE} "
+            f"(mark handled)", exc
+        )
+
+
+def _append_remediation_cleanup_actions(
+    cleanup_actions: List[Dict[str, Any]],
+    root_guid:       str,
+    logger:          RemediationLogger,
+) -> None:
+    """
+    Append each remediation cleanup_action to actioned_nodes.jsonl with
+    source="remediation" and remediation_handled=True (already executed).
+
+    This gives a complete ledger — analyst and remediation actions in one file.
+    No graph writes needed for remediation actions.
+    """
+    from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
+
+    if not cleanup_actions:
+        return
+
+    ts = datetime.now(timezone.utc).isoformat()
+    records = []
+    for ca in cleanup_actions:
+        action_type  = ca.get("action_type", "unknown")
+        target       = ca.get("target", "")
+        if not target:
+            continue
+        # Infer target_type from action_type (mirrors _remediation_action_to_executor_format)
+        if action_type == "block_ip":
+            target_type = "ip"
+        elif action_type == "block_domain":
+            target_type = "domain"
+        elif action_type in ("quarantine_file",):
+            target_type = "file"
+        elif action_type in ("remove_registry_key",):
+            target_type = "registry"
+        else:
+            target_type = "host"
+
+        records.append({
+            "guid":                root_guid,
+            "action_type":         action_type,
+            "target_type":         target_type,
+            "target_value":        target,
+            "reason":              ca.get("reason", ""),
+            "stamped_at":          ts,
+            "remediation_handled": True,
+            "source":              "remediation",
+        })
+
+    if not records:
+        return
+
+    try:
+        with open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        logger.info(
+            f"[actioned_nodes] Appended {len(records)} remediation "
+            f"cleanup_action record(s) (source=remediation, handled=True)."
+        )
+    except Exception as exc:
+        logger.error(
+            f"Could not append remediation cleanup_actions to "
+            f"{ACTIONED_NODES_FILE}", exc
+        )
+
 
 def _save_summary(reports: List[RemediationReport], logger: RemediationLogger) -> None:
     """Write remediation_reports/remediation_summary.json with all reports combined."""
