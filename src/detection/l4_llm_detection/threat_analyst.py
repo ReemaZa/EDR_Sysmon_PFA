@@ -49,6 +49,7 @@ from tests.test_response.test_response import actions
 
 FINDINGS_FILE = "l4_findings.json"
 PENDING_APPROVALS_FILE = "pending_approvals.jsonl"
+ACTIONED_NODES_FILE = "actioned_nodes.jsonl"
 
 
 class ThreatAnalyst:
@@ -435,6 +436,59 @@ class ThreatAnalyst:
                             f"[ThreatAnalyst][ERROR] Single fallback also failed "
                             f"for {label} {a['val']}: {inner_exc}"
                         )
+
+        # Write durable record to actioned_nodes.jsonl (after all graph stamping)
+        self._append_actioned_nodes(result, ts)           
+    
+    
+    def _append_actioned_nodes(
+        self, result: ResponderOutput, ts: str
+    ) -> None:
+        """
+        Append one entry per action to actioned_nodes.jsonl.
+        Key is (action_type, target_value).  remediation_handled starts False.
+        This is the durable record for the remediation pipeline.
+        """
+        if not result.actions:
+            return
+
+        # Load existing records keyed by (action_type, target_value) so we can
+        # deduplicate — if the same key exists we still append (new tick, new
+        # entry with remediation_handled=False) per the spec.
+        records = []
+        for action in result.actions:
+            action_type  = action.get("type", "unknown")
+            target_type  = action.get("target_type", "")
+            target_value = action.get("target_value", "")
+            if not target_value:
+                continue
+            record = {
+                "guid":                result.anchor_guid,
+                "action_type":         action_type,
+                "target_type":         target_type,
+                "target_value":        target_value,
+                "reason":              action.get("reason", ""),
+                "stamped_at":          ts,
+                "remediation_handled": False,
+            }
+            records.append(record)
+
+        if not records:
+            return
+
+        try:
+            with open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec) + "\n")
+            self._log(
+                f"[ThreatAnalyst] Appended {len(records)} record(s) "
+                f"to {ACTIONED_NODES_FILE}"
+            )
+        except Exception as exc:
+            self._log(
+                f"[ThreatAnalyst][WARN] Could not append to "
+                f"{ACTIONED_NODES_FILE}: {exc}"
+            )
 
     # ── PERSISTENCE ───────────────────────────────────────────────────────────
 
