@@ -179,6 +179,15 @@ as EXECUTED in your context. Your job is NOT to re-triage. It is to answer:
                      WMI subscriptions, DLL hijacking paths.)
                     Are they still ACTIVE?
 
+     CRITICAL: For EVERY blast-radius GUID, call
+                       get_persistence_mechanisms(guid) FIRST. This returns
+                       exact removal commands you MUST recommend.
+                       Examples:
+                         - reg delete "HKEY_LOCAL_MACHINE\..." /v "ValueName" /f
+                         - sc delete "ServiceName"
+                         - schtasks /delete /tn "TaskName" /f
+                    Use these EXACT commands in cleanup_actions.
+
   2. EXFILTRATION — Was data sent out? To which IPs/domains? Estimate what was stolen
                     (based on file activity before network connections).
 
@@ -221,9 +230,28 @@ NETWORK ACTION RULES (CRITICAL — follow exactly):
     or block_domain.
 
 REGISTRY ACTION RULES (CRITICAL — follow exactly):
-  - For scheduled tasks → ALWAYS use
-    remove_registry_key, not disable_service.
+  - For ANY persistence-related registry key found via get_persistence_mechanisms()
+    → use remove_registry_key with the EXACT full path.
+  
+  - For services → use remove_registry_key (do NOT use disable_service).
+    Format: "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\{ServiceName}"
+    Example: "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\malware_svc"
+  
+  - For scheduled tasks → use remove_registry_key (do NOT use disable_task or disable_service).
+    Format: "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\{TaskName}"
+    Example: "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\Roaming"
+  
+  - For Run keys / startup registry entries → use remove_registry_key with the full value path.
+    Format: "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+    (The LLM must specify the exact value name being deleted in the action reason.)
+  
+  - For startup files (in Startup folders) → use quarantine_file (not delete_file).
 
+IMPORTANT EDGE CASES:
+  - If a registry key is already_actioned_by_analyst=True → DO NOT recommend removing it again.
+  - If a file is already_actioned_by_analyst=True → DO NOT recommend quarantining it again.
+  - For scheduled tasks created via registry modifications, the task_name must match exactly
+    what appears in the TaskCache\Tree\ registry path for schtasks /delete to work.
 CONFIDENCE SCORING (required for every finding and every cleanup action):
   Assign a confidence score (0.0–1.0) based on the quality of corroborating evidence:
     1.0 — Multiple independent tool results confirm it
@@ -580,33 +608,40 @@ class RemediationAgent:
         ]
         lines += [
             "═" * 80,
-            "TASK",
+            "TASK & STRICT GROUNDING RULES",
             "═" * 80,
-            f"Investigate {len(blast_guids)} process(es) for persistence, exfiltration, backdoors:",
-            f"  {blast_guids}",
+            f"Investigate EXACTLY {len(blast_guids)} process(es) for persistence, exfiltration, backdoors:",
+            f"  VALID GUID LIST: {blast_guids}",
             "",
-            "For EACH guid:",
-            "  1. get_file_activity              — quarantine_file for NEW suspicious files",
-            "  2. get_network_activity           — block_ip / block_domain for NEW IOCs",
-            "  3. get_registry_changes           — persistence keys",
-            "  4. get_injection_chains           — remote thread injections",
+            "CRITICAL GROUNDING CONSTRAINTS:",
+            "  - ALWAYS verify that a GUID exists in the 'VALID GUID LIST' before investigating it or suggesting actions.",
+            "  - NEVER suggest remediation actions (e.g., quarantine, block) based on assumptions or hypotheses.",
+            "  - Every single recommended action MUST directly reference a specific, verified IOC or artifact returned in the actual tool outputs.",
+            "  - If a tool returns NO data or empty results, state 'No suspicious activity found' and take NO action for that step.",
+            "  - Prohibitive Rule: Do NOT invent, guess, or assume the existence of IP addresses, file paths, hashes, domains, or GUIDs.",
+            "",
+            "For EACH valid guid from the list:",
+            "  1. get_file_activity           — quarantine_file for NEW suspicious files",
+            "  2. get_network_activity        — block_ip / block_domain for NEW IOCs",
+            "  3. get_registry_changes          — persistence keys",
+            "  4. get_injection_chains          — remote thread injections",
             "  5. get_loaded_drivers             — unsigned drivers",
             "  6. get_process_tampering          — process hollowing",
             "  7. get_child_processes            — suspicious children",
             "",
-            "For ANY suspicious IOC found:",
+            "For ANY suspicious IOC found in the ACTUAL tool outputs:",
             "  → Call find_processes_by_ioc(ioc_value, ioc_type) to detect lateral spread",
             "",
             "CONFIDENCE SCORING (required):",
             "  1.0 = Multiple independent tool results confirm it",
             "  0.7 = Single clear tool result",
-            "  0.4 = Indirect evidence",
+            "  0.4 = Indirect evidence (Must explain the limitation of the evidence)",
             "  0.2 = Heuristic / pattern match only",
             "",
             "FILE RULES: use quarantine_file (never delete_file); skip already-actioned",
             "NETWORK RULES: use block_ip/block_domain for NEW IOCs only; skip already-blocked",
             "",
-            "When done, produce RemediationReport.",
+            "When done, produce RemediationReport. Every action item in the report MUST include a 'Source Tool Output' citation proving the threat exists.",
         ]
 
         return "\n".join(lines)

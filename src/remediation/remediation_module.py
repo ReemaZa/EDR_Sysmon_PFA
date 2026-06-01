@@ -3,8 +3,8 @@ remediation_module.py  —  Orchestrator: runs the full remediation pipeline.
 
 PIPELINE (called once, after log ingestion is complete + 60s grace period)
 ──────────────────────────────────────────────────────────────────────────
-  1. IncidentCollector  — query Memgraph for stamped GUIDs (ProcessInstance)
-                          AND stamped File / Network / DNS nodes
+  1. IncidentCollector  — read actioned_nodes.jsonl for stamped GUIDs,
+                          File, Network, and DNS nodes
   2. IncidentGrouper    — union-find clustering via PAT parent chains
   3. LineageBuilder     — full ancestry + blast radius from PAT
   4. ContextBuilder     — assemble LLM payload, including analyst_file_actions
@@ -17,45 +17,16 @@ Called from agent.py after log replay finishes:
     run_remediation(pat=process_artifact_tree)
 
 Sleeps GRACE_PERIOD_SECONDS first so the AnalystAgent background thread
-can stamp all pending_actions before we query Memgraph.
+can stamp all pending_actions before we start.
 
-CHANGES vs previous version
-----------------------------
-1. IncidentCollector.get_actioned_guids — unchanged.
-
-2. NEW: IncidentCollector.get_analyst_file_actions(db, logger)
-   Queries File nodes with pending_action IS NOT NULL.
-   Returns list of dicts: {path, action_type, action_reason,
-                            action_stamped_at, source_process_guid}.
-   `source_process_guid` is resolved by following the CREATED/WROTE
-   relationship back to a ProcessInstance so we can scope files to
-   incident blast radii.
-
-3. NEW: IncidentCollector.get_analyst_network_actions(db, logger)
-   Queries Network nodes (ip_block) and DNS nodes (dns_block) with
-   pending_action IS NOT NULL.
-   Returns list of dicts: {value, action_type, action_reason,
-                            action_stamped_at, ioc_type}.
-
-4. ContextBuilder.build_context — now accepts analyst_file_actions and
-   analyst_network_actions lists.  Filters them to only entries whose
-   source_process_guid appears in the blast radius of the current incident
-   (or whose value can be reverse-looked-up via PAT into the blast radius).
-   Adds two new top-level keys to the payload:
-     "analyst_file_actions"    : scoped list
-     "analyst_network_actions" : scoped list
-
-5. ContextBuilder._simulate_executed_actions — fixed: now also includes
-   entries from analyst_file_actions and analyst_network_actions with
-   the REAL target_value (file path / IP / domain) instead of always
-   using the process GUID.
-
-6. run_remediation — now collects file + network actions upfront and
-   passes them through ContextBuilder into RemediationToolRegistry so
-   that tool results can carry inline already_actioned_by_analyst flags.
-
-7. RemediationToolRegistry is now constructed with analyst_actioned_files
-   and analyst_actioned_network dicts so tools can annotate results inline.
+DATA SOURCES
+────────────
+All data now comes from actioned_nodes.jsonl (written by ThreatAnalyst._append_actioned_nodes):
+  - ProcessInstance GUIDs with pending_action
+  - File nodes with pending_action
+  - Network/DNS nodes with pending_action
+  
+No Memgraph queries are performed in the remediation pipeline.
 """
 
 from __future__ import annotations
@@ -530,11 +501,11 @@ class ContextBuilder:
 
     Sources
     -------
-    - Memgraph : pending_action, action_reason, action_stamped_at per node.
-    - PAT      : full action stream per blast-radius process.
-    - Lineage  : ancestry chain + blast radius node records.
-    - NEW: analyst_file_actions    — File nodes stamped by analyst.
-    - NEW: analyst_network_actions — Network/DNS nodes stamped by analyst.
+    - actioned_nodes.jsonl : analyst pending_action, action_reason, stamped_at
+    - PAT                  : full action stream per blast-radius process.
+    - Lineage              : ancestry chain + blast radius node records.
+    - analyst_file_actions    — File nodes stamped by analyst.
+    - analyst_network_actions — Network/DNS nodes stamped by analyst.
     """
 
     # PAT action types surfaced as "notable" (first occurrence per type)
@@ -549,9 +520,8 @@ class ContextBuilder:
         "child_spawned",
     }
 
-    def __init__(self, pat: PATBuilder, db: Memgraph):
+    def __init__(self, pat: PATBuilder):
         self._pat = pat
-        self._db  = db
 
     def build_context(
         self,
@@ -726,43 +696,34 @@ class ContextBuilder:
         guids:  List[str],
         logger: RemediationLogger,
     ) -> List[Dict[str, Any]]:
-        """Query Memgraph for the analyst agent's pending_action + reason per GUID."""
+        """
+        Read analyst reasoning from actioned_nodes.jsonl for the given GUIDs.
+        
+        Filters: target_type == "guid", remediation_handled == False.
+        Only returns entries where pending_action IS NOT NULL.
+        """
         if not guids:
             return []
-        try:
-            rows = list(self._db.execute_and_fetch(
-                """
-                UNWIND $guids AS guid
-                MATCH (p:ProcessInstance {id: guid})
-                WHERE p.pending_action IS NOT NULL
-                RETURN
-                    p.id                AS guid,
-                    p.pending_action    AS pending_action,
-                    p.action_reason     AS action_reason,
-                    p.action_stamped_at AS action_stamped_at,
-                    p.pid               AS pid,
-                    p.score             AS score,
-                    p.alive             AS alive
-                """,
-                {"guids": guids},
-            ))
-        except Exception as exc:
-            logger.error("Memgraph analyst-reasoning fetch failed", exc)
-            return []
-
-        result = [
-            {
-                "guid":              row.get("guid", ""),
-                "pending_action":    row.get("pending_action", ""),
-                "action_reason":     row.get("action_reason", ""),
-                "action_stamped_at": row.get("action_stamped_at", ""),
-                "pid":               row.get("pid", ""),
-                "score":             row.get("score", 0),
-                "alive":             row.get("alive", True),
-            }
-            for row in rows if row.get("guid")
-        ]
-
+        
+        records = IncidentCollector._load_unhandled(logger)
+        guid_set = set(guids)
+        
+        result = []
+        for rec in records:
+            if (rec.get("target_type") == "guid" and 
+                rec.get("target_value") in guid_set and
+                rec.get("action_type")):  # action_type holds the pending_action
+                
+                result.append({
+                    "guid":              rec.get("target_value", ""),
+                    "pending_action":    rec.get("action_type", ""),
+                    "action_reason":     rec.get("reason", ""),
+                    "action_stamped_at": rec.get("stamped_at", ""),
+                    "pid":               rec.get("pid", ""),
+                    "score":             rec.get("score", 0),
+                    "alive":             rec.get("alive", True),
+                })
+        
         logger.data("Analyst reasoning entries", result)
         return result
 
@@ -1210,7 +1171,7 @@ def run_remediation(
 
         # ── Per-group pipeline (steps 3-5) ────────────────────────────────────
         lineage_builder = LineageBuilder(pat)
-        context_builder = ContextBuilder(pat, db)
+        context_builder = ContextBuilder(pat)
         
         # Rate limiting: delay between incident groups to avoid API rate limits
         # Google Gemini: 15 requests per minute = 1 request per 4 seconds

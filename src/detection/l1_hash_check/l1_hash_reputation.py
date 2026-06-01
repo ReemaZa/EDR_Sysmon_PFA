@@ -3,17 +3,16 @@ Layer 1: Simplified Hash Reputation Engine
 
 PURPOSE:
     Simple 2-step hash checking:
-    1. Check MalwareBazaar table → CRITICAL (malicious)
+    1. Check MalwareBazaar table (local DB) → CRITICAL (malicious)
     2. Check MalwareBazaar API → CRITICAL (malicious) + add to table
     
 FEATURES:
-    - MalwareBazaar table for cached malware hashes
-    - Early exit on first match (no need to check all 3 hashes)
-    - No complex caching (for now)
+    - MalwareBazaar table for cached malware hashes (local SQLite DB)
+    - Early exit on first match (no need to check all hashes)
     - Simple and fast
+    - No whitelist (analyze all hashes)
 
 PERFORMANCE:
-    - Whitelist check: <1ms
     - MalwareBazaar table check: <10ms
     - API check: 1-5s (only for unknowns)
 """
@@ -316,10 +315,13 @@ class HashReputationEngine:
                 'total_checks': 1000,
                 'malicious_found': 10,
                 'clean_found': 990,
-                'whitelist_hits': 500,
+                'detection_rate': '1.00%',
                 'malware_table_hits': 8,
                 'api_queries': 2,
                 'api_malicious': 2,
+                'api_errors': 0,
+                'api_rate_limited': 0,
+                'malware_db_size': 500000,
                 ...
             }
         """

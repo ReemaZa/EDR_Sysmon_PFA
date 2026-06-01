@@ -200,6 +200,7 @@ class RemediationToolRegistry:
             "get_process_tampering":         self.get_process_tampering,
             "get_child_processes":           self.get_child_processes,
             # NEW tools
+            "get_persistence_mechanisms":    self.get_persistence_mechanisms,  # ✅ ADD THIS LINE
             "get_analyst_actioned_artifacts": self.get_analyst_actioned_artifacts,
             "find_processes_by_ioc":          self.find_processes_by_ioc,
         }.get(tool_name)
@@ -862,6 +863,147 @@ class RemediationToolRegistry:
 
         }
 
+            # ── TOOL 8.5 (NEW): PERSISTENCE MECHANISMS ────────────────────────────
+
+    def get_persistence_mechanisms(self, guid: str) -> Dict[str, Any]:
+        """
+        Enumerate all persistence mechanisms created or modified by a process.
+        
+        Combines registry analysis, service creation, scheduled task creation,
+        and startup folder modifications into ONE tool that gives the LLM a
+        complete picture of what needs to be removed.
+
+        Parameters
+        ----------
+        guid : ProcessInstance GUID string.
+
+        Returns
+        -------
+        {
+          "guid": str,
+          "run_keys": [
+            {
+              "key": str,
+              "value_name": str,
+              "data": str,
+              "removal_command": str,  # exact registry delete path
+              "severity": "critical" | "high",
+            }
+          ],
+          "services": [
+            {
+              "service_name": str,
+              "service_path": str,
+              "display_name": str,
+              "removal_command": str,  # exact service deletion command
+              "severity": "critical",
+            }
+          ],
+          "scheduled_tasks": [
+            {
+              "task_name": str,
+              "task_path": str,
+              "triggers": [str],
+              "removal_command": str,  # exact task deletion command
+              "severity": "critical",
+            }
+          ],
+          "startup_files": [
+            {
+              "path": str,
+              "sha256": str,
+              "removal_action": "quarantine_file",
+            }
+          ],
+          "total_mechanisms": int,
+          "summary": str,  # one-line summary for the LLM
+        }
+        """
+        run_keys = []
+        services = []
+        scheduled_tasks = []
+        startup_files = []
+
+        # ── RUN KEY DETECTION ─────────────────────────────────────────────
+        for action in self._pat.get_actions_by_type(guid, "registry_write"):
+            key = action.get("key", "").lower()
+            
+            # Match Run key patterns
+            if "\\currentversion\\run" in key or "\\runonce" in key:
+                run_keys.append({
+                    "key":              action.get("key", ""),
+                    "value_name":       action.get("details", ""),
+                    "data":             action.get("details", ""),
+                    "removal_command":  f"reg delete \"{action.get('key', '')}\" /v \"{action.get('details', '')}\" /f",
+                    "severity":         "critical",
+                })
+            
+            # Match Service install patterns (HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\*)
+            if "\\services\\" in key and not any(
+                skip in key.lower() for skip in ["lanmanserver", "lanmanworkstation", "tcpip"]
+            ):
+                service_name = key.split("\\")[-1] if "\\" in key else ""
+                if service_name and len(service_name) > 1:
+                    services.append({
+                        "service_name":     service_name,
+                        "service_path":     key,
+                        "display_name":     action.get("details", ""),
+                        "removal_command":  f"sc delete \"{service_name}\"",
+                        "severity":         "critical",
+                    })
+            
+            # Match Scheduled Task patterns
+            if "\\schedule\\taskcache\\tree\\" in key:
+                task_name = key.split("\\")[-1] if "\\" in key else ""
+                if task_name:
+                    scheduled_tasks.append({
+                        "task_name":        task_name,
+                        "task_path":        key,
+                        "triggers":         [action.get("details", "")],
+                        "removal_command":  f"schtasks /delete /tn \"{task_name}\" /f",
+                        "severity":         "critical",
+                    })
+
+        # ── STARTUP FILE DETECTION ────────────────────────────────────────
+        for action in self._pat.get_actions_by_type(guid, "file_created"):
+            path = action.get("path", "").lower()
+            
+            # Startup folder locations
+            if any(startup in path for startup in [
+                "\\appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup",
+                "\\programdata\\microsoft\\windows\\start menu\\programs\\startup",
+            ]):
+                startup_files.append({
+                    "path":             action.get("path", ""),
+                    "sha256":           action.get("sha256", ""),
+                    "removal_action":   "quarantine_file",
+                })
+
+        total = len(run_keys) + len(services) + len(scheduled_tasks) + len(startup_files)
+        
+        summary = ""
+        if services:
+            summary += f"{len(services)} malicious service(s) installed. "
+        if scheduled_tasks:
+            summary += f"{len(scheduled_tasks)} scheduled task(s) created. "
+        if run_keys:
+            summary += f"{len(run_keys)} Run key(s) added. "
+        if startup_files:
+            summary += f"{len(startup_files)} startup file(s) dropped. "
+        
+        if not summary:
+            summary = "No persistence mechanisms detected."
+
+        return {
+            "guid":              guid,
+            "run_keys":          run_keys,
+            "services":          services,
+            "scheduled_tasks":   scheduled_tasks,
+            "startup_files":     startup_files,
+            "total_mechanisms":  total,
+            "summary":           summary,
+        }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GEMINI FUNCTION DECLARATIONS
@@ -940,6 +1082,14 @@ def get_tool_declarations() -> list:
             "get_child_processes",
             "Get all child processes spawned by a process, with their identity. "
             "Use this to trace command execution, interpreter abuse, or lateral movement.",
+        ),
+        # ✅ ADD THIS TOOL DECLARATION
+        _guid_tool(
+            "get_persistence_mechanisms",
+            "Enumerate all persistence mechanisms created by this process: Run keys, "
+            "services, scheduled tasks, and startup files. Returns exact removal commands "
+            "for each mechanism. CRITICAL: call this for every blast-radius GUID to find "
+            "ALL persistence that must be removed.",
         ),
         # NEW TOOL 9
         _guid_tool(

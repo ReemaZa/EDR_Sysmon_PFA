@@ -104,7 +104,7 @@ READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_datasets','t1053_2.txt'
+    '..', 'tests', 'logs_datasets','apt29.txt'
 )
 
 # ============================================================================
