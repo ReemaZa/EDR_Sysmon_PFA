@@ -49,12 +49,7 @@ CHANGES vs previous version
      already_actioned_by_analyst : bool
      analyst_action              : str  ("dns_block" | "")
 
-4. Two new tools added:
-     get_analyst_actioned_artifacts(guid)
-         Returns all files/IPs/domains the analyst already actioned that
-         are linked to this process.  The LLM should call this first to
-         avoid re-recommending already-handled artifacts.
-
+4. One new tool added:
      find_processes_by_ioc(ioc_value, ioc_type)
          Reverse-index pivot via PAT: given a file path, IP, or domain,
          returns every process GUID that ever touched it — including
@@ -65,8 +60,6 @@ CHANGES vs previous version
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-
-from numpy import identity
 
 # Persistence indicator keywords — paths and registry keys frequently abused
 # for persistence (Run keys, startup folder, scheduled tasks, services, etc.)
@@ -199,10 +192,8 @@ class RemediationToolRegistry:
             "get_loaded_drivers":            self.get_loaded_drivers,
             "get_process_tampering":         self.get_process_tampering,
             "get_child_processes":           self.get_child_processes,
-            # NEW tools
-            "get_persistence_mechanisms":    self.get_persistence_mechanisms,  # ✅ ADD THIS LINE
-            "get_analyst_actioned_artifacts": self.get_analyst_actioned_artifacts,
-            "find_processes_by_ioc":          self.find_processes_by_ioc,
+            "get_persistence_mechanisms":    self.get_persistence_mechanisms,
+            "find_processes_by_ioc":         self.find_processes_by_ioc,
         }.get(tool_name)
 
         if handler is None:
@@ -684,20 +675,13 @@ class RemediationToolRegistry:
         for action in self._pat.get_actions_by_type(guid, "child_spawned"):
             child_guid  = action.get("child_guid", "")
             child_image = action.get("child_image", "")
-            identity    = self._pat.get_identity(child_guid) if child_guid else None
-            # AFTER
-            
-
-            ident_dict = dict(identity) if identity else None
-            if ident_dict and "cmdline" in ident_dict:
-                ident_dict["cmdline"] = _trunc(ident_dict["cmdline"])
 
             children.append({
                 "child_guid":    child_guid,
                 "child_image":   child_image,
                 "child_cmdline": _trunc(action.get("child_cmdline", "")),
                 "ts":            action.get("ts", ""),
-                # identity removed: LLM uses get_process_identity(child_guid) if needed
+                # Use get_process_identity(child_guid) for full identity details
             })
 
         return {
@@ -706,102 +690,7 @@ class RemediationToolRegistry:
             "total_children": len(children),
         }
 
-    # ── TOOL 9 (NEW): ANALYST-ACTIONED ARTIFACTS ─────────────────────────────
-
-    def get_analyst_actioned_artifacts(self, guid: str) -> Dict[str, Any]:
-        """
-        Return all files/IPs/domains linked to this process that the analyst
-        already actioned.
-
-        The LLM should call this early in the sweep for each blast-radius GUID
-        to build an upfront picture of what has already been handled before
-        recommending any new actions.
-
-        How it works
-        ------------
-        Cross-references the process's PAT file + network events against
-        the analyst_actioned_files and analyst_actioned_network dicts that
-        were injected at registry construction time.
-
-        Parameters
-        ----------
-        guid : ProcessInstance GUID string.
-
-        Returns
-        -------
-        {
-          "guid": str,
-          "actioned_files": [{"path", "analyst_action"}],
-          "actioned_ips":   [{"ip", "analyst_action"}],
-          "actioned_domains": [{"domain", "analyst_action"}],
-          "total": int,
-          "note": str,   # reminder for the LLM about what NOT to re-recommend
-        }
-        """
-        actioned_files   = []
-        actioned_ips     = []
-        actioned_domains = []
-
-        # Check files created by this process
-        for action in self._pat.get_actions_by_type(guid, "file_created"):
-            path = action.get("path", "")
-            if path.lower() in self._analyst_files:
-                actioned_files.append({
-                    "path":          path,
-                    "analyst_action": self._analyst_files[path.lower()],
-                })
-
-        # Check network connections
-        for action in self._pat.get_actions_by_type(guid, "network_connection"):
-            ip = action.get("dst_ip", "")
-            if ip.lower() in self._analyst_network:
-                actioned_ips.append({
-                    "ip":            ip,
-                    "analyst_action": self._analyst_network[ip.lower()],
-                })
-
-        # Check DNS queries
-        for action in self._pat.get_actions_by_type(guid, "dns_query"):
-            domain = action.get("query", "")
-            if domain.lower() in self._analyst_network:
-                actioned_domains.append({
-                    "domain":         domain,
-                    "analyst_action": self._analyst_network[domain.lower()],
-                })
-
-        # Deduplicate
-        seen_files = set()
-        unique_files = []
-        for item in actioned_files:
-            if item["path"] not in seen_files:
-                seen_files.add(item["path"])
-                unique_files.append(item)
-
-        seen_ips = set()
-        unique_ips = []
-        for item in actioned_ips:
-            if item["ip"] not in seen_ips:
-                seen_ips.add(item["ip"])
-                unique_ips.append(item)
-
-        seen_domains = set()
-        unique_domains = []
-        for item in actioned_domains:
-            if item["domain"] not in seen_domains:
-                seen_domains.add(item["domain"])
-                unique_domains.append(item)
-
-        total = len(unique_files) + len(unique_ips) + len(unique_domains)
-
-        return {
-            "guid":             guid,
-            "actioned_files":   unique_files,
-            "actioned_ips":     unique_ips,
-            "actioned_domains": unique_domains,
-            "total":            total,
-        }
-
-    # ── TOOL 10 (NEW): FIND PROCESSES BY IOC ─────────────────────────────────
+    # ── TOOL 9: FIND PROCESSES BY IOC ────────────────────────────────────────
 
     def find_processes_by_ioc(self, ioc_value: str, ioc_type: str) -> Dict[str, Any]:
         """
@@ -868,10 +757,11 @@ class RemediationToolRegistry:
     def get_persistence_mechanisms(self, guid: str) -> Dict[str, Any]:
         """
         Enumerate all persistence mechanisms created or modified by a process.
-        
-        Combines registry analysis, service creation, scheduled task creation,
-        and startup folder modifications into ONE tool that gives the LLM a
-        complete picture of what needs to be removed.
+
+        Delegates to get_registry_changes() and get_file_activity() rather than
+        re-querying the PAT directly, so no extra Redis round-trips are made.
+        Post-filters the results for Run keys, services, scheduled tasks, and
+        startup files, and generates exact removal commands for each.
 
         Parameters
         ----------
@@ -886,8 +776,8 @@ class RemediationToolRegistry:
               "key": str,
               "value_name": str,
               "data": str,
-              "removal_command": str,  # exact registry delete path
-              "severity": "critical" | "high",
+              "removal_command": str,
+              "severity": "critical",
             }
           ],
           "services": [
@@ -895,7 +785,7 @@ class RemediationToolRegistry:
               "service_name": str,
               "service_path": str,
               "display_name": str,
-              "removal_command": str,  # exact service deletion command
+              "removal_command": str,
               "severity": "critical",
             }
           ],
@@ -904,7 +794,7 @@ class RemediationToolRegistry:
               "task_name": str,
               "task_path": str,
               "triggers": [str],
-              "removal_command": str,  # exact task deletion command
+              "removal_command": str,
               "severity": "critical",
             }
           ],
@@ -916,71 +806,67 @@ class RemediationToolRegistry:
             }
           ],
           "total_mechanisms": int,
-          "summary": str,  # one-line summary for the LLM
+          "summary": str,
         }
         """
-        run_keys = []
-        services = []
+        run_keys        = []
+        services        = []
         scheduled_tasks = []
-        startup_files = []
+        startup_files   = []
 
-        # ── RUN KEY DETECTION ─────────────────────────────────────────────
-        for action in self._pat.get_actions_by_type(guid, "registry_write"):
-            key = action.get("key", "").lower()
-            
-            # Match Run key patterns
+        # ── REGISTRY-BASED PERSISTENCE — reuse get_registry_changes ──────────
+        reg_result = self.get_registry_changes(guid)
+        for write in reg_result.get("writes", []):
+            key = write.get("key", "").lower()
+
             if "\\currentversion\\run" in key or "\\runonce" in key:
                 run_keys.append({
-                    "key":              action.get("key", ""),
-                    "value_name":       action.get("details", ""),
-                    "data":             action.get("details", ""),
-                    "removal_command":  f"reg delete \"{action.get('key', '')}\" /v \"{action.get('details', '')}\" /f",
-                    "severity":         "critical",
+                    "key":             write.get("key", ""),
+                    "value_name":      write.get("details", ""),
+                    "data":            write.get("details", ""),
+                    "removal_command": f"reg delete \"{write.get('key', '')}\" /v \"{write.get('details', '')}\" /f",
+                    "severity":        "critical",
                 })
-            
-            # Match Service install patterns (HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\*)
+
             if "\\services\\" in key and not any(
-                skip in key.lower() for skip in ["lanmanserver", "lanmanworkstation", "tcpip"]
+                skip in key for skip in ["lanmanserver", "lanmanworkstation", "tcpip"]
             ):
-                service_name = key.split("\\")[-1] if "\\" in key else ""
+                service_name = write.get("key", "").split("\\")[-1]
                 if service_name and len(service_name) > 1:
                     services.append({
-                        "service_name":     service_name,
-                        "service_path":     key,
-                        "display_name":     action.get("details", ""),
-                        "removal_command":  f"sc delete \"{service_name}\"",
-                        "severity":         "critical",
-                    })
-            
-            # Match Scheduled Task patterns
-            if "\\schedule\\taskcache\\tree\\" in key:
-                task_name = key.split("\\")[-1] if "\\" in key else ""
-                if task_name:
-                    scheduled_tasks.append({
-                        "task_name":        task_name,
-                        "task_path":        key,
-                        "triggers":         [action.get("details", "")],
-                        "removal_command":  f"schtasks /delete /tn \"{task_name}\" /f",
-                        "severity":         "critical",
+                        "service_name":    service_name,
+                        "service_path":    write.get("key", ""),
+                        "display_name":    write.get("details", ""),
+                        "removal_command": f"sc delete \"{service_name}\"",
+                        "severity":        "critical",
                     })
 
-        # ── STARTUP FILE DETECTION ────────────────────────────────────────
-        for action in self._pat.get_actions_by_type(guid, "file_created"):
-            path = action.get("path", "").lower()
-            
-            # Startup folder locations
-            if any(startup in path for startup in [
+            if "\\schedule\\taskcache\\tree\\" in key:
+                task_name = write.get("key", "").split("\\")[-1]
+                if task_name:
+                    scheduled_tasks.append({
+                        "task_name":       task_name,
+                        "task_path":       write.get("key", ""),
+                        "triggers":        [write.get("details", "")],
+                        "removal_command": f"schtasks /delete /tn \"{task_name}\" /f",
+                        "severity":        "critical",
+                    })
+
+        # ── STARTUP FILE PERSISTENCE — reuse get_file_activity ───────────────
+        file_result = self.get_file_activity(guid)
+        for created in file_result.get("created", []):
+            path_lower = created.get("path", "").lower()
+            if any(startup in path_lower for startup in [
                 "\\appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup",
                 "\\programdata\\microsoft\\windows\\start menu\\programs\\startup",
             ]):
                 startup_files.append({
-                    "path":             action.get("path", ""),
-                    "sha256":           action.get("sha256", ""),
-                    "removal_action":   "quarantine_file",
+                    "path":           created.get("path", ""),
+                    "sha256":         created.get("sha256", ""),
+                    "removal_action": "quarantine_file",
                 })
 
-        total = len(run_keys) + len(services) + len(scheduled_tasks) + len(startup_files)
-        
+        total   = len(run_keys) + len(services) + len(scheduled_tasks) + len(startup_files)
         summary = ""
         if services:
             summary += f"{len(services)} malicious service(s) installed. "
@@ -990,18 +876,17 @@ class RemediationToolRegistry:
             summary += f"{len(run_keys)} Run key(s) added. "
         if startup_files:
             summary += f"{len(startup_files)} startup file(s) dropped. "
-        
         if not summary:
             summary = "No persistence mechanisms detected."
 
         return {
-            "guid":              guid,
-            "run_keys":          run_keys,
-            "services":          services,
-            "scheduled_tasks":   scheduled_tasks,
-            "startup_files":     startup_files,
-            "total_mechanisms":  total,
-            "summary":           summary,
+            "guid":             guid,
+            "run_keys":         run_keys,
+            "services":         services,
+            "scheduled_tasks":  scheduled_tasks,
+            "startup_files":    startup_files,
+            "total_mechanisms": total,
+            "summary":          summary,
         }
 
 
@@ -1083,7 +968,6 @@ def get_tool_declarations() -> list:
             "Get all child processes spawned by a process, with their identity. "
             "Use this to trace command execution, interpreter abuse, or lateral movement.",
         ),
-        # ✅ ADD THIS TOOL DECLARATION
         _guid_tool(
             "get_persistence_mechanisms",
             "Enumerate all persistence mechanisms created by this process: Run keys, "
@@ -1091,14 +975,7 @@ def get_tool_declarations() -> list:
             "for each mechanism. CRITICAL: call this for every blast-radius GUID to find "
             "ALL persistence that must be removed.",
         ),
-        # NEW TOOL 9
-        _guid_tool(
-            "get_analyst_actioned_artifacts",
-            "Get all files, IPs, and domains linked to this process that the AnalystAgent "
-            "already actioned (quarantined/blocked). Call this FIRST for each blast-radius "
-            "GUID to know what is already handled before recommending new cleanup actions.",
-        ),
-        # NEW TOOL 10 — different signature (ioc_value + ioc_type)
+        # find_processes_by_ioc — different signature (ioc_value + ioc_type)
         genai.protos.Tool(
             function_declarations=[
                 genai.protos.FunctionDeclaration(

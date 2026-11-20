@@ -44,8 +44,7 @@ CHANGES vs previous version
      - NEW Section 4b: Analyst-Actioned Network/DNS — lists every IP/domain
        the analyst already blocked that is scoped to this incident.
      - Section 8 (Task) updated: instructs the LLM to call
-       get_analyst_actioned_artifacts FIRST for each GUID, and to use
-       find_processes_by_ioc for lateral-spread pivots.
+       for each GUID, find_processes_by_ioc for lateral-spread pivots.
      - Section 8 also reminds the LLM: for NEW files use quarantine_file,
        never delete_file; do NOT re-recommend already-actioned artifacts.
 
@@ -133,7 +132,6 @@ def _get_final_report_schema():
                 "remove_registry_key",
                 "block_ip",
                 "block_domain",
-                "disable_service",
                 "scan_process",
                 "revoke_credential",
                 "patch_vulnerability",
@@ -206,8 +204,6 @@ TOOL USAGE STRATEGY:
     get_registry_changes, get_injection_chains, get_loaded_drivers,
     get_process_tampering.
   - Each result includes already_actioned_by_analyst flags inline — skip those.
-  - Use get_analyst_actioned_artifacts only if you need a quick summary of what
-    the analyst handled for a GUID before diving into details.  
   - For any suspicious IP, domain, or file hash you discover, call
     find_processes_by_ioc to detect lateral spread (other processes that
     touched the same IOC but were never flagged by the analyst).
@@ -216,15 +212,13 @@ TOOL USAGE STRATEGY:
   - Be exhaustive: cover EVERY guid in blast_radius_guids.
 
 FILE ACTION RULES (CRITICAL — follow exactly):
-  - If get_file_activity or get_analyst_actioned_artifacts shows
-    already_actioned_by_analyst=True for a file path → SKIP IT. Do not
+  - If get_file_activity  shows already_actioned_by_analyst=True for a file path → SKIP IT. Do not
     include it in cleanup_actions. Acknowledge it as already handled.
   - For any NEW suspicious file not already actioned → use quarantine_file.
     NEVER use delete_file. Quarantine is reversible; deletion is not.
 
 NETWORK ACTION RULES (CRITICAL — follow exactly):
-  - If get_network_activity or get_analyst_actioned_artifacts shows
-    already_actioned_by_analyst=True for an IP or domain → SKIP IT.
+  - If get_network_activity  shows already_actioned_by_analyst=True for an IP or domain → SKIP IT.
     Do not recommend blocking it again.
   - For any NEW suspicious external IP or domain not already blocked → use block_ip
     or block_domain.

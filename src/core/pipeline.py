@@ -14,6 +14,7 @@ import sys
 import time
 from typing import Dict, Any, Optional, List
 
+from src.core.config import ACTION_MODE
 from src.core.utils import FinalVerdict, ThreatLevel
 from src.detection.l2_sigma_detection.l2_sigma_engine import SigmaEngine
 
@@ -59,6 +60,7 @@ class DetectionPipeline:
                 query_interval   =30,   # scan graph every 30 seconds
                 threat_threshold = 4,    # investigate nodes with score >= 5
                 max_subgraph_nodes = 120,
+                action_executor_mode = ACTION_MODE,   # shared with remediation
             )
 
         self.stats = {

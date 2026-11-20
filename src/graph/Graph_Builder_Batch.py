@@ -29,8 +29,9 @@ from typing import Optional
 
 from gqlalchemy import Memgraph
 
-MEMGRAPH_HOST = "localhost"
-MEMGRAPH_PORT = 7687
+# Connection settings live in src/core/config.py (env-overridable). They are
+# re-exported here because other modules import them from this file.
+from src.core.config import MEMGRAPH_HOST, MEMGRAPH_PORT  # noqa: E402,F401
 
 EDGE_WEIGHTS: dict[str, int] = {
     "INJECTED_THREAD": 4,
@@ -146,12 +147,18 @@ class GraphBuilderBatch:
                 "techniques":  [],
                 "tactics":     [],
                 "total_score": 0,
+                "ioc_score":   0,
             }
+        # ioc_score = known-malware-hash score from L1. It is folded into
+        # total_score so every handler scores the acting process / edge with it;
+        # it is also exposed separately because EV1 must route it to the CHILD only.
+        ioc_score = int(detection.get("ioc_score", 0) or 0)
         return {
             "finding_ids": detection.get("finding_ids", []),
             "techniques":  detection.get("techniques",  []),
             "tactics":     detection.get("tactics",     []),
-            "total_score": int(detection.get("total_score", 0)),
+            "total_score": int(detection.get("total_score", 0)) + ioc_score,
+            "ioc_score":   ioc_score,
         }
 
     @staticmethod
@@ -1168,7 +1175,11 @@ class GraphBuilderBatch:
             description  = d.get("Description")        or ""
             user         = (d.get("User")              or "").lower()
             parent_user  = (d.get("ParentUser")        or "").lower()
-            eff          = ep["total_score"]
+            # EV1 hash = hash of the NEW process image, so a known-malware (IOC)
+            # score belongs to the child only: the parent must not be tagged as
+            # malicious nor pass +40% of the IOC score to all its future children.
+            ioc_score    = ep["ioc_score"]
+            eff          = ep["total_score"] - ioc_score      # sigma-only score
             child_pid    = int(d.get("ProcessId")       or 0) or None
             parent_pid   = int(d.get("ParentProcessId") or 0) or None
 
@@ -1179,7 +1190,7 @@ class GraphBuilderBatch:
             # live graph state and cannot be precomputed across the batch.
             parent_score = self._get_score(parent_guid) if parent_guid else 0
             delta        = int(parent_score * PARENT_INHERITANCE)
-            child_eff    = eff*0.6 + delta
+            child_eff    = eff*0.6 + delta + ioc_score
 
             cmdline_clean = re.sub(
                 r'(?i)(-encodedcommand|-enc)\s+[A-Za-z0-9+/=]{20,}',
@@ -1242,7 +1253,7 @@ class GraphBuilderBatch:
                     "dst_id": child_guid,
                     "e_hash": e_hash,
                     "ts":     ts,
-                    "score":  eff,          # raw sigma score on the edge
+                    "score":  eff + ioc_score,   # raw sigma score (+ IOC) on the edge
                     "fids":   ep["finding_ids"][:FINDING_IDS_CAP],
                     "techs":  ep["techniques"],
                     "tacs":   ep["tactics"],

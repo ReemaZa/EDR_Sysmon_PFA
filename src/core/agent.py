@@ -22,7 +22,7 @@ from src.core.pipeline import DetectionPipeline, ThreatLevel
 from src.graph.Graph_Builder import GraphBuilder
 from src.graph.Graph_Builder_Batch import GraphBuilderBatch
 from src.PAT.pat_builder import PATBuilder
-from src.remediation.remediation_module import run_remediation
+from src.remediation.remediation_module import run_remediation, has_pending_remediation_work
 
 # ============================================================================
 # LOGGING SETUP: Log all console output to both console and file
@@ -54,19 +54,12 @@ _last_flush_time: float = time.time()
 # LOGGING
 # ============================================================================
 
-os.makedirs(LOG_DIR, exist_ok=True)
+# Only the file NAME is computed at import time. Creating the log directory,
+# installing logging handlers and redirecting stdout happen in setup_logging(),
+# which main() calls - importing this module has no side effects on the process.
 LOG_FILE = os.path.join(LOG_DIR, f"edr_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
 _graph_timing_records: list = []
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 
 
 class PrintLogger:
@@ -94,7 +87,31 @@ class PrintLogger:
         self.log.close()
 
 
-sys.stdout = PrintLogger(LOG_FILE)
+_print_logger = None
+
+
+def setup_logging() -> None:
+    """
+    Configure process-wide logging: logging module -> console + LOG_FILE, and
+    print() output mirrored to LOG_FILE. Called once from main(); idempotent.
+    """
+    global _print_logger
+    if _print_logger is not None:
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    # force=True: this is the application entry point, so its configuration must
+    # win even if some library already attached a handler to the root logger.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler(sys.stdout),   # the real stdout, before the swap
+        ],
+        force=True,
+    )
+    _print_logger = PrintLogger(LOG_FILE)
+    sys.stdout = _print_logger
 
 # ============================================================================
 # REPLAY FILE
@@ -104,7 +121,7 @@ READ_FROM_FILE = True
 
 LOG_REPLAY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    '..', 'tests', 'logs_datasets','apt29.txt'
+    '..', 'tests', 'logs_datasets','apt17.txt'
 )
 
 # ============================================================================
@@ -407,7 +424,20 @@ def process_event(evt: dict) -> None:
         if not graph_detection:
              graph_detection=hash_graph_detection
         elif hash_graph_detection:
-            graph_detection['total_score']+=hash_graph_detection['total_score']
+            # Sigma and L1 both produced a detection for this event: merge them
+            # (scores add up, ids/techniques/tactics are unioned).
+            graph_detection = {
+                "finding_ids": list(graph_detection.get("finding_ids", []))
+                               + list(hash_graph_detection.get("finding_ids", [])),
+                "techniques":  sorted(set(graph_detection.get("techniques", []))
+                                      | set(hash_graph_detection.get("techniques", []))),
+                "tactics":     sorted(set(graph_detection.get("tactics", []))
+                                      | set(hash_graph_detection.get("tactics", []))),
+                "total_score": int(graph_detection.get("total_score", 0))
+                               + int(hash_graph_detection.get("total_score", 0)),
+                "ioc_score":   int(graph_detection.get("ioc_score", 0))
+                               + int(hash_graph_detection.get("ioc_score", 0)),
+            }
             
                    
         if BATCH_GRAPH:
@@ -468,10 +498,39 @@ def process_event(evt: dict) -> None:
 
 
 # ============================================================================
+# SHUTDOWN
+# ============================================================================
+
+_shutdown_done = False
+
+
+def _shutdown_pipeline() -> None:
+    """Stop the pipeline's background engines (ThreatAnalyst thread + any
+    in-flight containment actions). Runs once, on every way out of main():
+    normal end, Ctrl+C / SIGTERM (sys.exit in the handlers), or an error."""
+    global _shutdown_done
+    if _shutdown_done or detection_pipeline is None:
+        return
+    _shutdown_done = True
+    try:
+        detection_pipeline.shutdown()
+    except Exception as exc:
+        print(f"[WARN] Pipeline shutdown failed: {exc}")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
+    setup_logging()
+    try:
+        _run()
+    finally:
+        _shutdown_pipeline()
+
+
+def _run():
     global detection_pipeline
 
     print("=" * 70)
@@ -562,14 +621,17 @@ def main():
 
             # ── Remediation Module ────────────────────────────────────────────
             # Trigger post-containment forensic sweep.
-            # run_remediation() blocks for GRACE_PERIOD_SECONDS (default 60s)
-            # so the AnalystAgent background thread can finish its last tick
-            # and stamp all pending_actions before we query Memgraph.
+            # run_remediation() first waits until the ThreatAnalyst is idle
+            # (it has analysed every scored node and written its actions to
+            # actioned_nodes.jsonl), up to ANALYST_IDLE_TIMEOUT_SECONDS.
             # We pass the global `process_artifact_tree` (PATBuilder) so the
             # remediation agent can query the Redis PAT without a new connection.
             # Memgraph connection is opened inside run_remediation() automatically.
             if READ_FROM_FILE:
-                run_remediation(pat=process_artifact_tree)
+                run_remediation(
+                    pat=process_artifact_tree,
+                    analyst=getattr(detection_pipeline, "l4_analyst", None),
+                )
 
         except Exception as e:
             print(f"[ERROR] Failed to run log replay engine: {e}")
@@ -625,35 +687,38 @@ def main():
         watcher.start()
         print("[INFO] Listening for live Sysmon events. Press Ctrl+C to stop.\n")
 
-        # ── Get reference to the ThreatAnalyst that is running inside L4 ──────
-        # DetectionPipeline exposes the L4 layer; we reach its analyst instance.
-        _threat_analyst = None
-        try:
-            from src.detection.l4_llm_detection.threat_analyst import ThreatAnalyst
-            for layer in detection_pipeline._layers:          # internal list
-                if hasattr(layer, "_analyst_thread") or isinstance(layer, ThreatAnalyst):
-                    _threat_analyst = layer
-                    break
-                # also check if the layer holds a ThreatAnalyst as an attribute
-                for attr in vars(layer).values():
-                    if isinstance(attr, ThreatAnalyst):
-                        _threat_analyst = attr
-                        break
-        except Exception as _e:
-            print(f"[WARN] Could not locate ThreatAnalyst instance: {_e}")
+        # ── Live-mode remediation trigger ─────────────────────────────────────
+        # Two independent triggers (see architecture figure):
+        #   1. QUIET TICKS : the ThreatAnalyst saw N consecutive ticks with no new
+        #                    node above threshold -> the attack burst is over, run
+        #                    the post-containment forensic sweep.
+        #   2. TIMEOUT     : REMEDIATION_TIMEOUT_HOURS since the last sweep (or since
+        #                    startup) -> safety net if the quiet condition never holds.
+        # A sweep only starts if none is running AND actioned_nodes.jsonl holds
+        # unhandled work (otherwise a quiet host would trigger an empty LLM pipeline
+        # every N ticks). The sweep runs in its own thread so event processing never
+        # blocks.
+        # The ThreatAnalyst is owned by the pipeline (DetectionPipeline.l4_analyst).
+        _threat_analyst = getattr(detection_pipeline, "l4_analyst", None)
+        if _threat_analyst is None:
+            print("[WARN] [LiveRemediation] L4 ThreatAnalyst not available — "
+                  "only the timeout trigger is active.")
 
-        _last_remediation_time: float = 0.0          # epoch seconds
-        REMEDIATION_COOLDOWN_HOURS    = 1             # minimum gap between runs
+        REMEDIATION_TIMEOUT_HOURS = 1
+        _last_remediation_time: float = time.time()   # timeout window starts now
         _remediation_running          = threading.Event()
 
         def _run_remediation_background():
             """Runs run_remediation() in a background thread so the watcher loop
             keeps processing live events during the forensic sweep."""
             nonlocal _last_remediation_time
-            _remediation_running.set()
             print("[INFO] [LiveRemediation] Starting remediation sweep ...")
             try:
-                run_remediation(pat=process_artifact_tree, grace_seconds=30)
+                run_remediation(
+                    pat=process_artifact_tree,
+                    grace_seconds=30,
+                    analyst=_threat_analyst,
+                )
             except Exception as _rem_exc:
                 print(f"[ERROR] [LiveRemediation] run_remediation failed: {_rem_exc}")
                 import traceback
@@ -663,38 +728,56 @@ def main():
                 _remediation_running.clear()
                 print("[INFO] [LiveRemediation] Remediation sweep complete.")
 
-        def _maybe_trigger_remediation(reason: str):
-            """Fire remediation in a background thread if not already running
-            and the cooldown has elapsed."""
+        def _maybe_trigger_remediation(reason: str) -> bool:
+            """Start a remediation sweep thread if none is running and there is
+            unhandled work. Returns True if a sweep was started."""
+            nonlocal _last_remediation_time
             if _remediation_running.is_set():
                 print(f"[INFO] [LiveRemediation] Skipping ({reason}) — already running.")
-                return
+                return False
+            if not has_pending_remediation_work():
+                print(f"[INFO] [LiveRemediation] Trigger ({reason}) — "
+                      f"no unhandled actions, nothing to remediate.")
+                _last_remediation_time = time.time()   # restart the timeout window
+                return False
             t = threading.Thread(
                 target=_run_remediation_background,
                 name="LiveRemediation",
                 daemon=True,
             )
+            # Set the flag BEFORE starting the thread so the main loop can never
+            # launch a second sweep during the thread's start-up window.
+            _remediation_running.set()
             print(f"[INFO] [LiveRemediation] Triggered: {reason}")
             t.start()
+            return True
 
         while not stop_event.is_set():
             time.sleep(0.2)
 
-            # ── Check quiet-tick signal from ThreatAnalyst ────────────────────
-            if _threat_analyst is not None:
-                if _threat_analyst.consume_remediation_request():
-                    _maybe_trigger_remediation(
-                        "5 consecutive quiet ticks (no nodes above threshold)"
-                    )
-
-            # ── Hourly fallback ───────────────────────────────────────────────
+            # ── Trigger 1: quiet-tick signal from ThreatAnalyst ───────────────
+            # The request is only consumed when a sweep can actually start, so a
+            # request raised while a sweep is running is not lost.
             if (
-                _last_remediation_time > 0
+                _threat_analyst is not None
                 and not _remediation_running.is_set()
-                and (time.time() - _last_remediation_time)
-                    >= REMEDIATION_COOLDOWN_HOURS * 3600
+                and _threat_analyst.consume_remediation_request()
             ):
-                _maybe_trigger_remediation("1 hour since last remediation run")
+                _maybe_trigger_remediation(
+                    f"{_threat_analyst.quiet_ticks_required} consecutive quiet ticks "
+                    f"(no new nodes above threshold)"
+                )
+
+            # ── Trigger 2: timeout since last sweep / startup ─────────────────
+            if (
+                not _remediation_running.is_set()
+                and (time.time() - _last_remediation_time)
+                    >= REMEDIATION_TIMEOUT_HOURS * 3600
+            ):
+                _maybe_trigger_remediation(
+                    f"{REMEDIATION_TIMEOUT_HOURS}h since last remediation run"
+                )
+
 
         if detection_pipeline:
             detection_pipeline.print_stats()

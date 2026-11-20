@@ -25,7 +25,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 # Import utilities
-from src.core.utils import DetectionResult, ThreatLevel
+from src.core.utils import DetectionResult, ThreatLevel, HASH_MATCH_SCORE
 
 # Import database
 from src.detection.l1_hash_check.malware_intelligence_db import MalwareIntelligenceDB
@@ -71,6 +71,13 @@ class HashReputationEngine:
             print("[L1-HASH] Set environment variable: export MALWAREBAZAAR_API_KEY='your-key'")
             self.enable_api = False
         
+        # (process guid, hash) pairs already scored in the graph. A known-malware
+        # hash is worth HASH_MATCH_SCORE once per process: repeated events (e.g. the
+        # same DLL loaded again) must not keep inflating the score and re-triggering
+        # the LLM analyst.
+        self._scored_pairs = set()
+        self._scored_pairs_max = 100_000
+
         # API rate limiting
         self.api_queries_today = 0
         self.api_reset_time = time.time() + 86400  # Reset after 24h
@@ -263,6 +270,18 @@ class HashReputationEngine:
         self.stats['clean_found'] += 1
         return None
     
+    def _should_award_ioc_score(self, proc_guid: Optional[str], file_hash: str) -> bool:
+        """True the first time this (process, hash) pair is seen, False afterwards."""
+        if not proc_guid:
+            return True  # cannot dedupe without a process identity
+        key = (proc_guid, file_hash)
+        if key in self._scored_pairs:
+            return False
+        if len(self._scored_pairs) >= self._scored_pairs_max:
+            self._scored_pairs.clear()  # bound memory on long-running agents
+        self._scored_pairs.add(key)
+        return True
+
     def _create_detection_result(self, event: Dict[str, Any], file_hash: str,
                                  malware_info: Dict[str, Any], source: str) -> DetectionResult:
         """
@@ -288,6 +307,22 @@ class HashReputationEngine:
         if signature and signature != 'unknown':
             match_text += f" - {signature}"
         
+        # Graph detection: same shape as the Sigma layer's graph_detection, consumed
+        # by agent.process_event -> GraphBuilder. The hash score travels in its own
+        # 'ioc_score' key (total_score stays the Sigma-only score) so the graph
+        # builder can attach it to the right process (see GraphBuilder._edge_params).
+        event_data = event.get('data') or {}
+        proc_guid = event_data.get('ProcessGuid') or event.get('guid')
+        award = self._should_award_ioc_score(proc_guid, file_hash)
+        ioc_label = signature if signature and signature != 'unknown' else file_hash[:16]
+        graph_detection = {
+            'finding_ids': [f"L1-HASH:{ioc_label}"],
+            'techniques': [],
+            'tactics': [],
+            'total_score': 0,
+            'ioc_score': HASH_MATCH_SCORE if award else 0,
+        }
+
         # Create metadata
         metadata = {
             'malicious_hash': file_hash,
@@ -297,6 +332,7 @@ class HashReputationEngine:
             'file_name': malware_info.get('file_name'),
             'file_type': malware_info.get('file_type'),
             'first_seen': malware_info.get('first_seen'),
+            'graph_detection': graph_detection,
         }
         
         return DetectionResult(

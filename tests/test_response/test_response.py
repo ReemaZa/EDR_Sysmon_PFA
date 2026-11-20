@@ -102,13 +102,15 @@ actions = [
 ]
 
 
-executor = ActionExecutor(mode="approval")
+if __name__ == "__main__":
+    # Manual smoke test: nothing runs on import.
+    executor = ActionExecutor(mode="approval")
 
-results = executor.execute_sync(
-    actions=actions,
-    anchor_guid="test-anchor-guid"
-)
+    results = executor.execute_sync(
+        actions=actions,
+        anchor_guid="test-anchor-guid"
+    )
 
-print("\nFINAL RESULTS:")
-for r in results:
-    print(r)
+    print("\nFINAL RESULTS:")
+    for r in results:
+        print(r)
