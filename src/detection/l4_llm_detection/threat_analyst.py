@@ -44,12 +44,24 @@ from src.detection.l4_llm_detection.graph_extractor import (
 from src.detection.l4_llm_detection.l4_models import ResponderOutput
 from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
 from src.detection.l4_llm_detection.action_executor import ActionExecutor
-import src.core.response as rf
-from tests.test_response.test_response import actions
+from src.core.config import (
+    ACTION_MODE,
+    ACTIONED_NODES_FILE,
+    ACTIONED_NODES_LOCK,
+    PENDING_APPROVALS_FILE,
+    PENDING_APPROVALS_LOCK,
+    new_record_id,
+    normalize_action_mode,
+)
 
 FINDINGS_FILE = "l4_findings.json"
-PENDING_APPROVALS_FILE = "pending_approvals.jsonl"
-ACTIONED_NODES_FILE = "actioned_nodes.jsonl"
+# PENDING_APPROVALS_FILE, ACTIONED_NODES_FILE and ACTIONED_NODES_LOCK now live in
+# src/core/config.py (shared with the remediation module) and are imported above,
+# so existing `from ...threat_analyst import ACTIONED_NODES_FILE` imports still work.
+
+# Consecutive "quiet" ticks (no new node above threshold) after which the analyst
+# asks for a remediation sweep (consumed by agent.py in live mode).
+QUIET_TICKS_FOR_REMEDIATION = 10
 
 
 class ThreatAnalyst:
@@ -68,12 +80,12 @@ class ThreatAnalyst:
         query_interval:     int = 30,
         threat_threshold:   int = 4,
         max_subgraph_nodes: int = 120,
-        action_executor_mode: str = "automatic",
+        action_executor_mode: str = ACTION_MODE,
     ):
         self.query_interval     = query_interval
         self.threat_threshold   = threat_threshold
         self.max_subgraph_nodes = max_subgraph_nodes
-        self.action_executor = ActionExecutor(mode=action_executor_mode)
+        self.action_executor = ActionExecutor(mode=normalize_action_mode(action_executor_mode))
         # Logging
         import os
         os.makedirs("logs", exist_ok=True)
@@ -95,7 +107,18 @@ class ThreatAnalyst:
 
         # ── Remediation trigger state (used by live mode in agent.py) ─────────
         self._quiet_ticks        = 0   # incremented each tick with no candidates
+        self.quiet_ticks_required = QUIET_TICKS_FOR_REMEDIATION
         self._remediation_requested = threading.Event()  # set when threshold met
+
+        # ── Idle tracking (used by wait_until_idle) ───────────────────────────
+        # A tick is "clean" when its scan found nothing left to analyse. The
+        # analyst is idle w.r.t. a moment T when no tick is running and a clean
+        # tick that STARTED after T has finished: everything scored before T has
+        # then been analysed and its actions written to actioned_nodes.jsonl.
+        self._idle_cv               = threading.Condition()
+        self._tick_in_progress      = False
+        self._last_clean_tick_start = 0.0          # time.monotonic() of that tick
+        self._wake_event            = threading.Event()   # "tick now" request
 
         # Thread
         self._stop_event = threading.Event()
@@ -151,10 +174,13 @@ class ThreatAnalyst:
                 self._log(f"[ThreatAnalyst][ERROR] Tick failed: {exc}")
                 traceback.print_exc()
 
-            # Sleep in 1-second increments so shutdown() is responsive
+            # Sleep in 1-second increments so shutdown() is responsive;
+            # wait_until_idle() can cut the sleep short to get a fresh scan.
             deadline = time.monotonic() + self.query_interval
             while time.monotonic() < deadline and not self._stop_event.is_set():
-                time.sleep(1)
+                if self._wake_event.wait(timeout=1):
+                    self._wake_event.clear()
+                    break
 
     def consume_remediation_request(self) -> bool:
         """
@@ -165,9 +191,53 @@ class ThreatAnalyst:
             self._remediation_requested.clear()
             return True
         return False
+
+    def wait_until_idle(self, timeout: float = 300.0) -> bool:
+        """
+        Block until the analyst has nothing left to do for everything scored in
+        the graph up to now, or until `timeout` seconds pass.
+
+        Forces an immediate tick (instead of waiting for the next interval) and
+        returns True once a tick that started after this call has found no
+        candidate above threshold. Returns False on timeout or if the analyst
+        was shut down first. Safe to call from any thread.
+        """
+        start = time.monotonic()
+        deadline = start + timeout
+        self._wake_event.set()
+        with self._idle_cv:
+            while True:
+                if self._stop_event.is_set():
+                    return False
+                if not self._tick_in_progress and self._last_clean_tick_start > start:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                # A tick that was already running when we asked saw an older
+                # graph; make sure another one follows it.
+                self._wake_event.set()
+                self._idle_cv.wait(timeout=min(1.0, remaining))
+
     # ── TICK ──────────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
+        """Run one scan/analyse cycle and record whether it came out clean."""
+        started = time.monotonic()
+        with self._idle_cv:
+            self._tick_in_progress = True
+        clean = False
+        try:
+            clean = self._run_tick()
+        finally:
+            with self._idle_cv:
+                self._tick_in_progress = False
+                if clean:
+                    self._last_clean_tick_start = started
+                self._idle_cv.notify_all()
+
+    def _run_tick(self) -> bool:
+        """Body of one tick. Returns True if nothing was above threshold."""
         self._stats["ticks"] += 1
         n = self._stats["ticks"]
         self._log(f"\n[ThreatAnalyst] ══ Tick #{n} @ {datetime.utcnow().isoformat()} ══")
@@ -180,14 +250,14 @@ class ThreatAnalyst:
                 f"[ThreatAnalyst] Quiet tick #{self._quiet_ticks} "
                 f"(no nodes above threshold)"
             )
-            if self._quiet_ticks >= 10:
+            if self._quiet_ticks >= self.quiet_ticks_required:
                 self._log(
-                    "[ThreatAnalyst] 10 consecutive quiet ticks — "
+                    f"[ThreatAnalyst] {self.quiet_ticks_required} consecutive quiet ticks — "
                     "signalling remediation."
                 )
                 self._quiet_ticks = 0          # reset so it doesn't fire again immediately
                 self._remediation_requested.set()
-            return
+            return True
 
         # candidates found — reset quiet counter
         self._quiet_ticks = 0
@@ -229,7 +299,9 @@ class ThreatAnalyst:
             )
     
             # Remove visited from remaining, keep unvisited for next iteration
-            visited = {i.guid for i in subgraph.instances}
+            # The anchor is always consumed, even if the extractor did not return
+            # it as an instance - otherwise this loop would never terminate.
+            visited = {i.guid for i in subgraph.instances} | {anchor_guid}
             remaining = [g for g in remaining if g not in visited]
             # unvisited_guids stay in remaining naturally since they weren't visited
             # ── NEW: execute containment actions in a parallel thread ──
@@ -240,6 +312,8 @@ class ThreatAnalyst:
                     
                     self._save_pending_approval(finding)
 
+        return False
+
     def _save_pending_approval(self, finding: ResponderOutput) -> None:
         record = {
             "analysis_id": finding.analysis_id,
@@ -248,9 +322,10 @@ class ThreatAnalyst:
             "actions": finding.actions,
             "produced_at": datetime.utcnow().isoformat(),
             "executed": False,
+            "source": "analyst",
         }
         try:
-            with open(PENDING_APPROVALS_FILE, "a", encoding="utf-8") as f:
+            with PENDING_APPROVALS_LOCK, open(PENDING_APPROVALS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             self._log(f"[ThreatAnalyst] Pending approval saved → analysis_id={finding.analysis_id}")
         except Exception as exc:
@@ -463,6 +538,7 @@ class ThreatAnalyst:
             if not target_value:
                 continue
             record = {
+                "record_id":           new_record_id(),
                 "guid":                result.anchor_guid,
                 "action_type":         action_type,
                 "target_type":         target_type,
@@ -477,7 +553,7 @@ class ThreatAnalyst:
             return
 
         try:
-            with open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
+            with ACTIONED_NODES_LOCK, open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
                 for rec in records:
                     f.write(json.dumps(rec) + "\n")
             self._log(

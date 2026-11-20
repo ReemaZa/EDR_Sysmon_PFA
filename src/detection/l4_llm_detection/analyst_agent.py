@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+from src.core.utils import HASH_MATCH_SCORE
 from src.detection.l4_llm_detection.l4_models import ResponderOutput
 from src.detection.l4_llm_detection.graph_extractor import SubgraphContext
 
@@ -233,7 +234,7 @@ class AnalystAgent:
                 )
             else:
                 ioc_str = "  ⚠ SIGNATURE MATCH — hash confirmed malicious by threat intelligence (IOC)" \
-                          if inst.score >= 1000 else ""
+                          if inst.score >= HASH_MATCH_SCORE else ""
                 lines.append(
                     f"{prefix}score={inst.score}  tmpl={t_short}  guid={inst.guid}{tag_str}{ioc_str}"
                 )
@@ -344,7 +345,12 @@ You are a senior threat analyst and SOC responder. Analyse this scored Windows S
 process graph and produce machine-executable containment actions and graph annotations.
 
 SCORING:
-  ≥10 = fired on more than 3 Sigma rules
+  ≥__HASH_MATCH_SCORE__ = SIGNATURE MATCH (IOC): the process ran, loaded or wrote a file whose hash is
+      confirmed malware by threat intelligence. This is ground truth, independent of Sigma rules.
+      Treat it as MALICIOUS. The related edge carries the same score (CREATED / LOADED_IMAGE /
+      LOADED_DRIVER / CREATED_FILE ...). If the tagged process is a critical Windows system process
+      that only hosts the malicious module, prefer alert over process_termination.
+  10-999 = fired on more than 3 Sigma rules
   5-9 = fired on more than 1 Sigma rule
   1-4 = fired on one or more low-confidence Sigma rules
     0 = no Sigma rule fired — structural context only
@@ -395,7 +401,7 @@ REASON:
  explain every choice you made 
 
 
-"""
+""".replace("__HASH_MATCH_SCORE__", str(HASH_MATCH_SCORE))
 
     # ── CMDLINE SUMMARISER ────────────────────────────────────────────────────
 

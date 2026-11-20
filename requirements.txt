@@ -5,6 +5,7 @@ requests>=2.31.0
 pysigma
 python-dotenv
 pysigma-pipeline-sysmon
+boolean.py
 redis 
 gqlalchemy
 python-evtx>=0.8.1

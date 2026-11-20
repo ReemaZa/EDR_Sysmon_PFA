@@ -2,22 +2,66 @@
 Reads pending_approvals.jsonl, presents each finding's actions to the operator,
 and executes approved ones via ActionExecutor in automatic mode.
 
-Usage:
-    python approval_response_executor.py
+The queue file is APPEND-ONLY from this tool's point of view: it is never
+rewritten, because the agent may append new findings while the operator is
+still reviewing (a rewrite would silently drop them). Executed findings are
+recorded in approvals_resolved.jsonl instead, and load_pending() hides every
+finding whose analysis_id appears there.
+
+Usage (from the repo root):
+    python -m src.detection.l4_llm_detection.approval_response_executor
 """
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from src.detection.l4_llm_detection.action_executor import ActionExecutor
+from src.core.config import APPROVALS_RESOLVED_FILE, PENDING_APPROVALS_FILE
 
-PENDING_FILE  = "../../../pending_approvals.jsonl"
+# Same file the ThreatAnalyst and the Remediation module write to
+# (relative to the working directory - run this from the repo root).
+PENDING_FILE  = PENDING_APPROVALS_FILE
+RESOLVED_FILE = APPROVALS_RESOLVED_FILE
+
+
+def _read_jsonl(path: str) -> list[dict]:
+    """Read a JSONL file, skipping blank or half-written lines (the agent may
+    be appending to the file at this very moment)."""
+    if not Path(path).exists():
+        return []
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
 
 def load_pending() -> list[dict]:
-    if not Path(PENDING_FILE).exists():
-        return []
-    with open(PENDING_FILE, "r") as f:
-        return [json.loads(line) for line in f if line.strip()]
+    """Queued findings that have not been executed yet."""
+    resolved_ids = {r.get("analysis_id") for r in _read_jsonl(RESOLVED_FILE)}
+    return [
+        f for f in _read_jsonl(PENDING_FILE)
+        if f.get("analysis_id") not in resolved_ids and not f.get("executed")
+    ]
+
+
+def _mark_resolved(finding: dict, approved_actions: list[dict], results: list[dict]) -> None:
+    """Append one line to the resolved log. Append-only: never touches the queue."""
+    record = {
+        "analysis_id":      finding["analysis_id"],
+        "resolved_at":      datetime.now(timezone.utc).isoformat(),
+        "approved_actions": approved_actions,
+        "results":          results,
+    }
+    with open(RESOLVED_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 
@@ -73,15 +117,12 @@ def main():
 
     print(f"[ApprovalExecutor] {len(pending)} pending finding(s) to review.\n")
 
-    # Executor always runs in automatic here — approval already happened above
-    executor = ActionExecutor(mode="automatic")
-    executed_records = []
+    # Executor always runs in automatic here — approval already happened above,
+    # so pre_approved=True lifts the approval-only gate (shutdown, isolation...).
+    executor = ActionExecutor(mode="automatic", pre_approved=True)
+    executed_count = 0
 
     for finding in pending:
-        if finding.get("executed"):
-            print(f"[ApprovalExecutor] Skipping already-executed {finding['analysis_id']}")
-            continue
-
         approved_actions = prompt_finding(finding)
 
         if not approved_actions:
@@ -90,22 +131,20 @@ def main():
         print(f"\n[ApprovalExecutor] Executing {len(approved_actions)} action(s)...")
         results = executor.execute_sync(approved_actions, finding["anchor_guid"])
 
-        finding["executed"]         = True
-        finding["approved_actions"] = approved_actions
-        finding["results"]          = results
-        executed_records.append(finding)
+        _mark_resolved(finding, approved_actions, results)
+        executed_count += 1
 
         for r in results:
             status = r.get("status", "?")
             action = r.get("action", "?")
             print(f"  → [{action}] status={status}")
 
-    # Rewrite pending file excluding executed findings
-    remaining = [f for f in pending if not f.get("executed")]
-    with open(PENDING_FILE, "w") as f:
-        for r in remaining:
-            f.write(json.dumps(r) + "\n")
-    print(f"[ApprovalExecutor] {len(remaining)} finding(s) remain pending.")
+    # The queue is not rewritten (see module docstring). Re-read it to report
+    # the real number still pending, including findings added during review.
+    print(
+        f"[ApprovalExecutor] {executed_count} finding(s) executed, "
+        f"{len(load_pending())} remain pending."
+    )
 
 
 if __name__ == "__main__":

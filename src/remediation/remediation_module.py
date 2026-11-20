@@ -3,8 +3,8 @@ remediation_module.py  —  Orchestrator: runs the full remediation pipeline.
 
 PIPELINE (called once, after log ingestion is complete + 60s grace period)
 ──────────────────────────────────────────────────────────────────────────
-  1. IncidentCollector  — query Memgraph for stamped GUIDs (ProcessInstance)
-                          AND stamped File / Network / DNS nodes
+  1. IncidentCollector  — read actioned_nodes.jsonl for stamped GUIDs,
+                          File, Network, and DNS nodes
   2. IncidentGrouper    — union-find clustering via PAT parent chains
   3. LineageBuilder     — full ancestry + blast radius from PAT
   4. ContextBuilder     — assemble LLM payload, including analyst_file_actions
@@ -17,50 +17,22 @@ Called from agent.py after log replay finishes:
     run_remediation(pat=process_artifact_tree)
 
 Sleeps GRACE_PERIOD_SECONDS first so the AnalystAgent background thread
-can stamp all pending_actions before we query Memgraph.
+can stamp all pending_actions before we start.
 
-CHANGES vs previous version
-----------------------------
-1. IncidentCollector.get_actioned_guids — unchanged.
-
-2. NEW: IncidentCollector.get_analyst_file_actions(db, logger)
-   Queries File nodes with pending_action IS NOT NULL.
-   Returns list of dicts: {path, action_type, action_reason,
-                            action_stamped_at, source_process_guid}.
-   `source_process_guid` is resolved by following the CREATED/WROTE
-   relationship back to a ProcessInstance so we can scope files to
-   incident blast radii.
-
-3. NEW: IncidentCollector.get_analyst_network_actions(db, logger)
-   Queries Network nodes (ip_block) and DNS nodes (dns_block) with
-   pending_action IS NOT NULL.
-   Returns list of dicts: {value, action_type, action_reason,
-                            action_stamped_at, ioc_type}.
-
-4. ContextBuilder.build_context — now accepts analyst_file_actions and
-   analyst_network_actions lists.  Filters them to only entries whose
-   source_process_guid appears in the blast radius of the current incident
-   (or whose value can be reverse-looked-up via PAT into the blast radius).
-   Adds two new top-level keys to the payload:
-     "analyst_file_actions"    : scoped list
-     "analyst_network_actions" : scoped list
-
-5. ContextBuilder._simulate_executed_actions — fixed: now also includes
-   entries from analyst_file_actions and analyst_network_actions with
-   the REAL target_value (file path / IP / domain) instead of always
-   using the process GUID.
-
-6. run_remediation — now collects file + network actions upfront and
-   passes them through ContextBuilder into RemediationToolRegistry so
-   that tool results can carry inline already_actioned_by_analyst flags.
-
-7. RemediationToolRegistry is now constructed with analyst_actioned_files
-   and analyst_actioned_network dicts so tools can annotate results inline.
+DATA SOURCES
+────────────
+All data now comes from actioned_nodes.jsonl (written by ThreatAnalyst._append_actioned_nodes):
+  - ProcessInstance GUIDs with pending_action
+  - File nodes with pending_action
+  - Network/DNS nodes with pending_action
+  
+No Memgraph queries are performed in the remediation pipeline.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -79,7 +51,19 @@ from src.remediation.remediation_models import (
 from src.remediation.remediation_tools import RemediationToolRegistry
 from src.remediation.remediation_agent import RemediationAgent
 from src.detection.l4_llm_detection.action_executor import ActionExecutor
-GRACE_PERIOD_SECONDS = 60
+from src.core.config import (
+    ACTIONED_NODES_FILE,
+    ACTIONED_NODES_LOCK,
+    PENDING_APPROVALS_FILE,
+    PENDING_APPROVALS_LOCK,
+    ledger_record_key,
+    new_record_id,
+    normalize_action_mode,
+)
+GRACE_PERIOD_SECONDS = 60          # fallback wait when no analyst handle is given
+ANALYST_IDLE_TIMEOUT_SECONDS = 300  # max wait for the analyst to finish
+# Marker understood by response.registry_delete(): "...@schtasks:<task name>"
+_SCHTASKS_MARKER = "HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\Scheduler@schtasks:"
 MAX_BLAST_RADIUS_IN_PROMPT = 15  # Limit blast radius shown in LLM prompt to reduce tokens
 
 
@@ -107,7 +91,6 @@ class IncidentCollector:
 
         Returns the full list of such records (not deduplicated yet).
         """
-        from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
         import os
 
         if not os.path.exists(ACTIONED_NODES_FILE):
@@ -119,7 +102,7 @@ class IncidentCollector:
 
         records = []
         try:
-            with open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
+            with ACTIONED_NODES_LOCK, open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
                 for lineno, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
@@ -144,7 +127,11 @@ class IncidentCollector:
         return records
 
     @staticmethod
-    def get_actioned_guids(db: Memgraph, logger: RemediationLogger) -> List[str]:
+    def get_actioned_guids(
+        db: Memgraph,
+        logger: RemediationLogger,
+        records: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
         """
         Return every ProcessInstance GUID that has a non-null pending_action.
 
@@ -166,7 +153,8 @@ class IncidentCollector:
             "(target_type='guid', remediation_handled=False) ..."
         )
 
-        records = IncidentCollector._load_unhandled(logger)
+        if records is None:
+            records = IncidentCollector._load_unhandled(logger)
 
         # Filter to guid entries only
         guid_records = [
@@ -202,7 +190,9 @@ class IncidentCollector:
 
     @staticmethod
     def get_analyst_file_actions(
-        db: Memgraph, logger: RemediationLogger
+        db: Memgraph,
+        logger: RemediationLogger,
+        records: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Read File-level actions from actioned_nodes.jsonl.
@@ -225,7 +215,8 @@ class IncidentCollector:
             "(target_type='file', remediation_handled=False) ..."
         )
 
-        records = IncidentCollector._load_unhandled(logger)
+        if records is None:
+            records = IncidentCollector._load_unhandled(logger)
 
         # Deduplicate by target_value — keep the latest stamped_at entry,
         # same as get_actioned_guids. Without this, a file actioned across
@@ -258,7 +249,9 @@ class IncidentCollector:
 
     @staticmethod
     def get_analyst_network_actions(
-        db: Memgraph, logger: RemediationLogger
+        db: Memgraph,
+        logger: RemediationLogger,
+        records: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Read Network/DNS actions from actioned_nodes.jsonl.
@@ -281,7 +274,8 @@ class IncidentCollector:
             "(target_type in ('ip','domain'), remediation_handled=False) ..."
         )
 
-        records = IncidentCollector._load_unhandled(logger)
+        if records is None:
+            records = IncidentCollector._load_unhandled(logger)
 
         # Deduplicate by target_value — keep the latest stamped_at entry.
         latest: Dict[str, Any] = {}
@@ -530,11 +524,11 @@ class ContextBuilder:
 
     Sources
     -------
-    - Memgraph : pending_action, action_reason, action_stamped_at per node.
-    - PAT      : full action stream per blast-radius process.
-    - Lineage  : ancestry chain + blast radius node records.
-    - NEW: analyst_file_actions    — File nodes stamped by analyst.
-    - NEW: analyst_network_actions — Network/DNS nodes stamped by analyst.
+    - actioned_nodes.jsonl : analyst pending_action, action_reason, stamped_at
+    - PAT                  : full action stream per blast-radius process.
+    - Lineage              : ancestry chain + blast radius node records.
+    - analyst_file_actions    — File nodes stamped by analyst.
+    - analyst_network_actions — Network/DNS nodes stamped by analyst.
     """
 
     # PAT action types surfaced as "notable" (first occurrence per type)
@@ -549,9 +543,8 @@ class ContextBuilder:
         "child_spawned",
     }
 
-    def __init__(self, pat: PATBuilder, db: Memgraph):
+    def __init__(self, pat: PATBuilder):
         self._pat = pat
-        self._db  = db
 
     def build_context(
         self,
@@ -559,6 +552,7 @@ class ContextBuilder:
         analyst_file_actions:    List[Dict[str, Any]],
         analyst_network_actions: List[Dict[str, Any]],
         logger:                  RemediationLogger,
+        ledger_records:          Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Assemble and log the full LLM context payload.
@@ -584,7 +578,9 @@ class ContextBuilder:
         }
 
         logger.info("Fetching analyst reasoning from Memgraph ...")
-        analyst_reasoning = self._fetch_analyst_reasoning(group.member_guids, logger)
+        analyst_reasoning = self._fetch_analyst_reasoning(
+            group.member_guids, logger, ledger_records
+        )
 
         # Scope file actions to this incident's blast radius
         logger.info("Scoping analyst file actions to this incident's blast radius ...")
@@ -725,44 +721,39 @@ class ContextBuilder:
         self,
         guids:  List[str],
         logger: RemediationLogger,
+        records: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Query Memgraph for the analyst agent's pending_action + reason per GUID."""
+        """
+        Read analyst reasoning from actioned_nodes.jsonl for the given GUIDs.
+        Uses the sweep's snapshot when given (records=...), so entries the
+        analyst appended mid-sweep are not mixed into this incident's context.
+        
+        Filters: target_type == "guid", remediation_handled == False.
+        Only returns entries where pending_action IS NOT NULL.
+        """
         if not guids:
             return []
-        try:
-            rows = list(self._db.execute_and_fetch(
-                """
-                UNWIND $guids AS guid
-                MATCH (p:ProcessInstance {id: guid})
-                WHERE p.pending_action IS NOT NULL
-                RETURN
-                    p.id                AS guid,
-                    p.pending_action    AS pending_action,
-                    p.action_reason     AS action_reason,
-                    p.action_stamped_at AS action_stamped_at,
-                    p.pid               AS pid,
-                    p.score             AS score,
-                    p.alive             AS alive
-                """,
-                {"guids": guids},
-            ))
-        except Exception as exc:
-            logger.error("Memgraph analyst-reasoning fetch failed", exc)
-            return []
-
-        result = [
-            {
-                "guid":              row.get("guid", ""),
-                "pending_action":    row.get("pending_action", ""),
-                "action_reason":     row.get("action_reason", ""),
-                "action_stamped_at": row.get("action_stamped_at", ""),
-                "pid":               row.get("pid", ""),
-                "score":             row.get("score", 0),
-                "alive":             row.get("alive", True),
-            }
-            for row in rows if row.get("guid")
-        ]
-
+        
+        if records is None:
+            records = IncidentCollector._load_unhandled(logger)
+        guid_set = set(guids)
+        
+        result = []
+        for rec in records:
+            if (rec.get("target_type") == "guid" and 
+                rec.get("target_value") in guid_set and
+                rec.get("action_type")):  # action_type holds the pending_action
+                
+                result.append({
+                    "guid":              rec.get("target_value", ""),
+                    "pending_action":    rec.get("action_type", ""),
+                    "action_reason":     rec.get("reason", ""),
+                    "action_stamped_at": rec.get("stamped_at", ""),
+                    "pid":               rec.get("pid", ""),
+                    "score":             rec.get("score", 0),
+                    "alive":             rec.get("alive", True),
+                })
+        
         logger.data("Analyst reasoning entries", result)
         return result
 
@@ -998,43 +989,40 @@ _REMEDIATION_TO_ANALYST_TYPE: Dict[str, str] = {
     "alert_analyst":        "alert",
 }
 
-def _transform_task_name_to_registry_path(target: str) -> str:
+_TASKCACHE_TREE_RE = re.compile(
+    r"^(?:HKEY_LOCAL_MACHINE|HKLM)\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+    r"\\Schedule\\TaskCache\\Tree\\(?P<name>.+)$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_registry_target(target: str) -> str:
     """
-    Convert a remediation agent task target (e.g., "Task: T1053_005_OnStartup")
-    into a registry value deletion path that deletes ONLY the specific scheduled task,
-    not the entire parent registry key.
-    
-    Windows Scheduled Tasks are stored in:
-    - Task subkeys: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks
-      (Each task is a subkey with GUID name)
-    
-    For deleting a task by name, use:
-    - schtasks /delete /tn "TaskName" /f
-    
-    However, if we need registry-level deletion, we delete the task's subkey:
-    - Format: HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\{GUID}
-    
-    Since the remediation report only provides the task NAME, we construct a command
-    that will be converted to schtasks deletion instead of direct registry deletion.
-    
-    For now, return a special format: "schtasks://{task_name}" which indicates
-    that ActionExecutor should handle this via schtasks command rather than registry.
+    Turn a remove_registry_key target into what registry_delete() understands.
+
+    Scheduled tasks are NOT removed by deleting a registry key: the key under
+    TaskCache\\Tree\\<name> is only a name index, the task's XML file and its
+    TaskCache\\Tasks\\{GUID} entry would stay behind. They are removed with
+    `schtasks /delete`, which registry_delete() runs when the target carries the
+    "@schtasks:<name>" marker. So:
+
+      "Task: Foo" / "Task:Foo"                         -> schtasks marker
+      "HKLM\\...\\Schedule\\TaskCache\\Tree\\Foo"        -> schtasks marker
+      any other registry path (Run keys, Services...)  -> returned unchanged
+
+    The task name is validated later, in response.registry_delete().
     """
-    # Extract task name from formats like:
-    # - "Task: T1053_005_OnStartup"
-    # - "T1053_005_OnStartup"
-    # - "Task:T1053_005_OnStartup"
-    
-    task_name = target
+    target = (target or "").strip()
+
     if target.lower().startswith("task:"):
-        task_name = target[5:].strip()
-    elif target.lower().startswith("task "):
-        task_name = target[5:].strip()
-    
-    # Return format that indicates this should use schtasks deletion
-    # Format: HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Scheduler@schtasks:{task_name}
-    # This tells registry_delete to use schtasks /delete instead
-    return f"HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\Scheduler@schtasks:{task_name}"
+        return _SCHTASKS_MARKER + target[5:].strip()
+
+    m = _TASKCACHE_TREE_RE.match(target)
+    if m:
+        return _SCHTASKS_MARKER + m.group("name").strip()
+
+    return target
+
 
 def _remediation_action_to_executor_format(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -1070,9 +1058,8 @@ def _remediation_action_to_executor_format(action: Dict[str, Any]) -> Optional[D
         target_type = "file"
     elif mapped_type == "registry_delete":
         target_type = "registry"
-        # Transform task name to registry path for scheduled tasks
-        # Example: "Task: T1053_005_OnStartup" → registry path to delete
-        target = _transform_task_name_to_registry_path(target)
+        # Scheduled tasks are routed to schtasks, other keys pass through
+        target = _normalize_registry_target(target)
     elif mapped_type == "identity_revocation":
         target_type = "user"
     elif mapped_type in ("patching", "shutdown"):
@@ -1090,45 +1077,56 @@ def _remediation_action_to_executor_format(action: Dict[str, Any]) -> Optional[D
     }
 
 
-def _transform_task_name_to_registry_path(target: str) -> str:
-    """
-    Transform a scheduled task name into a registry deletion path.
-    
-    Windows Scheduled Tasks are stored in the registry at:
-      HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\<TaskName>
-    
-    Parameters
-    ----------
-    target : str
-        Either a task name (e.g., "T1053_005_OnStartup") or 
-        a prefixed description (e.g., "Task: T1053_005_OnStartup")
-    
-    Returns
-    -------
-    str
-        Full registry path to delete, or the original target if it's already a path
-    """
-    # If it's already a registry path, return as-is
-    if target.startswith("HKEY_") or target.startswith("HKLM\\") or target.startswith("HKU\\"):
-        return target
-    
-    # Extract task name (remove "Task: " prefix if present)
-    task_name = target.replace("Task: ", "").strip()
-    
-    # Build the registry path to the scheduled task
-    # Note: Scheduled tasks are stored under TaskCache\Tree\
-    registry_path = f"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\{task_name}"
-    
-    return registry_path
-
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP-LEVEL ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
+
+def has_pending_remediation_work() -> bool:
+    """
+    Cheap pre-check used by the live-mode trigger in agent.py.
+
+    True when actioned_nodes.jsonl holds at least one unhandled ProcessInstance
+    record (target_type == "guid", remediation_handled == False) - the same gate
+    run_remediation() applies once its grace period is over. It lets the trigger
+    skip a sweep (and the LLM calls it implies) when there is nothing to do.
+
+    Fails open: if the file cannot be read, returns True so run_remediation()
+    makes the decision itself.
+    """
+    import os
+
+    try:
+        with ACTIONED_NODES_LOCK:
+            if not os.path.exists(ACTIONED_NODES_FILE):
+                return False
+            with open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        rec.get("target_type") == "guid"
+                        and rec.get("target_value")
+                        and not rec.get("remediation_handled", False)
+                    ):
+                        return True
+        return False
+    except Exception as exc:
+        print(f"[Remediation] has_pending_remediation_work failed ({exc}) - assuming work is pending.")
+        return True
+
 
 def run_remediation(
     pat:           PATBuilder,
     db:            Optional[Memgraph] = None,
     grace_seconds: int = GRACE_PERIOD_SECONDS,
+    action_mode:   Optional[str] = None,
+    analyst:       Any = None,
+    idle_timeout:  float = ANALYST_IDLE_TIMEOUT_SECONDS,
 ) -> List[RemediationReport]:
     """
     Main entry point called from agent.py after log replay finishes.
@@ -1140,29 +1138,64 @@ def run_remediation(
     ----------
     pat           : the global PATBuilder instance from agent.py.
     db            : optional Memgraph instance. Opens one automatically if None.
-    grace_seconds : seconds to wait before starting (default 60).
+    grace_seconds : fixed wait before starting (default 60). Only used when no
+                    `analyst` is given; with an analyst the wait is
+                    "until the analyst is idle" instead.
+    action_mode   : "approval" | "automatic". None -> shared default from
+                    src/core/config.py (EDR_ACTION_MODE, default "approval"),
+                    i.e. the same mode the ThreatAnalyst uses.
+    analyst       : the running ThreatAnalyst (pipeline.l4_analyst), or None.
+                    If given, the sweep starts when analyst.wait_until_idle()
+                    returns, i.e. when no scored node is left to analyse, rather
+                    than after a fixed delay that may be too short (slow LLM,
+                    flood replay) or needlessly long.
+    idle_timeout  : max seconds to wait for the analyst. On timeout the sweep
+                    runs anyway on whatever the analyst has written so far.
 
     Returns
     -------
     List of RemediationReport objects. Empty list on early failure.
     """
     logger = RemediationLogger()
+    mode = normalize_action_mode(action_mode)
 
     logger.phase("REMEDIATION PIPELINE STARTED")
     logger.info(
-        f"Grace period = {grace_seconds}s — "
-        "waiting for AnalystAgent to finish its last tick ..."
+        f"Action mode = {mode} "
+        + ("(cleanup actions are executed immediately)"
+           if mode == "automatic"
+           else "(cleanup actions are queued in "
+                f"{PENDING_APPROVALS_FILE} for operator approval)")
     )
 
-    # ── Grace period ──────────────────────────────────────────────────────────
-    remaining = grace_seconds
-    while remaining > 0:
-        chunk = min(5, remaining)
-        time.sleep(chunk)
-        remaining -= chunk
-        logger.info(f"Grace period: {remaining}s remaining ...")
+    if analyst is not None:
+        # ── Idle wait ─────────────────────────────────────────────────────────
+        logger.info(
+            f"Waiting for the ThreatAnalyst to become idle "
+            f"(timeout {idle_timeout:.0f}s) ..."
+        )
+        if analyst.wait_until_idle(timeout=idle_timeout):
+            logger.phase("ANALYST IDLE — STARTING PIPELINE")
+        else:
+            logger.info(
+                "Analyst did not become idle in time (timeout or shutdown) - "
+                "continuing with the actions recorded so far."
+            )
+            logger.phase("IDLE WAIT ENDED — STARTING PIPELINE")
+    else:
+        # ── Fixed grace period (no analyst handle available) ──────────────────
+        logger.info(
+            f"Grace period = {grace_seconds}s — "
+            "waiting for AnalystAgent to finish its last tick ..."
+        )
+        remaining = grace_seconds
+        while remaining > 0:
+            chunk = min(5, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+            logger.info(f"Grace period: {remaining}s remaining ...")
 
-    logger.phase("GRACE PERIOD COMPLETE — STARTING PIPELINE")
+        logger.phase("GRACE PERIOD COMPLETE — STARTING PIPELINE")
 
     # ── Memgraph connection ───────────────────────────────────────────────────
     if db is None:
@@ -1184,12 +1217,18 @@ def run_remediation(
                     "Query Memgraph for ProcessInstance nodes with "
                     "pending_action IS NOT NULL, plus File/Network/DNS nodes.")
 
-        guids = IncidentCollector.get_actioned_guids(db, logger)
+        # ONE snapshot of the unhandled ledger records. Everything this sweep
+        # does - and later marks as handled - comes from this snapshot, so
+        # records the analyst appends while the sweep runs are never marked
+        # handled without having been remediated.
+        snapshot = IncidentCollector._load_unhandled(logger)
+
+        guids = IncidentCollector.get_actioned_guids(db, logger, snapshot)
 
         # NEW: collect all analyst-actioned file and network artifacts globally.
         # These will be scoped per-incident in ContextBuilder.
-        analyst_file_actions    = IncidentCollector.get_analyst_file_actions(db, logger)
-        analyst_network_actions = IncidentCollector.get_analyst_network_actions(db, logger)
+        analyst_file_actions    = IncidentCollector.get_analyst_file_actions(db, logger, snapshot)
+        analyst_network_actions = IncidentCollector.get_analyst_network_actions(db, logger, snapshot)
 
         if not guids:
             logger.info("No actioned GUIDs found — nothing to remediate.")
@@ -1210,7 +1249,7 @@ def run_remediation(
 
         # ── Per-group pipeline (steps 3-5) ────────────────────────────────────
         lineage_builder = LineageBuilder(pat)
-        context_builder = ContextBuilder(pat, db)
+        context_builder = ContextBuilder(pat)
         
         # Rate limiting: delay between incident groups to avoid API rate limits
         # Google Gemini: 15 requests per minute = 1 request per 4 seconds
@@ -1243,6 +1282,7 @@ def run_remediation(
                     analyst_file_actions=    analyst_file_actions,
                     analyst_network_actions= analyst_network_actions,
                     logger=                  logger,
+                    ledger_records=          snapshot,
                 )
 
                 # Build per-incident dicts for the tool registry
@@ -1296,15 +1336,12 @@ def run_remediation(
                                 f"{ca.get('action_type')} target={ca.get('target', '')}"
                             )
 
-                    if executor_actions:
+                    if executor_actions and mode == "automatic":
                         logger.info(
                             f"[Remediation] Executing {len(executor_actions)} "
                             f"cleanup action(s) for incident {group.incident_id[:8]} ..."
                         )
-                        # ActionExecutor is instantiated in automatic mode.
-                        # If you want approval mode, pass mode="approval" and
-                        # use the existing approval_response_executor flow.
-                        action_executor = ActionExecutor(mode="automatic")
+                        action_executor = ActionExecutor(mode=mode)
                         # execute_sync so we wait before moving to the next incident
                         results = action_executor.execute_sync(
                             executor_actions, group.root_guid
@@ -1315,10 +1352,18 @@ def run_remediation(
                                 f"{r.get('action')} → status={r.get('status')} "
                                 f"target={r.get('target_value', '')}"
                             )
+                    elif executor_actions:
+                        # Approval mode: same behaviour as the ThreatAnalyst -
+                        # queue the actions, an operator approves them later with
+                        # approval_response_executor.
+                        _queue_remediation_for_approval(
+                            executor_actions, group, logger
+                        )
 
                     # ── Change 5: Write remediation cleanup_actions to ledger ──
                     _append_remediation_cleanup_actions(
-                        report.cleanup_actions, group.root_guid, logger
+                        report.cleanup_actions, group.root_guid, logger,
+                        executed=(mode == "automatic"),
                     )
 
                 # ── Change 4: Mark handled entries in actioned_nodes.jsonl ────
@@ -1334,12 +1379,13 @@ def run_remediation(
                     for e in context_payload.get("analyst_network_actions", [])
                     if e.get("value")
                 ]
-                _mark_actioned_nodes_handled(
+                consumed_keys = _select_consumed_keys(
+                    snapshot=       snapshot,
                     member_guids=   group.member_guids,
                     scoped_file_tv= scoped_file_tv,
                     scoped_net_tv=  scoped_net_tv,
-                    logger=         logger,
                 )
+                _mark_actioned_nodes_handled(consumed_keys, logger)
                 
                 # Rate limiting: add delay between incident groups to avoid 
                 # hitting Google API per-minute rate limits
@@ -1371,33 +1417,62 @@ def run_remediation(
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _mark_actioned_nodes_handled(
+def _select_consumed_keys(
+    snapshot:        List[Dict[str, Any]],
     member_guids:    List[str],
     scoped_file_tv:  List[str],
     scoped_net_tv:   List[str],
-    logger:          RemediationLogger,
-) -> None:
+) -> set:
     """
-    Mark entries in actioned_nodes.jsonl as remediation_handled=True for:
-      - All entries whose target_value is in member_guids (GUID entries)
-      - All file/network entries whose target_value is in scoped_file_tv or
-        scoped_net_tv (the values scoped to this incident group).
+    Keys (see ledger_record_key) of the snapshot records this incident group
+    actually consumed:
+      - guid entries whose target_value is one of the group's member GUIDs
+      - file entries whose target_value is in scoped_file_tv
+      - ip/domain entries whose target_value is in scoped_net_tv
 
-    Uses a load-update-write strategy keyed by (action_type, target_value).
-    If the same key appears multiple times, ALL matching lines are updated.
+    Only records present in the snapshot taken at the start of the sweep are
+    considered, so records appended later are never selected.
     """
-    from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
-    import os
-
-    if not os.path.exists(ACTIONED_NODES_FILE):
-        return
-
     member_set = set(member_guids)
     file_set   = set(scoped_file_tv)
     net_set    = set(scoped_net_tv)
 
+    keys = set()
+    for rec in snapshot:
+        tv = rec.get("target_value", "")
+        tt = rec.get("target_type", "")
+        if (
+            (tt == "guid"   and tv in member_set) or
+            (tt == "file"   and tv in file_set)   or
+            (tt in ("ip", "domain") and tv in net_set)
+        ):
+            keys.add(ledger_record_key(rec))
+    return keys
+
+
+def _mark_actioned_nodes_handled(
+    consumed_keys: set,
+    logger:        RemediationLogger,
+) -> None:
+    """
+    Mark exactly the records in consumed_keys as remediation_handled=True in
+    actioned_nodes.jsonl.
+
+    consumed_keys comes from _select_consumed_keys() and therefore only holds
+    records that were in the snapshot this sweep worked on. A record the analyst
+    appended after the snapshot (even for the same GUID / file / IP) has a
+    different key and is left unhandled for the next sweep.
+    """
+    import os
+
+    if not consumed_keys or not os.path.exists(ACTIONED_NODES_FILE):
+        return
+
     updated = 0
     lines_out = []
+    # Hold the lock for the whole read-modify-write so records appended by the
+    # ThreatAnalyst in the meantime are not lost (live mode).
+    ACTIONED_NODES_LOCK.acquire()
     try:
         with open(ACTIONED_NODES_FILE, "r", encoding="utf-8") as f:
             for line in f:
@@ -1407,15 +1482,10 @@ def _mark_actioned_nodes_handled(
                     continue
                 try:
                     rec = json.loads(stripped)
-                    tv  = rec.get("target_value", "")
-                    tt  = rec.get("target_type", "")
-                    if (
-                        (tt == "guid"   and tv in member_set) or
-                        (tt == "file"   and tv in file_set)   or
-                        (tt in ("ip", "domain") and tv in net_set)
-                    ):
+                    if ledger_record_key(rec) in consumed_keys:
+                        if not rec.get("remediation_handled", False):
+                            updated += 1
                         rec["remediation_handled"] = True
-                        updated += 1
                     lines_out.append(json.dumps(rec) + "\n")
                 except json.JSONDecodeError:
                     lines_out.append(line)
@@ -1432,21 +1502,63 @@ def _mark_actioned_nodes_handled(
             f"Could not update {ACTIONED_NODES_FILE} "
             f"(mark handled)", exc
         )
+    finally:
+        ACTIONED_NODES_LOCK.release()
+
+
+def _queue_remediation_for_approval(
+    executor_actions: List[Dict[str, Any]],
+    group:            IncidentGroup,
+    logger:           RemediationLogger,
+) -> None:
+    """
+    Approval mode: append the remediation cleanup actions to pending_approvals.jsonl
+    using the same schema the ThreatAnalyst writes, so the existing
+    approval_response_executor reviews and executes both kinds the same way.
+    """
+    import uuid
+
+    record = {
+        "analysis_id": str(uuid.uuid4()),
+        "anchor_guid": group.root_guid,
+        "verdict":     "REMEDIATION",
+        "actions":     executor_actions,
+        "produced_at": datetime.utcnow().isoformat(),
+        "executed":    False,
+        "source":      "remediation",
+    }
+    try:
+        with PENDING_APPROVALS_LOCK, open(PENDING_APPROVALS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        logger.info(
+            f"[Remediation] Mode=approval - queued {len(executor_actions)} "
+            f"cleanup action(s) for incident {group.incident_id[:8]} in "
+            f"{PENDING_APPROVALS_FILE} (analysis_id={record['analysis_id']}). "
+            f"Nothing was executed."
+        )
+    except Exception as exc:
+        logger.error(
+            f"Could not queue remediation actions in {PENDING_APPROVALS_FILE}", exc
+        )
 
 
 def _append_remediation_cleanup_actions(
     cleanup_actions: List[Dict[str, Any]],
     root_guid:       str,
     logger:          RemediationLogger,
+    executed:        bool = True,
 ) -> None:
     """
     Append each remediation cleanup_action to actioned_nodes.jsonl with
-    source="remediation" and remediation_handled=True (already executed).
+    source="remediation" and remediation_handled=True (the remediation pipeline
+    is done with it, so later sweeps do not pick it up again).
+
+    executed=True  -> status "executed"          (automatic mode)
+    executed=False -> status "pending_approval"  (approval mode: queued, not run)
 
     This gives a complete ledger — analyst and remediation actions in one file.
     No graph writes needed for remediation actions.
     """
-    from src.detection.l4_llm_detection.threat_analyst import ACTIONED_NODES_FILE
 
     if not cleanup_actions:
         return
@@ -1471,6 +1583,7 @@ def _append_remediation_cleanup_actions(
             target_type = "host"
 
         records.append({
+            "record_id":           new_record_id(),
             "guid":                root_guid,
             "action_type":         action_type,
             "target_type":         target_type,
@@ -1479,18 +1592,20 @@ def _append_remediation_cleanup_actions(
             "stamped_at":          ts,
             "remediation_handled": True,
             "source":              "remediation",
+            "status":              "executed" if executed else "pending_approval",
         })
 
     if not records:
         return
 
     try:
-        with open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
+        with ACTIONED_NODES_LOCK, open(ACTIONED_NODES_FILE, "a", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
         logger.info(
             f"[actioned_nodes] Appended {len(records)} remediation "
-            f"cleanup_action record(s) (source=remediation, handled=True)."
+            f"cleanup_action record(s) (source=remediation, handled=True, "
+            f"status={'executed' if executed else 'pending_approval'})."
         )
     except Exception as exc:
         logger.error(

@@ -41,12 +41,11 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 _approval_callback = None  # module-level
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [EDR] %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+# Library module: it must not configure the root logger on import (that used to
+# run before the agent's own setup and silently turned it into a no-op). The
+# application entry point (agent.py -> setup_logging) owns handlers and format.
 log = logging.getLogger("edr")
+log.addHandler(logging.NullHandler())
 
 Mode = Literal["automatic", "approval"]
 
@@ -171,6 +170,26 @@ def _now() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
+# Scheduled-task names come from LLM output, so they are validated before they
+# reach schtasks. Allowed: letters, digits, space and _ - . ( ) { } and "\\" as
+# the folder separator (e.g. "\\Microsoft\\Foo\\Task"). No leading "/" or "-"
+# (would look like an option), no "..", no control chars, bounded length.
+_TASK_NAME_RE = re.compile(r"^[\w .(){}\-\\]{1,238}$")
+
+
+def _validate_task_name(task_name: str) -> str:
+    """Return the cleaned task name or raise ValueError."""
+    name = (task_name or "").strip()
+    if (
+        not _TASK_NAME_RE.match(name)
+        or name[0] in "/-"
+        or ".." in name
+        or name.strip("\\ .") == ""
+    ):
+        raise ValueError(f"Invalid scheduled task name: {task_name!r}")
+    return name
+
+
 def _result(status: str, action: str, target: str, details: Any = None) -> Dict:
     r = {
         "status": status,
@@ -200,6 +219,18 @@ def _request_approval(action: str, target: str, details: str) -> bool:
 
 
 
+def set_approval_callback(callback) -> None:
+    """
+    Register the function used by approval mode.
+
+    callback(action: str, target: str, description: str) -> bool
+        return True to approve (the action is then executed), False to reject.
+    Pass None to remove it (approval-mode actions then stay "pending_approval").
+    """
+    global _approval_callback
+    _approval_callback = callback
+
+
 def _gate(mode, action, target, description, execute_fn, *args, **kwargs):
     if mode == "automatic":
         try:
@@ -207,9 +238,15 @@ def _gate(mode, action, target, description, execute_fn, *args, **kwargs):
         except Exception as exc:
             return _result("error", action, target, {"error": str(exc)})
 
-    # approval mode — delegate to injected callback
+    # approval mode — delegate to injected callback.
+    # Fail closed: with no callback nothing is executed, the action is only
+    # reported as pending (it used to raise RuntimeError, so every action failed).
     if _approval_callback is None:
-        raise RuntimeError("approval mode requires a callback — call set_approval_callback() first")
+        return _result(
+            "pending_approval", action, target,
+            {"description": description,
+             "note": "no approval callback registered - action NOT executed"},
+        )
 
     approved = _approval_callback(action, target, description)
     if not approved:
@@ -715,6 +752,36 @@ def ip_block(
         _block,
     )
 
+def _delete_scheduled_task(task_name: str) -> Dict[str, Any]:
+    """
+    Delete a scheduled task with `schtasks /delete /tn <name> /f`.
+
+    The command is run as an argument list (no shell) and the name has already
+    been validated by the caller. A non-zero exit code raises, so the action is
+    reported as "error" instead of "executed" when the task was not removed.
+    """
+    cmd = ["schtasks", "/delete", "/tn", task_name, "/f"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"Failed to run schtasks for '{task_name}': {e}")
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"schtasks /delete failed for '{task_name}' "
+            f"(rc={result.returncode}): "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+    return {
+        "method": "schtasks_cmd",
+        "task_name": task_name,
+        "command": " ".join(cmd),
+        "returncode": result.returncode,
+        "success": True,
+        "stdout": result.stdout.strip() or None,
+    }
+
+
 def registry_delete(
     key_path: str,
     mode: Mode = "approval",
@@ -739,6 +806,22 @@ def registry_delete(
     Dict with status, action, target, details, and timestamp.
     """
     
+    # Scheduled tasks are removed through schtasks (it deletes the task XML, the
+    # TaskCache\\Tasks\\{GUID} entry and the Tree entry together), not by deleting
+    # a registry key. The target is a task, not a registry path, so the
+    # file-style protection check below does not apply: the name is validated.
+    if "@schtasks:" in key_path:
+        task_name = key_path.split("@schtasks:", 1)[1]
+        try:
+            task_name = _validate_task_name(task_name)
+        except ValueError as exc:
+            return _result("error", "registry_delete", key_path, {"error": str(exc)})
+        return _gate(
+            mode, "registry_delete", key_path,
+            f"Delete scheduled task '{task_name}' via schtasks /delete",
+            _delete_scheduled_task, task_name,
+        )
+
     # PROTECTION CHECK: Verify this is not a protected registry key
     is_protected, reason = _protection.is_protected_file(key_path)  # Reuse file protection check
     if is_protected:
@@ -754,46 +837,9 @@ def registry_delete(
                       {"reason": reason, "warning": warning_msg})
     
     def _delete():
-        """Delete registry key/value OR scheduled task via schtasks"""
-        # Check for special schtasks format: "...@schtasks:{task_name}"
-        if "@schtasks:" in key_path:
-            return _delete_scheduled_task(key_path)
-        
-        # Standard registry deletion
+        """Delete a registry key or value (scheduled tasks are handled above)."""
         return _delete_registry(key_path)
-    
-    def _delete_scheduled_task(key_path: str) -> Dict[str, Any]:
-        """
-        Delete a scheduled task using schtasks command.
-        
-        Input format: "HKEY_LOCAL_MACHINE\\System\\...\\@schtasks:{task_name}"
-        Extracts task_name and runs: schtasks /delete /tn "task_name" /f
-        """
-        # Extract task name from format: "...@schtasks:{task_name}"
-        parts = key_path.split("@schtasks:", 1)
-        if len(parts) < 2:
-            raise ValueError(f"Invalid schtasks format: {key_path}")
-        
-        task_name = parts[1].strip()
-        
-        # Delete using schtasks command (safer, more appropriate for scheduled tasks)
-        cmd = ["schtasks", "/delete", "/tn", task_name, "/f"]
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            return {
-                "method": "schtasks_cmd",
-                "task_name": task_name,
-                "command": " ".join(cmd),
-                "returncode": result.returncode,
-                "success": result.returncode == 0,
-                "stdout": result.stdout.strip() or None,
-                "stderr": result.stderr.strip() or None,
-            }
-        except Exception as e:
-            raise RuntimeError(f"Failed to delete scheduled task '{task_name}': {e}")
-    
+
     def _delete_registry(key_path: str) -> Dict[str, Any]:
         """Delete registry key/value using winreg module or subprocess"""
         # Normalize key_path: convert short hive names to full names

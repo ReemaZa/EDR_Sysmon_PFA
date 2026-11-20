@@ -83,8 +83,9 @@ from typing import Optional
 
 from gqlalchemy import Memgraph
 
-MEMGRAPH_HOST = "localhost"
-MEMGRAPH_PORT = 7687
+# Connection settings live in src/core/config.py (env-overridable). They are
+# re-exported here because other modules import them from this file.
+from src.core.config import MEMGRAPH_HOST, MEMGRAPH_PORT  # noqa: E402,F401
 
 # Sigma scale 1–4
 EDGE_WEIGHTS: dict[str, int] = {
@@ -213,12 +214,18 @@ class GraphBuilder:
                 "techniques":  [],
                 "tactics":     [],
                 "total_score": 0,
+                "ioc_score":   0,
             }
+        # ioc_score = known-malware-hash score from L1. It is folded into
+        # total_score so every handler scores the acting process / edge with it;
+        # it is also exposed separately because EV1 must route it to the CHILD only.
+        ioc_score = int(detection.get("ioc_score", 0) or 0)
         return {
             "finding_ids": detection.get("finding_ids", []),
             "techniques":  detection.get("techniques",  []),
             "tactics":     detection.get("tactics",     []),
-            "total_score": int(detection.get("total_score", 0)),
+            "total_score": int(detection.get("total_score", 0)) + ioc_score,
+            "ioc_score":   ioc_score,
         }
 
     @staticmethod

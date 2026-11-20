@@ -6,6 +6,11 @@ from enum import Enum
 import time
 from typing import Any, Dict, List
 
+# Score injected into the threat graph when L1 confirms a known-malware hash (IOC).
+# Single source of truth: produced by L1 (HashReputationEngine) and read by the
+# analyst prompt (AnalystAgent) to tag a process as a "SIGNATURE MATCH".
+HASH_MATCH_SCORE = 1000
+
 
 class ThreatLevel(Enum):
     """
@@ -92,6 +97,8 @@ class DetectionResult:
                 gd = self.metadata['graph_detection']
                 result_str += f"    |  +- Graph Detection:\n"
                 result_str += f"    |  |  +- Score: {gd.get('total_score', 0)}\n"
+                if gd.get('ioc_score'):
+                    result_str += f"    |  |  +- IOC score (hash match): {gd.get('ioc_score')}\n"
                 result_str += f"    |  |  +- Findings: {len(gd.get('finding_ids', []))}\n"
                 
                 techniques = gd.get('techniques', [])

@@ -86,11 +86,32 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 # Import all response functions from the companion module.
 # Adjust the import path to match your project layout.
 from src.core import response as rf
+from src.core.config import (
+    MEMGRAPH_HOST,
+    MEMGRAPH_PORT,
+    PENDING_APPROVALS_FILE,
+    PENDING_APPROVALS_LOCK,
+)
+
+# Actions that are never executed unattended, whatever the executor mode.
+# They are host-wide or account-wide, hard to undo, and are triggered by LLM
+# output (shutdown / host isolation / patching / account revocation). In
+# "automatic" mode they are queued in pending_approvals.jsonl instead; an
+# operator runs them through approval_response_executor, which builds its
+# executor with pre_approved=True.
+APPROVAL_ONLY_ACTIONS = frozenset({
+    "shutdown",
+    "host_isolation",
+    "patching",
+    "identity_revocation",
+})
 
 
 class ActionExecutor:
@@ -109,9 +130,14 @@ class ActionExecutor:
     Pass mode="automatic" for fully automated containment (CI / high-confidence
     detections) or mode="approval" (default) to require operator confirmation
     before each destructive action.
+
+    Even in "automatic" mode, the actions in APPROVAL_ONLY_ACTIONS are not run:
+    they are queued for operator approval. The only way to run them
+    unattended-style is pre_approved=True, which is meant for the approval tool
+    (the operator has already said yes) and nothing else.
     """
 
-    def __init__(self, mode: rf.Mode = "approval"):
+    def __init__(self, mode: rf.Mode = "approval", pre_approved: bool = False):
         """
         Parameters
         ----------
@@ -119,8 +145,13 @@ class ActionExecutor:
             Default execution mode passed to every response_functions call.
             Individual dispatchers may override this for non-destructive actions
             (e.g. "alert" and "blacklist" always run in automatic mode).
+        pre_approved : bool
+            True only when a human has already approved the actions being
+            passed in (approval_response_executor). Lifts the
+            APPROVAL_ONLY_ACTIONS gate.
         """
         self.mode = mode
+        self.pre_approved = pre_approved
         
         self._threads = []
         self._lock = threading.Lock()
@@ -173,11 +204,9 @@ class ActionExecutor:
             return
 
         from gqlalchemy import Memgraph
-        from src.graph.Graph_Builder import MEMGRAPH_HOST, MEMGRAPH_PORT
-        from datetime import datetime
 
         db = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
-        ts = datetime.utcnow().isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
 
         action_type = action.get("type", "")
         target_type = action.get("target_type", "")
@@ -275,6 +304,16 @@ class ActionExecutor:
         """Sort by priority then dispatch each action, collecting results."""
         sorted_actions = sorted(actions, key=lambda a: a.get("priority", 99))
         results = []
+
+        # Approval-only actions never run unattended (see APPROVAL_ONLY_ACTIONS).
+        if self.mode == "automatic" and not self.pre_approved:
+            gated = [a for a in sorted_actions if a.get("type") in APPROVAL_ONLY_ACTIONS]
+            if gated:
+                sorted_actions = [
+                    a for a in sorted_actions if a.get("type") not in APPROVAL_ONLY_ACTIONS
+                ]
+                results.extend(self._queue_for_approval(gated, anchor_guid))
+
         for action in sorted_actions:
             action_id = action.get("id", "?")
             try:
@@ -298,6 +337,44 @@ class ActionExecutor:
         with open("action_log.jsonl", "a") as f:
             f.write(json.dumps({"anchor": anchor_guid, "actions": results}) + "\n")
         return results
+
+    def _queue_for_approval(
+        self, gated: List[Dict[str, Any]], anchor_guid: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Write approval-only actions to pending_approvals.jsonl (same schema the
+        ThreatAnalyst uses) and return one "pending_approval" result per action.
+        """
+        record = {
+            "analysis_id": str(uuid.uuid4()),
+            "anchor_guid": anchor_guid,
+            "verdict":     "REQUIRES_APPROVAL",
+            "actions":     gated,
+            "produced_at": datetime.now(timezone.utc).isoformat(),
+            "executed":    False,
+            "source":      "executor_policy",
+        }
+        note = "approval-only action - queued for operator approval, NOT executed"
+        try:
+            with PENDING_APPROVALS_LOCK, open(PENDING_APPROVALS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            print(
+                f"[ActionExecutor] {len(gated)} approval-only action(s) "
+                f"({', '.join(a.get('type', '?') for a in gated)}) queued in "
+                f"{PENDING_APPROVALS_FILE} (analysis_id={record['analysis_id']})"
+            )
+        except Exception as exc:
+            note = f"approval-only action - could NOT be queued ({exc}); NOT executed"
+            print(f"[ActionExecutor][ERROR] Could not queue approval-only actions: {exc}")
+        return [
+            {
+                "status":  "pending_approval",
+                "action":  a.get("type"),
+                "target":  a.get("target_value", ""),
+                "details": {"note": note},
+            }
+            for a in gated
+        ]
 
     # ── DISPATCHER ────────────────────────────────────────────────────────────
 
@@ -476,7 +553,7 @@ class ActionExecutor:
         """
         try:
             from gqlalchemy import Memgraph
-            db   = Memgraph(host="localhost", port=7687)
+            db   = Memgraph(host=MEMGRAPH_HOST, port=MEMGRAPH_PORT)
             rows = list(db.execute_and_fetch(
                 "MATCH (p:ProcessInstance {id: $guid}) RETURN p.pid AS pid",
                 {"guid": guid},
